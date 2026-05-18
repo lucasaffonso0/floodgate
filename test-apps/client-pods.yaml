@@ -1,0 +1,139 @@
+# Client pods in every namespace — used by run-tests.sh to verify connectivity
+# Each pod has wget (busybox) and stays alive indefinitely
+# Usage: kubectl exec -n <ns> deploy/client -- wget -qT3 -O- http://<target>
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client
+  namespace: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: client
+  template:
+    metadata:
+      labels:
+        app: client
+    spec:
+      containers:
+        - name: client
+          image: busybox:1.36
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client
+  namespace: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: client
+  template:
+    metadata:
+      labels:
+        app: client
+    spec:
+      containers:
+        - name: client
+          image: busybox:1.36
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client
+  namespace: infra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: client
+  template:
+    metadata:
+      labels:
+        app: client
+    spec:
+      containers:
+        - name: client
+          image: busybox:1.36
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client
+  namespace: database
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: client
+  template:
+    metadata:
+      labels:
+        app: client
+    spec:
+      containers:
+        - name: client
+          image: busybox:1.36
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: client
+  template:
+    metadata:
+      labels:
+        app: client
+    spec:
+      containers:
+        - name: client
+          image: busybox:1.36
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"

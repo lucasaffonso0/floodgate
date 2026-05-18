@@ -1,0 +1,26 @@
+{{- if .Values.httproute.enabled -}}
+{{- $fullName := include "base.fullname" . -}}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $fullName }}
+spec:
+  parentRefs:
+  {{- range .Values.httproute.gateway }}
+    - name: {{ .name }}
+      namespace: {{ .namespace }}
+      sectionName: {{ .sectionName }}
+  {{- end }}
+{{- with .Values.httproute.hostnames }}
+  hostnames:
+  {{- toYaml . | nindent 8 }}
+{{- end }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ include "base.fullname" . }}
+          port: {{ .Values.service.port }}
+{{- end }}

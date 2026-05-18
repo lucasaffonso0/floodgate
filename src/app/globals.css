@@ -1,0 +1,4 @@
+@import '@xyflow/react/dist/style.css';
+
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }

@@ -1,0 +1,16 @@
+apiVersion: v2
+name: app-chart
+description: Helm chart developed by José Lucas
+type: application
+
+# Chart version (Semantic Versioning)
+version: 1.0.0
+# Application version
+appVersion: "1.0.0"
+
+# Chart homepage (author profile)
+home: https://www.linkedin.com/in/lucasaffonso0/
+# Chart maintainer information
+maintainers:
+  - name: José Lucas
+    url: https://www.linkedin.com/in/lucasaffonso0/

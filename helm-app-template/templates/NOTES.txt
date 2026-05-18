@@ -1,0 +1,38 @@
+floodgate deployed successfully!
+
+{{- $serviceType := .Values.service.type | default "ClusterIP" }}
+{{- if and .Values.httproute .Values.httproute.enabled }}
+
+The application is exposed via Gateway API (HTTPRoute):
+{{- range .Values.httproute.hostnames }}
+  https://{{ . }}
+{{- end }}
+
+{{- else if and .Values.ingress .Values.ingress.enabled }}
+
+The application is exposed via Ingress:
+{{- range .Values.ingress.hostnames }}
+  https://{{ . }}
+{{- end }}
+
+{{- else if eq $serviceType "LoadBalancer" }}
+
+Waiting for LoadBalancer IP:
+  kubectl get svc -n {{ .Release.Namespace }} {{ include "base.fullname" . }} -w
+
+{{- else if eq $serviceType "NodePort" }}
+
+  export NODE_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[0].address}")
+  export NODE_PORT=$(kubectl get svc -n {{ .Release.Namespace }} {{ include "base.fullname" . }} \
+    -o jsonpath="{.spec.ports[0].nodePort}")
+  echo "http://$NODE_IP:$NODE_PORT"
+
+{{- else }}
+
+Access via port-forward:
+  kubectl port-forward svc/{{ include "base.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+  open http://localhost:{{ .Values.service.port }}
+
+{{- end }}
+
+Default credentials: admin / admin (password change required on first login)
