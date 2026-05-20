@@ -155,15 +155,12 @@ export async function PATCH(req: NextRequest, { params }: Params) {
 
     logAudit({ user_id: user.sub, username: user.username, action: 'approve_vote', resource_type: 'ApprovalRequest', resource_name: id })
 
-    // Auto-apply when quorum is reached
+    // Auto-apply when quorum is reached — the approval workflow is the authorization mechanism,
+    // so the policy is applied regardless of the individual voter's namespace permissions.
     const updated = getRequest(id)!
     let autoApplyError: string | null = null
     if (updated.approve_count >= updated.approvals_required && updated.reject_count === 0) {
       const draft = normalizeDraft(updated.draft_data as Draft & { dst_port?: number })
-      if (!(await canManageNamespace(user.sub, user.role, draft.dst_namespace))) {
-        emit({ type: 'approval_voted', id })
-        return NextResponse.json({ ...getRequest(id), auto_apply_error: 'Quorum reached but voter lacks permission to apply to this namespace' })
-      }
       const apiReq = {
         src_workload: draft.src_workload, src_namespace: draft.src_namespace,
         dst_service: draft.dst_service, dst_namespace: draft.dst_namespace, dst_ports: draft.dst_ports,

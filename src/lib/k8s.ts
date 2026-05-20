@@ -11,6 +11,18 @@ kc.loadFromDefault()
 const core = kc.makeApiClient(k8s.CoreV1Api)
 const networking = kc.makeApiClient(k8s.NetworkingV1Api)
 
+function getK8sStatus(e: unknown): number | undefined {
+  const err = e as { statusCode?: number; body?: unknown; message?: string }
+  if (typeof err.statusCode === 'number') return err.statusCode
+  try {
+    const body = typeof err.body === 'string' ? JSON.parse(err.body) : err.body
+    if (typeof (body as { code?: number })?.code === 'number') return (body as { code: number }).code
+  } catch {}
+  const match = (err.message ?? '').match(/HTTP-Code:\s*(\d+)/)
+  if (match) return parseInt(match[1], 10)
+  return undefined
+}
+
 function parseIntOrString(val: unknown, fallback: number): number {
   if (typeof val === 'number') return val
   if (typeof val === 'string') {
@@ -199,7 +211,7 @@ export async function createNetworkPolicy(req: CreatePolicyRequest): Promise<Net
   try {
     created = await networking.createNamespacedNetworkPolicy({ namespace: req.dst_namespace, body })
   } catch (e: unknown) {
-    const status = (e as { statusCode?: number })?.statusCode
+    const status = getK8sStatus(e)
     if (status === 409) {
       created = await networking.replaceNamespacedNetworkPolicy({ name: policyName, namespace: req.dst_namespace, body })
     } else throw e
@@ -271,7 +283,7 @@ export async function createEgressNetworkPolicy(req: CreatePolicyRequest): Promi
   try {
     created = await networking.createNamespacedNetworkPolicy({ namespace: req.src_namespace, body })
   } catch (e: unknown) {
-    const status = (e as { statusCode?: number })?.statusCode
+    const status = getK8sStatus(e)
     if (status === 409) {
       created = await networking.replaceNamespacedNetworkPolicy({ name: policyName, namespace: req.src_namespace, body })
     } else throw e
@@ -628,7 +640,7 @@ export async function applyPolicyYAML(namespace: string, yamlStr: string): Promi
   try {
     await networking.createNamespacedNetworkPolicy({ namespace, body: policy })
   } catch (e: unknown) {
-    const status = (e as { statusCode?: number })?.statusCode
+    const status = getK8sStatus(e)
     if (status === 409) {
       await networking.replaceNamespacedNetworkPolicy({ name: policy.metadata!.name!, namespace, body: policy })
     } else throw e
