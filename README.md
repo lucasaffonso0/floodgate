@@ -6,7 +6,7 @@ Kubernetes NetworkPolicy manager with an interactive drag-and-drop graph UI. Vis
 
 ## Features
 
-- **Interactive graph** — services grouped by namespace, policies rendered as colored edges
+- **Interactive graph** — services grouped by namespace, policies rendered as colored edges; hide namespaces to focus the view — all edges follow
 - **Drag-and-drop** — draw connections between services to create allow rules
 - **Role-based access** — admin, ns_admin, viewer, audit
 - **Approval workflow** — require N approvals before a policy is applied
@@ -14,6 +14,8 @@ Kubernetes NetworkPolicy manager with an interactive drag-and-drop graph UI. Vis
 - **Real-time updates** — Server-Sent Events push changes to all connected users in < 100 ms
 - **Audit log** — every action recorded with user, timestamp, and details
 - **Namespace isolation** — one-click default-deny (ingress, egress, or both)
+- **CIDR/IP range policies** — allow or restrict traffic to/from external IP ranges (e.g. corporate VPN, managed databases, external APIs)
+- **Flow discovery** — Hubble/Cilium integration streams live traffic flows; one click creates a draft policy from any discovered connection
 - **Pause/Resume** — remove all policies from the cluster temporarily and restore them
 
 ---

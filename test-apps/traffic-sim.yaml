@@ -1,0 +1,291 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: frontend
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backend
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: infra
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: database
+---
+# frontend/app: SSR app (porta 80 + 443) → chama backend e infra
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app
+  template:
+    metadata:
+      labels:
+        app: app
+    spec:
+      containers:
+      - name: app
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\napp\n' > /www/index.html
+          busybox httpd -f -p 80 -h /www &
+          busybox httpd -f -p 443 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://worker.backend.svc.cluster.local:8080 2>/dev/null
+            sleep 8
+            wget -qT3 -O/dev/null http://haproxy.infra.svc.cluster.local:80 2>/dev/null
+            sleep 8
+          done
+        ports:
+        - containerPort: 80
+        - containerPort: 443
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app
+  namespace: frontend
+spec:
+  selector:
+    app: app
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+  - name: https
+    port: 443
+    targetPort: 443
+---
+# backend/worker: job worker (porta 8080) → consulta banco e métricas
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+      - name: worker
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nworker\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://pgbouncer.database.svc.cluster.local:6432 2>/dev/null
+            sleep 8
+            wget -qT3 -O/dev/null http://app.frontend.svc.cluster.local:80 2>/dev/null
+            sleep 8
+            wget -qT3 -O/dev/null http://grafana.monitoring.svc.cluster.local:3000 2>/dev/null
+            sleep 8
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker
+  namespace: backend
+spec:
+  selector:
+    app: worker
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# monitoring/grafana: dashboard (porta 3000) → scraping do backend e banco
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+      - name: grafana
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ngrafana\n' > /www/index.html
+          busybox httpd -f -p 3000 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://worker.backend.svc.cluster.local:8080 2>/dev/null
+            sleep 8
+            wget -qT3 -O/dev/null http://pgbouncer.database.svc.cluster.local:6432 2>/dev/null
+            sleep 8
+          done
+        ports:
+        - containerPort: 3000
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  selector:
+    app: grafana
+  ports:
+  - port: 3000
+    targetPort: 3000
+---
+# infra/haproxy: load balancer (porta 80) → forward para backend
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: haproxy
+  namespace: infra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: haproxy
+  template:
+    metadata:
+      labels:
+        app: haproxy
+    spec:
+      containers:
+      - name: haproxy
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhaproxy\n' > /www/index.html
+          busybox httpd -f -p 80 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://worker.backend.svc.cluster.local:8080 2>/dev/null
+            sleep 10
+          done
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: haproxy
+  namespace: infra
+spec:
+  selector:
+    app: haproxy
+  ports:
+  - port: 80
+    targetPort: 80
+---
+# database/pgbouncer: connection pooler (porta 6432) → healthcheck no backend e replica
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer
+  namespace: database
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pgbouncer
+  template:
+    metadata:
+      labels:
+        app: pgbouncer
+    spec:
+      containers:
+      - name: pgbouncer
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\npgbouncer\n' > /www/index.html
+          busybox httpd -f -p 6432 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://worker.backend.svc.cluster.local:8080 2>/dev/null
+            sleep 15
+            wget -qT3 -O/dev/null http://app.frontend.svc.cluster.local:80 2>/dev/null
+            sleep 15
+          done
+        ports:
+        - containerPort: 6432
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgbouncer
+  namespace: database
+spec:
+  selector:
+    app: pgbouncer
+  ports:
+  - port: 6432
+    targetPort: 6432

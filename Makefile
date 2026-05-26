@@ -6,7 +6,7 @@ HELM_RELEASE := floodgate
 HELM_CHART   := ./helm-app-template
 HELM_VALUES  := helm-app-template/helmvalues/values.yaml
 
-.PHONY: dev build load deploy port-forward logs
+.PHONY: dev build load deploy port-forward logs traffic-sim traffic-sim-stop
 
 # Hot reload local — sem Docker, sem kind
 dev:
@@ -34,3 +34,10 @@ port-forward:
 
 logs:
 	kubectl logs -n $(NS) deployment/$(HELM_RELEASE) -f
+
+# Simula tráfego contínuo entre os test-apps para gerar flows no Hubble
+traffic-sim:
+	kubectl apply -f test-apps/traffic-sim.yaml
+
+traffic-sim-stop:
+	kubectl delete -f test-apps/traffic-sim.yaml --ignore-not-found

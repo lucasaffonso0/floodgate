@@ -12,6 +12,8 @@ const DEFAULTS: AppConfig = {
   auto_default_deny_direction: 'ingress',
   autosync_enabled: false,
   autosync_interval_s: 60,
+  hubble_discovery_enabled: false,
+  hubble_flow_retention_days: 7,
 }
 
 function getRow(key: string): string | null {
@@ -30,6 +32,8 @@ export function getConfig(): AppConfig {
     auto_default_deny_direction:  (getRow('auto_default_deny_direction') ?? 'ingress') as AppConfig['auto_default_deny_direction'],
     autosync_enabled:             JSON.parse(getRow('autosync_enabled')             ?? 'false'),
     autosync_interval_s:          JSON.parse(getRow('autosync_interval_s')          ?? '60'),
+    hubble_discovery_enabled:     JSON.parse(getRow('hubble_discovery_enabled')     ?? 'false'),
+    hubble_flow_retention_days:   JSON.parse(getRow('hubble_flow_retention_days')   ?? '7'),
   }
 }
 
@@ -45,6 +49,8 @@ export function setConfig(c: AppConfig): void {
   upsert.run('auto_default_deny_direction', c.auto_default_deny_direction)
   upsert.run('autosync_enabled',    JSON.stringify(c.autosync_enabled))
   upsert.run('autosync_interval_s', JSON.stringify(c.autosync_interval_s))
+  upsert.run('hubble_discovery_enabled',   JSON.stringify(c.hubble_discovery_enabled ?? false))
+  upsert.run('hubble_flow_retention_days', JSON.stringify(c.hubble_flow_retention_days ?? 7))
 }
 
 export function isNamespaceWatched(namespace: string): boolean {

@@ -2,7 +2,7 @@ import axios from 'axios'
 import type {
   ServiceInfo, NetworkPolicyInfo, CreatePolicyRequest, NamespaceIngressRequest,
   PortSpec, AppConfig, User, AuditLog, ApprovalRequest, SecurityCoverage, NamespacePermission,
-  ServiceLayout, AutosyncStatus,
+  ServiceLayout, AutosyncStatus, CiliumFlowsResponse, CiliumFlowSummary, CidrPolicyRequest,
 } from '@/types'
 
 const api = axios.create({ baseURL: '/api' })
@@ -44,6 +44,9 @@ export const patchNetworkPolicyPort = (namespace: string, name: string, dst_port
 
 export const restrictService = (req: { service_name: string; namespace: string; direction: 'ingress' | 'egress' }): Promise<NetworkPolicyInfo> =>
   api.post('/networkpolicies/restrict', req).then(r => r.data)
+
+export const createCidrPolicy = (req: CidrPolicyRequest): Promise<NetworkPolicyInfo> =>
+  api.post('/networkpolicies/cidr', req).then(r => r.data)
 
 // ── Config ─────────────────────────────────────────────────────────────────
 export const getConfig = (): Promise<AppConfig> =>
@@ -130,8 +133,14 @@ export const getPausedPolicies = (): Promise<{ id: string; name: string; namespa
 export const pauseAllPolicies = (): Promise<{ paused: number }> =>
   api.post('/networkpolicies/pause').then(r => r.data)
 
+export const pausePolicy = (namespace: string, name: string): Promise<{ paused: number }> =>
+  api.post('/networkpolicies/pause', { namespace, name }).then(r => r.data)
+
 export const resumeAllPolicies = (): Promise<{ resumed: number }> =>
   api.post('/networkpolicies/resume').then(r => r.data)
+
+export const resumePolicy = (id: string): Promise<{ resumed: number }> =>
+  api.post('/networkpolicies/resume', { id }).then(r => r.data)
 
 // ── Service layout / namespace locks ──────────────────────────────────────
 export const getServiceLayout = (): Promise<{
@@ -166,3 +175,29 @@ export const getAutosyncStatus = (): Promise<AutosyncStatus> =>
 
 export const triggerAutosync = (): Promise<AutosyncStatus['last_result']> =>
   api.post('/autosync').then(r => r.data)
+
+// ── Cilium Auto-Discover ───────────────────────────────────────────────────
+export const getCiliumFlows = (): Promise<CiliumFlowsResponse> =>
+  api.get('/cilium/flows').then(r => r.data)
+
+export const clearCiliumFlows = (): Promise<void> =>
+  api.delete('/cilium/flows').then(() => undefined)
+
+export const checkHubble = (): Promise<{ available: boolean }> =>
+  api.get('/cilium/flows/check').then(r => r.data)
+
+export const getNetworkPolicyYaml = (namespace: string, name: string): Promise<string> =>
+  api.get(`/networkpolicies/${namespace}/${name}`, { headers: { Accept: 'application/yaml' } }).then(r => r.data)
+
+export const previewDiscoveryPolicyYAML = (
+  flow: CiliumFlowSummary,
+  direction: 'ingress' | 'egress' | 'both' = 'ingress',
+): Promise<string> =>
+  api.post('/networkpolicies/preview', {
+    src_workload: flow.src_workload,
+    src_namespace: flow.src_namespace,
+    dst_service: flow.dst_workload,
+    dst_namespace: flow.dst_namespace,
+    dst_ports: [{ port: flow.dst_port, protocol: flow.protocol }],
+    direction,
+  }, { responseType: 'text' }).then(r => r.data as string)

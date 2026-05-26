@@ -10,6 +10,8 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@grpc/grpc-js": "^1.14.4",
+    "@grpc/proto-loader": "^0.8.1",
     "@kubernetes/client-node": "^1.4.0",
     "@xyflow/react": "^12.3.6",
     "axios": "^1.7.9",

@@ -3,8 +3,28 @@ import { getCurrentUser, canManageNamespace } from '@/lib/auth'
 import { getDb } from '@/lib/db'
 import { logAudit } from '@/lib/audit'
 import { emit } from '@/lib/sse'
-import { createNetworkPolicy, createEgressNetworkPolicy, previewPolicyYAML } from '@/lib/k8s'
+import { createNetworkPolicy, createEgressNetworkPolicy, createCidrPolicy, previewPolicyYAML } from '@/lib/k8s'
 import type { ApprovalRequest, Draft, PortSpec } from '@/types'
+
+async function applyDraftPolicy(draft: Draft): Promise<void> {
+  if (draft.src_cidr || draft.dst_cidr) {
+    await createCidrPolicy({
+      namespace: draft.dst_namespace,
+      service_name: draft.dst_service || undefined,
+      cidr: (draft.src_cidr ?? draft.dst_cidr)!,
+      except: draft.cidr_except,
+      dst_ports: draft.dst_ports.length > 0 ? draft.dst_ports : undefined,
+      direction: draft.src_cidr ? 'ingress' : 'egress',
+    })
+    return
+  }
+  const apiReq = {
+    src_workload: draft.src_workload, src_namespace: draft.src_namespace,
+    dst_service: draft.dst_service, dst_namespace: draft.dst_namespace, dst_ports: draft.dst_ports,
+  }
+  if (draft.policy_direction === 'ingress' || draft.policy_direction === 'both') await createNetworkPolicy(apiReq)
+  if (draft.policy_direction === 'egress'  || draft.policy_direction === 'both') await createEgressNetworkPolicy(apiReq)
+}
 
 function normalizeDraft(draft: Draft & { dst_port?: number }): Draft {
   if (draft.dst_ports === undefined) {
@@ -161,13 +181,8 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     let autoApplyError: string | null = null
     if (updated.approve_count >= updated.approvals_required && updated.reject_count === 0) {
       const draft = normalizeDraft(updated.draft_data as Draft & { dst_port?: number })
-      const apiReq = {
-        src_workload: draft.src_workload, src_namespace: draft.src_namespace,
-        dst_service: draft.dst_service, dst_namespace: draft.dst_namespace, dst_ports: draft.dst_ports,
-      }
       try {
-        if (draft.policy_direction === 'ingress' || draft.policy_direction === 'both') await createNetworkPolicy(apiReq)
-        if (draft.policy_direction === 'egress'  || draft.policy_direction === 'both') await createEgressNetworkPolicy(apiReq)
+        await applyDraftPolicy(draft)
         getDb().prepare("UPDATE approval_requests SET status='applied', applied_at=datetime('now') WHERE id=?").run(id)
         logAudit({ user_id: user.sub, username: user.username, action: 'auto_apply_approval_request', resource_type: 'ApprovalRequest', resource_name: id, namespace: draft.dst_namespace })
         emit({ type: 'approval_applied', id })
@@ -199,12 +214,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     const canManage = await canManageNamespace(user.sub, user.role, draft.dst_namespace)
     if (!canManage) return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
 
-    const apiReq = {
-      src_workload: draft.src_workload, src_namespace: draft.src_namespace,
-      dst_service: draft.dst_service,   dst_namespace: draft.dst_namespace, dst_ports: draft.dst_ports,
-    }
-    if (draft.policy_direction === 'ingress' || draft.policy_direction === 'both') await createNetworkPolicy(apiReq)
-    if (draft.policy_direction === 'egress'  || draft.policy_direction === 'both') await createEgressNetworkPolicy(apiReq)
+    await applyDraftPolicy(draft)
 
     getDb().prepare("UPDATE approval_requests SET status='applied', applied_at=datetime('now') WHERE id=?").run(id)
     logAudit({ user_id: user.sub, username: user.username, action: 'apply_approval_request', resource_type: 'ApprovalRequest', resource_name: id, namespace: draft.dst_namespace })
