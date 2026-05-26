@@ -10,6 +10,7 @@ export type SSEEvent =
   | { type: 'policy_deleted' }
   | { type: 'policies_paused' }
   | { type: 'policies_resumed' }
+  | { type: 'hubble_flow_new' }
 
 type Writer = (chunk: string) => void
 

@@ -1,7 +1,7 @@
 import 'server-only'
 import * as k8s from '@kubernetes/client-node'
 import yaml from 'js-yaml'
-import type { ServiceInfo, NetworkPolicyInfo, CreatePolicyRequest, PortSpec, RestrictPolicyRequest, IsolateNamespaceRequest } from '@/types'
+import type { ServiceInfo, NetworkPolicyInfo, CreatePolicyRequest, PortSpec, RestrictPolicyRequest, IsolateNamespaceRequest, CidrPolicyRequest } from '@/types'
 
 const MANAGED_BY = 'floodgate'
 
@@ -565,6 +565,55 @@ export async function isolateNamespace(req: IsolateNamespaceRequest): Promise<{ 
   return { created, skipped }
 }
 
+export async function createCidrPolicy(req: CidrPolicyRequest): Promise<NetworkPolicyInfo> {
+  const { namespace, service_name, cidr, except, dst_ports, direction } = req
+
+  const podSelector = service_name ? await getServiceSelector(service_name, namespace) : {}
+
+  const kPorts = (dst_ports?.length ?? 0) > 0
+    ? dst_ports!.map(p => ({ protocol: p.protocol as string, port: p.port as unknown as number }))
+    : undefined
+
+  const ipBlock: k8s.V1IPBlock = { cidr, ...(except?.length ? { except } : {}) }
+  const policyType = `cidr-${direction}` as 'cidr-ingress' | 'cidr-egress'
+  const safeCidr = cidr.replace(/\//g, '-').replace(/\./g, '-')
+  const policyName = `floodgate-cidr-${direction}-${safeCidr}${service_name ? `-${service_name}` : ''}`.slice(0, 63)
+
+  const spec: k8s.V1NetworkPolicySpec = {
+    podSelector: { matchLabels: podSelector },
+    policyTypes: [direction === 'ingress' ? 'Ingress' : 'Egress'],
+    ...(direction === 'ingress'
+      ? { ingress: [{ _from: [{ ipBlock }], ...(kPorts ? { ports: kPorts } : {}) }] }
+      : { egress:  [{ to:    [{ ipBlock }], ...(kPorts ? { ports: kPorts } : {}) }] }),
+  }
+
+  const labels: Record<string, string> = {
+    'managed-by': MANAGED_BY,
+    'floodgate-policy-type': policyType,
+    'target-service': service_name ?? '',
+    'target-port': String(dst_ports?.[0]?.port ?? 0),
+    'source-workload': '',
+    'source-namespace': '',
+  }
+
+  const body = { metadata: { name: policyName, namespace, labels }, spec }
+
+  try {
+    await networking.createNamespacedNetworkPolicy({ namespace, body })
+  } catch (e: unknown) {
+    if (getK8sStatus(e) !== 409) throw e
+    await networking.replaceNamespacedNetworkPolicy({ namespace, name: policyName, body })
+  }
+
+  return {
+    name: policyName, namespace, managed: true, policy_type: policyType,
+    src_workload: '', src_namespace: '',
+    dst_service: service_name ?? '', dst_port: 0,
+    dst_ports: dst_ports ?? [], policy_types: [direction === 'ingress' ? 'Ingress' : 'Egress'],
+    pod_selector: podSelector, ingress_count: 0, egress_count: 0,
+  }
+}
+
 export async function previewPolicyYAML(
   req: CreatePolicyRequest,
   direction: 'ingress' | 'egress' | 'both',
@@ -720,4 +769,13 @@ export async function exportManagedPoliciesYAML(): Promise<string> {
     }
     return yaml.dump(clean, { lineWidth: -1 })
   }).join('---\n')
+}
+
+export async function checkHubbleRelayReady(): Promise<boolean> {
+  try {
+    const ep = await core.readNamespacedEndpoints({ name: 'hubble-relay', namespace: 'kube-system' })
+    return ep.subsets?.some(s => (s.addresses?.length ?? 0) > 0) ?? false
+  } catch {
+    return false
+  }
 }

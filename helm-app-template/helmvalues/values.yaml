@@ -196,7 +196,7 @@ rbac:
   # Rules granted to the ServiceAccount
   rules:
     - apiGroups: [""]
-      resources: ["services", "namespaces"]
+      resources: ["services", "namespaces", "endpoints"]
       verbs: ["get", "list", "watch"]
     - apiGroups: ["networking.k8s.io"]
       resources: ["networkpolicies"]

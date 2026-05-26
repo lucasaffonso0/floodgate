@@ -1,0 +1,52 @@
+syntax = "proto3";
+package flow;
+option go_package = "github.com/cilium/cilium/api/v1/flow";
+
+import "google/protobuf/timestamp.proto";
+
+enum Verdict {
+  VERDICT_UNKNOWN = 0;
+  FORWARDED = 1;
+  DROPPED = 2;
+  ERROR = 3;
+  AUDIT = 4;
+}
+
+message Flow {
+  google.protobuf.Timestamp time = 1;
+  Verdict verdict = 2;
+  Endpoint source = 8;
+  Endpoint destination = 9;
+  Layer4 l4 = 6;
+}
+
+message Endpoint {
+  uint32 ID = 1;
+  uint32 identity = 2;
+  string namespace = 3;
+  repeated string labels = 4;
+  string pod_name = 5;
+  repeated Workload workloads = 6;
+}
+
+message Workload {
+  string name = 1;
+  string kind = 2;
+}
+
+message Layer4 {
+  oneof protocol {
+    TCP TCP = 1;
+    UDP UDP = 2;
+  }
+}
+
+message TCP {
+  uint32 source_port = 1;
+  uint32 destination_port = 2;
+}
+
+message UDP {
+  uint32 source_port = 1;
+  uint32 destination_port = 2;
+}

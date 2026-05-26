@@ -2,20 +2,33 @@
 # Floodgate NetworkPolicy Test Suite
 # Usage: ./run-tests.sh [scenario]
 #
-# Tests run FROM the actual application pods (nginx, httpd, db, metrics) so that
-# Floodgate's podSelector-based allow rules are exercised correctly.
-# infra/whoami (nginx:alpine) usado como source de infra
+# Tests run FROM the actual application pods (app, worker, haproxy, pgbouncer, grafana)
+# so that Floodgate's podSelector-based allow rules are exercised correctly.
+#
+# Topology (traffic-sim.yaml):
+#   frontend/app       port 80+443
+#   backend/worker     port 8080
+#   infra/haproxy      port 80
+#   database/pgbouncer port 6432
+#   monitoring/grafana port 3000
 #
 # Scenarios:
-#   baseline              — Nenhuma policy, tudo deve ser OPEN
-#   restrict-db-ingress   — restrict-ingress aplicado em database/db
-#   allow-backend-to-db   — allow ingress de backend/httpd → database/db (restrict ainda ativo)
-#   restrict-frontend-egress — restrict-egress em frontend/nginx
-#   allow-egress-internet — restrict-egress em frontend + internet egress liberado (80/443)
-#   isolate-database      — namespace database completamente isolado (sem intra-namespace)
-#   isolate-database-intra — namespace database isolado + tráfego interno liberado
-#   allow-ns-monitoring   — allow namespace monitoring → backend/httpd
-#   scan                  — apenas escaneia e mostra estado atual (sem expected)
+#   baseline                    — No policies, everything OPEN
+#   restrict-db-ingress         — restrict-ingress on database/pgbouncer
+#   allow-backend-to-db         — restrict-ingress pgbouncer + allow worker→pgbouncer
+#   restrict-frontend-egress    — restrict-egress on frontend/app
+#   allow-egress-internet       — restrict-egress frontend + internet egress (80/443)
+#   isolate-database-allow-backend — namespace-isolate database (ingress) + allow worker→pgbouncer
+#   isolate-database            — full namespace isolation (both directions, no intra)
+#   isolate-database-intra      — full isolation + intra-namespace allow
+#   allow-ns-monitoring         — restrict-ingress worker + allow namespace monitoring→worker
+#   restrict-db-egress-allow-backend — restrict-egress pgbouncer + allow egress pgbouncer→worker
+#   isolate-db-egress-allow-backend  — namespace-isolate database egress + allow pgbouncer→worker
+#   restrict-multiple           — restrict-ingress pgbouncer AND worker simultaneously
+#   protocol-tcp-explicit       — allow TCP explicit port
+#   protocol-udp-blocks-tcp     — UDP-only allow does not unblock TCP
+#   protocol-multiport          — multi-port TCP+UDP allow
+#   scan                        — scan and display current connectivity state
 
 set -euo pipefail
 
@@ -128,24 +141,20 @@ print_summary() {
 
 wait_pods() {
   echo -e "${YELLOW}Aguardando pods ficarem Ready...${NC}"
-  kubectl wait --for=condition=Ready pod -l app=nginx       -n frontend  --timeout=60s 2>/dev/null || true
-  kubectl wait --for=condition=Ready pod -l app=httpd       -n backend   --timeout=60s 2>/dev/null || true
-  kubectl wait --for=condition=Ready pod -l app=whoami      -n infra     --timeout=60s 2>/dev/null || true
-  kubectl wait --for=condition=Ready pod -l app=db          -n database  --timeout=60s 2>/dev/null || true
-  kubectl wait --for=condition=Ready pod -l app=db-replica  -n database  --timeout=60s 2>/dev/null || true
-  kubectl wait --for=condition=Ready pod -l app=metrics     -n monitoring --timeout=60s 2>/dev/null || true
-  kubectl wait --for=condition=Ready pod -l app=alertmanager -n monitoring --timeout=60s 2>/dev/null || true
+  kubectl wait --for=condition=Ready pod -l app=app       -n frontend   --timeout=60s 2>/dev/null || true
+  kubectl wait --for=condition=Ready pod -l app=worker    -n backend    --timeout=60s 2>/dev/null || true
+  kubectl wait --for=condition=Ready pod -l app=haproxy   -n infra      --timeout=60s 2>/dev/null || true
+  kubectl wait --for=condition=Ready pod -l app=pgbouncer -n database   --timeout=60s 2>/dev/null || true
+  kubectl wait --for=condition=Ready pod -l app=grafana   -n monitoring --timeout=60s 2>/dev/null || true
   echo ""
 }
 
 # ── Targets ───────────────────────────────────────────────────────────────────
-FRONTEND="http://nginx.frontend.svc.cluster.local:8080"
-BACKEND="http://httpd.backend.svc.cluster.local:8081"
-INFRA="http://whoami.infra.svc.cluster.local:80"
-DATABASE="http://db.database.svc.cluster.local:5432"
-DB_REPLICA="http://db-replica.database.svc.cluster.local:5432"
-MONITORING="http://metrics.monitoring.svc.cluster.local:9090"
-ALERTMGR="http://alertmanager.monitoring.svc.cluster.local:9093"
+FRONTEND="http://app.frontend.svc.cluster.local:80"
+BACKEND="http://worker.backend.svc.cluster.local:8080"
+INFRA="http://haproxy.infra.svc.cluster.local:80"
+DATABASE="http://pgbouncer.database.svc.cluster.local:6432"
+MONITORING="http://grafana.monitoring.svc.cluster.local:3000"
 INTERNET="http://1.1.1.1"
 
 # ── Scenarios ─────────────────────────────────────────────────────────────────
@@ -154,101 +163,96 @@ scenario_baseline() {
   echo -e "\n${BOLD}${BLUE}Cenário: BASELINE — Sem policies, tudo OPEN${NC}"
   separator
 
-  header "FROM: frontend/nginx"
-  check frontend nginx "$BACKEND"    OPEN
-  check frontend nginx "$INFRA"      OPEN
-  check frontend nginx "$DATABASE"   OPEN
-  check frontend nginx "$MONITORING" OPEN
-  check frontend nginx "$INTERNET"   OPEN
+  header "FROM: frontend/app"
+  check frontend app "$BACKEND"    OPEN
+  check frontend app "$INFRA"      OPEN
+  check frontend app "$DATABASE"   OPEN
+  check frontend app "$MONITORING" OPEN
+  check frontend app "$INTERNET"   OPEN
 
-  header "FROM: backend/httpd"
-  check backend httpd "$FRONTEND"   OPEN
-  check backend httpd "$INFRA"      OPEN
-  check backend httpd "$DATABASE"   OPEN
-  check backend httpd "$MONITORING" OPEN
-  check backend httpd "$INTERNET"   OPEN
+  header "FROM: backend/worker"
+  check backend worker "$FRONTEND"   OPEN
+  check backend worker "$INFRA"      OPEN
+  check backend worker "$DATABASE"   OPEN
+  check backend worker "$MONITORING" OPEN
+  check backend worker "$INTERNET"   OPEN
 
-  header "FROM: infra/whoami"
-  check infra whoami "$FRONTEND"   OPEN
-  check infra whoami "$BACKEND"    OPEN
-  check infra whoami "$DATABASE"   OPEN
-  check infra whoami "$MONITORING" OPEN
-  check infra whoami "$INTERNET"   OPEN
+  header "FROM: infra/haproxy"
+  check infra haproxy "$FRONTEND"   OPEN
+  check infra haproxy "$BACKEND"    OPEN
+  check infra haproxy "$DATABASE"   OPEN
+  check infra haproxy "$MONITORING" OPEN
+  check infra haproxy "$INTERNET"   OPEN
 
-  header "FROM: database/db"
-  check database db "$FRONTEND"    OPEN
-  check database db "$BACKEND"     OPEN
-  check database db "$INFRA"       OPEN
-  check database db "$DB_REPLICA"  OPEN
-  check database db "$MONITORING"  OPEN
-  check database db "$INTERNET"    OPEN
+  header "FROM: database/pgbouncer"
+  check database pgbouncer "$FRONTEND"   OPEN
+  check database pgbouncer "$BACKEND"    OPEN
+  check database pgbouncer "$INFRA"      OPEN
+  check database pgbouncer "$MONITORING" OPEN
+  check database pgbouncer "$INTERNET"   OPEN
 
-  header "FROM: monitoring/metrics"
-  check monitoring metrics "$FRONTEND"  OPEN
-  check monitoring metrics "$BACKEND"   OPEN
-  check monitoring metrics "$INFRA"     OPEN
-  check monitoring metrics "$DATABASE"  OPEN
-  check monitoring metrics "$ALERTMGR"  OPEN
-  check monitoring metrics "$INTERNET"  OPEN
+  header "FROM: monitoring/grafana"
+  check monitoring grafana "$FRONTEND"  OPEN
+  check monitoring grafana "$BACKEND"   OPEN
+  check monitoring grafana "$INFRA"     OPEN
+  check monitoring grafana "$DATABASE"  OPEN
+  check monitoring grafana "$INTERNET"  OPEN
 
   print_summary "Resultado Baseline"
 }
 
 scenario_restrict_db_ingress() {
-  echo -e "\n${BOLD}${BLUE}Cenário: restrict-ingress em database/db${NC}"
+  echo -e "\n${BOLD}${BLUE}Cenário: restrict-ingress em database/pgbouncer${NC}"
   separator
 
-  header "Ingresso bloqueado para database/db"
-  check frontend   nginx    "$DATABASE" BLOCKED
-  check backend    httpd    "$DATABASE" BLOCKED
-  check infra      whoami   "$DATABASE" BLOCKED
-  check monitoring metrics  "$DATABASE" BLOCKED
+  header "Ingresso bloqueado para database/pgbouncer"
+  check frontend   app      "$DATABASE" BLOCKED
+  check backend    worker   "$DATABASE" BLOCKED
+  check infra      haproxy  "$DATABASE" BLOCKED
+  check monitoring grafana  "$DATABASE" BLOCKED
 
   header "Outras conexões não afetadas"
-  check frontend nginx    "$BACKEND"    OPEN
-  check frontend nginx    "$MONITORING" OPEN
-  check backend  httpd    "$INFRA"      OPEN
+  check frontend app    "$BACKEND"    OPEN
+  check frontend app    "$MONITORING" OPEN
+  check backend  worker "$INFRA"      OPEN
 
-  header "Egress de database/db ainda funciona"
-  check database db "$BACKEND"  OPEN
-  check database db "$INTERNET" OPEN
+  header "Egress de pgbouncer ainda funciona"
+  check database pgbouncer "$BACKEND"  OPEN
+  check database pgbouncer "$INTERNET" OPEN
 
-  print_summary "Resultado: restrict-ingress em database/db"
+  print_summary "Resultado: restrict-ingress em database/pgbouncer"
 }
 
 scenario_allow_backend_to_db() {
-  echo -e "\n${BOLD}${BLUE}Cenário: restrict-ingress db + allow backend/httpd → database/db${NC}"
+  echo -e "\n${BOLD}${BLUE}Cenário: restrict-ingress pgbouncer + allow backend/worker → database/pgbouncer${NC}"
   separator
 
-  header "Somente backend/httpd pode acessar database/db"
-  check backend    httpd   "$DATABASE" OPEN
-  check frontend   nginx   "$DATABASE" BLOCKED
-  check infra      whoami  "$DATABASE" BLOCKED
-  check monitoring metrics "$DATABASE" BLOCKED
+  header "Somente backend/worker pode acessar database/pgbouncer"
+  check backend    worker   "$DATABASE" OPEN
+  check frontend   app      "$DATABASE" BLOCKED
+  check infra      haproxy  "$DATABASE" BLOCKED
+  check monitoring grafana  "$DATABASE" BLOCKED
 
-  header "db-replica sem policy — permanece acessível"
-  check backend httpd "$DB_REPLICA" OPEN
-
-  print_summary "Resultado: allow backend/httpd→database/db"
+  print_summary "Resultado: allow worker→pgbouncer"
 }
 
 scenario_restrict_frontend_egress() {
-  echo -e "\n${BOLD}${BLUE}Cenário: restrict-egress em frontend/nginx${NC}"
+  echo -e "\n${BOLD}${BLUE}Cenário: restrict-egress em frontend/app${NC}"
   separator
 
-  header "Egress de frontend/nginx bloqueado"
-  check frontend nginx "$BACKEND"    BLOCKED
-  check frontend nginx "$DATABASE"   BLOCKED
-  check frontend nginx "$INFRA"      BLOCKED
-  check frontend nginx "$MONITORING" BLOCKED
-  check frontend nginx "$INTERNET"   BLOCKED
+  header "Egress de frontend/app bloqueado"
+  check frontend app "$BACKEND"    BLOCKED
+  check frontend app "$DATABASE"   BLOCKED
+  check frontend app "$INFRA"      BLOCKED
+  check frontend app "$MONITORING" BLOCKED
+  check frontend app "$INTERNET"   BLOCKED
 
-  header "Ingress para frontend/nginx ainda funciona"
-  check backend    httpd   "$FRONTEND" OPEN
-  check monitoring metrics "$FRONTEND" OPEN
-  check infra      whoami  "$FRONTEND" OPEN
+  header "Ingress para frontend/app ainda funciona"
+  check backend    worker   "$FRONTEND" OPEN
+  check monitoring grafana  "$FRONTEND" OPEN
+  check infra      haproxy  "$FRONTEND" OPEN
 
-  print_summary "Resultado: restrict-egress em frontend/nginx"
+  print_summary "Resultado: restrict-egress em frontend/app"
 }
 
 scenario_allow_egress_internet() {
@@ -256,34 +260,31 @@ scenario_allow_egress_internet() {
   separator
 
   header "Internet acessível (port 80)"
-  check frontend nginx "$INTERNET" OPEN
+  check frontend app "$INTERNET" OPEN
 
   header "Rede interna ainda bloqueada"
-  check frontend nginx "$BACKEND"    BLOCKED
-  check frontend nginx "$DATABASE"   BLOCKED
-  check frontend nginx "$MONITORING" BLOCKED
+  check frontend app "$BACKEND"    BLOCKED
+  check frontend app "$DATABASE"   BLOCKED
+  check frontend app "$MONITORING" BLOCKED
 
-  print_summary "Resultado: internet egress no frontend/nginx"
+  print_summary "Resultado: internet egress no frontend/app"
 }
 
 scenario_isolate_database_allow_backend() {
-  echo -e "\n${BOLD}${BLUE}Cenário: namespace-isolate database + allow backend/httpd → database/db${NC}"
+  echo -e "\n${BOLD}${BLUE}Cenário: namespace-isolate database (ingress) + allow backend/worker → database/pgbouncer${NC}"
   separator
 
-  header "Somente backend/httpd acessa database/db"
-  check backend    httpd   "$DATABASE" OPEN
-  check frontend   nginx   "$DATABASE" BLOCKED
-  check infra      whoami  "$DATABASE" BLOCKED
-  check monitoring metrics "$DATABASE" BLOCKED
+  header "Somente backend/worker acessa database/pgbouncer"
+  check backend    worker   "$DATABASE" OPEN
+  check frontend   app      "$DATABASE" BLOCKED
+  check infra      haproxy  "$DATABASE" BLOCKED
+  check monitoring grafana  "$DATABASE" BLOCKED
 
-  header "db-replica sem allow específico — permanece bloqueada"
-  check backend httpd "$DB_REPLICA" BLOCKED
+  header "Egress de pgbouncer ainda funciona (só ingress isolado)"
+  check database pgbouncer "$BACKEND"  OPEN
+  check database pgbouncer "$INTERNET" OPEN
 
-  header "Egress de database/db ainda funciona (só ingress isolado)"
-  check database db "$BACKEND"  OPEN
-  check database db "$INTERNET" OPEN
-
-  print_summary "Resultado: namespace-isolate database + allow backend→db"
+  print_summary "Resultado: namespace-isolate database + allow worker→pgbouncer"
 }
 
 scenario_isolate_database() {
@@ -291,20 +292,17 @@ scenario_isolate_database() {
   separator
 
   header "Ingresso bloqueado de todos os namespaces"
-  check frontend   nginx    "$DATABASE" BLOCKED
-  check backend    httpd    "$DATABASE" BLOCKED
-  check infra      whoami   "$DATABASE" BLOCKED
-  check monitoring metrics  "$DATABASE" BLOCKED
+  check frontend   app      "$DATABASE" BLOCKED
+  check backend    worker   "$DATABASE" BLOCKED
+  check infra      haproxy  "$DATABASE" BLOCKED
+  check monitoring grafana  "$DATABASE" BLOCKED
 
-  header "Egress de database/db bloqueado"
-  check database db "$FRONTEND"   BLOCKED
-  check database db "$BACKEND"    BLOCKED
-  check database db "$INFRA"      BLOCKED
-  check database db "$MONITORING" BLOCKED
-  check database db "$INTERNET"   BLOCKED
-
-  header "Intra-namespace também bloqueado (sem allow-intra)"
-  check database db "$DB_REPLICA" BLOCKED
+  header "Egress de pgbouncer bloqueado"
+  check database pgbouncer "$FRONTEND"   BLOCKED
+  check database pgbouncer "$BACKEND"    BLOCKED
+  check database pgbouncer "$INFRA"      BLOCKED
+  check database pgbouncer "$MONITORING" BLOCKED
+  check database pgbouncer "$INTERNET"   BLOCKED
 
   print_summary "Resultado: isolamento total database"
 }
@@ -314,77 +312,132 @@ scenario_isolate_database_intra() {
   separator
 
   header "Externo ainda bloqueado"
-  check frontend   nginx    "$DATABASE" BLOCKED
-  check backend    httpd    "$DATABASE" BLOCKED
-  check infra      whoami   "$DATABASE" BLOCKED
-  check monitoring metrics  "$DATABASE" BLOCKED
+  check frontend   app      "$DATABASE" BLOCKED
+  check backend    worker   "$DATABASE" BLOCKED
+  check infra      haproxy  "$DATABASE" BLOCKED
+  check monitoring grafana  "$DATABASE" BLOCKED
 
-  header "Intra-namespace database/db → database OPEN"
-  check database db "$DB_REPLICA" OPEN
-  check database db "$DATABASE"   OPEN
+  header "Intra-namespace database/pgbouncer → pgbouncer service OPEN"
+  check database pgbouncer "$DATABASE" OPEN
 
   header "Egress para fora do namespace bloqueado"
-  check database db "$BACKEND"  BLOCKED
-  check database db "$INTERNET" BLOCKED
+  check database pgbouncer "$BACKEND"  BLOCKED
+  check database pgbouncer "$INTERNET" BLOCKED
 
   print_summary "Resultado: isolamento com intra-namespace liberado"
 }
 
 scenario_allow_ns_monitoring() {
-  echo -e "\n${BOLD}${BLUE}Cenário: allow namespace monitoring → backend/httpd${NC}"
+  echo -e "\n${BOLD}${BLUE}Cenário: restrict-ingress worker + allow namespace monitoring → backend/worker${NC}"
   separator
 
-  header "monitoring pode acessar backend/httpd"
-  check monitoring metrics    "$BACKEND"  OPEN
-  check monitoring alertmanager "$ALERTMGR" OPEN
+  header "monitoring pode acessar backend/worker"
+  check monitoring grafana "$BACKEND" OPEN
 
-  header "Outros namespaces ainda bloqueados em backend/httpd"
-  check frontend nginx  "$BACKEND" BLOCKED
-  check infra    whoami "$BACKEND" BLOCKED
-  check database db     "$BACKEND" BLOCKED
+  header "Outros namespaces ainda bloqueados em backend/worker"
+  check frontend   app      "$BACKEND" BLOCKED
+  check infra      haproxy  "$BACKEND" BLOCKED
+  check database   pgbouncer "$BACKEND" BLOCKED
 
-  print_summary "Resultado: allow namespace monitoring→backend/httpd"
+  print_summary "Resultado: allow namespace monitoring→backend/worker"
+}
+
+scenario_restrict_db_egress_allow_backend() {
+  echo -e "\n${BOLD}${BLUE}Cenário: restrict-egress em database/pgbouncer + allow egress pgbouncer → backend/worker${NC}"
+  separator
+
+  header "Egress de pgbouncer bloqueado (exceto backend/worker)"
+  check database pgbouncer "$BACKEND"    OPEN
+  check database pgbouncer "$FRONTEND"   BLOCKED
+  check database pgbouncer "$MONITORING" BLOCKED
+  check database pgbouncer "$INTERNET"   BLOCKED
+
+  header "Ingress para database/pgbouncer não afetado (egress não restringe ingress)"
+  check backend    worker  "$DATABASE" OPEN
+  check frontend   app     "$DATABASE" OPEN
+  check monitoring grafana "$DATABASE" OPEN
+
+  print_summary "Resultado: restrict-egress pgbouncer + allow egress pgbouncer→worker"
+}
+
+scenario_isolate_db_egress_allow_backend() {
+  echo -e "\n${BOLD}${BLUE}Cenário: namespace-isolate database (egress) + allow egress pgbouncer → backend/worker${NC}"
+  separator
+
+  header "Somente pgbouncer pode sair para backend/worker"
+  check database pgbouncer "$BACKEND"    OPEN
+  check database pgbouncer "$FRONTEND"   BLOCKED
+  check database pgbouncer "$MONITORING" BLOCKED
+  check database pgbouncer "$INTERNET"   BLOCKED
+
+  header "Ingresso no namespace database não afetado"
+  check backend    worker  "$DATABASE" OPEN
+  check frontend   app     "$DATABASE" OPEN
+  check monitoring grafana "$DATABASE" OPEN
+
+  print_summary "Resultado: namespace-isolate database egress + allow pgbouncer→worker"
+}
+
+scenario_restrict_multiple() {
+  echo -e "\n${BOLD}${BLUE}Cenário: restrict-ingress em database/pgbouncer E backend/worker simultaneamente${NC}"
+  separator
+
+  header "database/pgbouncer bloqueado para todos"
+  check frontend   app      "$DATABASE" BLOCKED
+  check backend    worker   "$DATABASE" BLOCKED
+  check monitoring grafana  "$DATABASE" BLOCKED
+
+  header "backend/worker bloqueado para todos"
+  check frontend   app      "$BACKEND"  BLOCKED
+  check infra      haproxy  "$BACKEND"  BLOCKED
+  check monitoring grafana  "$BACKEND"  BLOCKED
+
+  header "Outros serviços não afetados"
+  check frontend   app      "$MONITORING" OPEN
+  check frontend   app      "$INFRA"      OPEN
+  check database   pgbouncer "$FRONTEND"  OPEN
+  check database   pgbouncer "$INTERNET"  OPEN
+
+  print_summary "Resultado: restrict-ingress múltiplos serviços"
 }
 
 scenario_scan() {
   echo -e "\n${BOLD}${BLUE}Scan — estado atual de conectividade${NC}"
   separator
 
-  header "FROM: frontend/nginx"
-  check frontend nginx "$BACKEND"
-  check frontend nginx "$INFRA"
-  check frontend nginx "$DATABASE"
-  check frontend nginx "$MONITORING"
-  check frontend nginx "$INTERNET"
+  header "FROM: frontend/app"
+  check frontend app "$BACKEND"
+  check frontend app "$INFRA"
+  check frontend app "$DATABASE"
+  check frontend app "$MONITORING"
+  check frontend app "$INTERNET"
 
-  header "FROM: backend/httpd"
-  check backend httpd "$FRONTEND"
-  check backend httpd "$INFRA"
-  check backend httpd "$DATABASE"
-  check backend httpd "$MONITORING"
-  check backend httpd "$INTERNET"
+  header "FROM: backend/worker"
+  check backend worker "$FRONTEND"
+  check backend worker "$INFRA"
+  check backend worker "$DATABASE"
+  check backend worker "$MONITORING"
+  check backend worker "$INTERNET"
 
-  header "FROM: infra/whoami"
-  check infra whoami "$FRONTEND"
-  check infra whoami "$BACKEND"
-  check infra whoami "$DATABASE"
-  check infra whoami "$MONITORING"
-  check infra whoami "$INTERNET"
+  header "FROM: infra/haproxy"
+  check infra haproxy "$FRONTEND"
+  check infra haproxy "$BACKEND"
+  check infra haproxy "$DATABASE"
+  check infra haproxy "$MONITORING"
+  check infra haproxy "$INTERNET"
 
-  header "FROM: database/db"
-  check database db "$FRONTEND"
-  check database db "$BACKEND"
-  check database db "$DB_REPLICA"
-  check database db "$MONITORING"
-  check database db "$INTERNET"
+  header "FROM: database/pgbouncer"
+  check database pgbouncer "$FRONTEND"
+  check database pgbouncer "$BACKEND"
+  check database pgbouncer "$MONITORING"
+  check database pgbouncer "$INTERNET"
 
-  header "FROM: monitoring/metrics"
-  check monitoring metrics "$FRONTEND"
-  check monitoring metrics "$BACKEND"
-  check monitoring metrics "$INFRA"
-  check monitoring metrics "$DATABASE"
-  check monitoring metrics "$ALERTMGR"
-  check monitoring metrics "$INTERNET"
+  header "FROM: monitoring/grafana"
+  check monitoring grafana "$FRONTEND"
+  check monitoring grafana "$BACKEND"
+  check monitoring grafana "$INFRA"
+  check monitoring grafana "$DATABASE"
+  check monitoring grafana "$INTERNET"
 
   flush
   echo ""
@@ -394,113 +447,51 @@ scenario_scan() {
   echo ""
 }
 
-scenario_restrict_db_egress_allow_backend() {
-  echo -e "\n${BOLD}${BLUE}Cenário: restrict-egress em database/db + allow egress db → backend/httpd${NC}"
-  separator
-
-  header "Egress de database/db bloqueado (exceto backend/httpd)"
-  check database db "$BACKEND"    OPEN
-  check database db "$FRONTEND"   BLOCKED
-  check database db "$MONITORING" BLOCKED
-  check database db "$INTERNET"   BLOCKED
-
-  header "Ingress para database/db não afetado (egress não restringe ingress)"
-  check backend    httpd   "$DATABASE" OPEN
-  check frontend   nginx   "$DATABASE" OPEN
-  check monitoring metrics "$DATABASE" OPEN
-
-  print_summary "Resultado: restrict-egress db + allow egress db→backend"
-}
-
-scenario_isolate_db_egress_allow_backend() {
-  echo -e "\n${BOLD}${BLUE}Cenário: namespace-isolate database (egress) + allow egress db → backend/httpd${NC}"
-  separator
-
-  header "Somente database/db pode sair para backend/httpd"
-  check database db "$BACKEND"    OPEN
-  check database db "$FRONTEND"   BLOCKED
-  check database db "$MONITORING" BLOCKED
-  check database db "$INTERNET"   BLOCKED
-
-  header "Ingresso no namespace database não afetado"
-  check backend    httpd   "$DATABASE" OPEN
-  check frontend   nginx   "$DATABASE" OPEN
-  check monitoring metrics "$DATABASE" OPEN
-
-  header "Intra-namespace database também bloqueado (egress isolado, sem intra-allow)"
-  check database db "$DB_REPLICA" BLOCKED
-
-  print_summary "Resultado: namespace-isolate database egress + allow db→backend"
-}
-
 scenario_protocol_tcp_explicit() {
-  echo -e "\n${BOLD}${BLUE}Cenário: policy com protocol: TCP explícito — httpd → database/db${NC}"
+  echo -e "\n${BOLD}${BLUE}Cenário: policy com protocol: TCP explícito — worker → database/pgbouncer${NC}"
   separator
 
-  header "TCP explícito: backend/httpd acessa database/db"
-  check backend    httpd   "$DATABASE" OPEN
-  check frontend   nginx   "$DATABASE" BLOCKED
-  check infra      whoami  "$DATABASE" BLOCKED
-  check monitoring metrics "$DATABASE" BLOCKED
+  header "TCP explícito: backend/worker acessa database/pgbouncer"
+  check backend    worker   "$DATABASE" OPEN
+  check frontend   app      "$DATABASE" BLOCKED
+  check infra      haproxy  "$DATABASE" BLOCKED
+  check monitoring grafana  "$DATABASE" BLOCKED
 
   header "Outros tráfegos não afetados"
-  check backend httpd "$BACKEND"   OPEN
-  check backend httpd "$MONITORING" OPEN
+  check backend worker "$BACKEND"    OPEN
+  check backend worker "$MONITORING" OPEN
 
-  print_summary "Resultado: allow TCP explícito httpd→db"
+  print_summary "Resultado: allow TCP explícito worker→pgbouncer"
 }
 
 scenario_protocol_udp_blocks_tcp() {
   echo -e "\n${BOLD}${BLUE}Cenário: policy UDP-only não libera TCP — restrict-ingress + allow UDP 5000${NC}"
   separator
 
-  header "TCP para database/db continua bloqueado (allow só cobre UDP 5000)"
-  check frontend   nginx   "$DATABASE" BLOCKED
-  check backend    httpd   "$DATABASE" BLOCKED
-  check infra      whoami  "$DATABASE" BLOCKED
-  check monitoring metrics "$DATABASE" BLOCKED
+  header "TCP para database/pgbouncer continua bloqueado (allow só cobre UDP 5000)"
+  check frontend   app      "$DATABASE" BLOCKED
+  check backend    worker   "$DATABASE" BLOCKED
+  check infra      haproxy  "$DATABASE" BLOCKED
+  check monitoring grafana  "$DATABASE" BLOCKED
 
-  header "database/db egress não afetado (restrict só é ingress)"
-  check database db "$BACKEND"  OPEN
-  check database db "$INTERNET" OPEN
+  header "database/pgbouncer egress não afetado (restrict só é ingress)"
+  check database pgbouncer "$BACKEND"  OPEN
+  check database pgbouncer "$INTERNET" OPEN
 
   print_summary "Resultado: UDP-only allow não libera TCP"
 }
 
 scenario_protocol_multiport() {
-  echo -e "\n${BOLD}${BLUE}Cenário: policy multi-porta TCP+UDP — restrict-ingress + allow TCP 5432 + UDP 5000${NC}"
+  echo -e "\n${BOLD}${BLUE}Cenário: policy multi-porta TCP+UDP — restrict-ingress + allow TCP 6432 + UDP 5000${NC}"
   separator
 
-  header "backend/httpd acessa database/db via TCP (HTTP coberto pela porta 5432)"
-  check backend    httpd   "$DATABASE" OPEN
-  check frontend   nginx   "$DATABASE" BLOCKED
-  check infra      whoami  "$DATABASE" BLOCKED
-  check monitoring metrics "$DATABASE" BLOCKED
+  header "backend/worker acessa database/pgbouncer via TCP (coberto pela porta 6432)"
+  check backend    worker   "$DATABASE" OPEN
+  check frontend   app      "$DATABASE" BLOCKED
+  check infra      haproxy  "$DATABASE" BLOCKED
+  check monitoring grafana  "$DATABASE" BLOCKED
 
-  print_summary "Resultado: allow multi-porta TCP+UDP httpd→db"
-}
-
-scenario_restrict_multiple() {
-  echo -e "\n${BOLD}${BLUE}Cenário: restrict-ingress em database/db E backend/httpd simultaneamente${NC}"
-  separator
-
-  header "database/db bloqueado para todos"
-  check frontend   nginx   "$DATABASE" BLOCKED
-  check backend    httpd   "$DATABASE" BLOCKED
-  check monitoring metrics "$DATABASE" BLOCKED
-
-  header "backend/httpd bloqueado para todos"
-  check frontend   nginx   "$BACKEND"  BLOCKED
-  check infra      whoami  "$BACKEND"  BLOCKED
-  check monitoring metrics "$BACKEND"  BLOCKED
-
-  header "Outros serviços não afetados"
-  check frontend nginx    "$MONITORING" OPEN
-  check frontend nginx    "$INFRA"      OPEN
-  check database db       "$FRONTEND"   OPEN
-  check database db       "$INTERNET"   OPEN
-
-  print_summary "Resultado: restrict-ingress múltiplos serviços"
+  print_summary "Resultado: allow multi-porta TCP+UDP worker→pgbouncer"
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -514,22 +505,22 @@ SCENARIO=${1:-scan}
 wait_pods
 
 case $SCENARIO in
-  baseline)                 scenario_baseline ;;
-  restrict-db-ingress)      scenario_restrict_db_ingress ;;
-  allow-backend-to-db)      scenario_allow_backend_to_db ;;
-  restrict-frontend-egress) scenario_restrict_frontend_egress ;;
-  allow-egress-internet)    scenario_allow_egress_internet ;;
-  isolate-database-allow-backend) scenario_isolate_database_allow_backend ;;
-  isolate-database)         scenario_isolate_database ;;
-  isolate-database-intra)   scenario_isolate_database_intra ;;
-  allow-ns-monitoring)           scenario_allow_ns_monitoring ;;
-  restrict-db-egress-allow-backend) scenario_restrict_db_egress_allow_backend ;;
-  isolate-db-egress-allow-backend)  scenario_isolate_db_egress_allow_backend ;;
-  restrict-multiple)             scenario_restrict_multiple ;;
-  protocol-tcp-explicit)         scenario_protocol_tcp_explicit ;;
-  protocol-udp-blocks-tcp)       scenario_protocol_udp_blocks_tcp ;;
-  protocol-multiport)            scenario_protocol_multiport ;;
-  scan|*)                        scenario_scan ;;
+  baseline)                          scenario_baseline ;;
+  restrict-db-ingress)               scenario_restrict_db_ingress ;;
+  allow-backend-to-db)               scenario_allow_backend_to_db ;;
+  restrict-frontend-egress)          scenario_restrict_frontend_egress ;;
+  allow-egress-internet)             scenario_allow_egress_internet ;;
+  isolate-database-allow-backend)    scenario_isolate_database_allow_backend ;;
+  isolate-database)                  scenario_isolate_database ;;
+  isolate-database-intra)            scenario_isolate_database_intra ;;
+  allow-ns-monitoring)               scenario_allow_ns_monitoring ;;
+  restrict-db-egress-allow-backend)  scenario_restrict_db_egress_allow_backend ;;
+  isolate-db-egress-allow-backend)   scenario_isolate_db_egress_allow_backend ;;
+  restrict-multiple)                 scenario_restrict_multiple ;;
+  protocol-tcp-explicit)             scenario_protocol_tcp_explicit ;;
+  protocol-udp-blocks-tcp)           scenario_protocol_udp_blocks_tcp ;;
+  protocol-multiport)                scenario_protocol_multiport ;;
+  scan|*)                            scenario_scan ;;
 esac
 
 exit $((FAIL > 0 ? 1 : 0))

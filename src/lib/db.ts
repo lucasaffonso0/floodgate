@@ -156,6 +156,21 @@ function initDb(): DbType {
       saved_at TEXT DEFAULT (datetime('now')),
       PRIMARY KEY (namespace, name)
     );
+
+    CREATE TABLE IF NOT EXISTS discovered_flows (
+      id           TEXT PRIMARY KEY,
+      src_workload  TEXT NOT NULL,
+      src_namespace TEXT NOT NULL,
+      dst_workload  TEXT NOT NULL,
+      dst_namespace TEXT NOT NULL,
+      dst_port     INTEGER NOT NULL,
+      protocol     TEXT NOT NULL,
+      verdict      TEXT NOT NULL,
+      flow_count   INTEGER NOT NULL DEFAULT 1,
+      has_policy   INTEGER NOT NULL DEFAULT 0,
+      first_seen   TEXT NOT NULL,
+      last_seen    TEXT NOT NULL
+    );
   `)
 
   // ── Seed default admin user ────────────────────────────────────────────────

@@ -2,6 +2,13 @@
 # Floodgate — Full API Test Suite
 # Cria policies via API, testa conectividade e remove. Roda todos os cenários em sequência.
 # Uso: ./full-test.sh [url] [usuario] [senha]
+#
+# Topology (traffic-sim.yaml):
+#   frontend/app       port 80
+#   backend/worker     port 8080
+#   infra/haproxy      port 80
+#   database/pgbouncer port 6432
+#   monitoring/grafana port 3000
 
 set -euo pipefail
 
@@ -146,32 +153,32 @@ test_baseline() {
 }
 
 test_restrict_db_ingress() {
-  header_scenario "2/12 — restrict-ingress em database/db"
+  header_scenario "2/12 — restrict-ingress em database/pgbouncer"
   echo "  Aplicando via API:"
-  assert_ok "restrict-ingress db" "$(api POST '/api/networkpolicies/restrict' \
-    '{"service_name":"db","namespace":"database","direction":"ingress"}')"
+  assert_ok "restrict-ingress pgbouncer" "$(api POST '/api/networkpolicies/restrict' \
+    '{"service_name":"pgbouncer","namespace":"database","direction":"ingress"}')"
   sleep "$PROPAGATION_WAIT"
   run_tests restrict-db-ingress || FAILED_SCENARIOS+=("restrict-db-ingress")
   cleanup
 }
 
 test_allow_backend_to_db() {
-  header_scenario "3/12 — restrict-ingress db + allow ingress backend → db"
+  header_scenario "3/12 — restrict-ingress pgbouncer + allow ingress worker → pgbouncer"
   echo "  Aplicando via API:"
-  assert_ok "restrict-ingress db" "$(api POST '/api/networkpolicies/restrict' \
-    '{"service_name":"db","namespace":"database","direction":"ingress"}')"
-  assert_ok "allow ingress httpd→db" "$(api POST '/api/networkpolicies' \
-    '{"src_workload":"httpd","src_namespace":"backend","dst_service":"db","dst_namespace":"database","dst_port":5432}')"
+  assert_ok "restrict-ingress pgbouncer" "$(api POST '/api/networkpolicies/restrict' \
+    '{"service_name":"pgbouncer","namespace":"database","direction":"ingress"}')"
+  assert_ok "allow ingress worker→pgbouncer" "$(api POST '/api/networkpolicies' \
+    '{"src_workload":"worker","src_namespace":"backend","dst_service":"pgbouncer","dst_namespace":"database","dst_port":6432}')"
   sleep "$PROPAGATION_WAIT"
   run_tests allow-backend-to-db || FAILED_SCENARIOS+=("allow-backend-to-db")
   cleanup
 }
 
 test_restrict_frontend_egress() {
-  header_scenario "4/12 — restrict-egress em frontend/nginx"
+  header_scenario "4/12 — restrict-egress em frontend/app"
   echo "  Aplicando via API:"
-  assert_ok "restrict-egress nginx" "$(api POST '/api/networkpolicies/restrict' \
-    '{"service_name":"nginx","namespace":"frontend","direction":"egress"}')"
+  assert_ok "restrict-egress app" "$(api POST '/api/networkpolicies/restrict' \
+    '{"service_name":"app","namespace":"frontend","direction":"egress"}')"
   sleep "$PROPAGATION_WAIT"
   run_tests restrict-frontend-egress || FAILED_SCENARIOS+=("restrict-frontend-egress")
   cleanup
@@ -188,12 +195,12 @@ test_allow_egress_internet() {
 }
 
 test_isolate_database_allow_backend() {
-  header_scenario "6/12 — namespace-isolate database (ingress) + allow backend/httpd → database/db"
+  header_scenario "6/12 — namespace-isolate database (ingress) + allow backend/worker → database/pgbouncer"
   echo "  Aplicando via API:"
   assert_ok "namespace-isolate database (ingress)" "$(api POST '/api/networkpolicies/namespace-isolate' \
     '{"namespace":"database","direction":"ingress","allow_intra_namespace":false,"allow_egress_internet":false}')"
-  assert_ok "allow ingress httpd→db" "$(api POST '/api/networkpolicies' \
-    '{"src_workload":"httpd","src_namespace":"backend","dst_service":"db","dst_namespace":"database","dst_port":5432}')"
+  assert_ok "allow ingress worker→pgbouncer" "$(api POST '/api/networkpolicies' \
+    '{"src_workload":"worker","src_namespace":"backend","dst_service":"pgbouncer","dst_namespace":"database","dst_port":6432}')"
   sleep "$PROPAGATION_WAIT"
   run_tests isolate-database-allow-backend || FAILED_SCENARIOS+=("isolate-database-allow-backend")
   cleanup
@@ -219,27 +226,51 @@ test_isolate_database_intra() {
   cleanup
 }
 
-test_restrict_db_egress_allow_backend() {
-  header_scenario "10/12 — restrict-egress em database/db + allow egress db → backend/httpd"
+test_allow_ns_monitoring() {
+  header_scenario "9/12 — restrict-ingress worker + allow namespace monitoring → backend"
   echo "  Aplicando via API:"
-  assert_ok "restrict-egress db" "$(api POST '/api/networkpolicies/restrict' \
-    '{"service_name":"db","namespace":"database","direction":"egress"}')"
-  assert_ok "allow egress db→httpd" "$(api POST '/api/networkpolicies/egress' \
-    '{"src_workload":"db","src_namespace":"database","dst_service":"httpd","dst_namespace":"backend","dst_port":8081}')"
+  assert_ok "restrict-ingress worker" "$(api POST '/api/networkpolicies/restrict' \
+    '{"service_name":"worker","namespace":"backend","direction":"ingress"}')"
+  assert_ok "allow namespace monitoring→backend" "$(api POST '/api/networkpolicies/namespace-ingress' \
+    '{"src_namespace":"monitoring","dst_service":"worker","dst_namespace":"backend","dst_port":8080}')"
+  sleep "$PROPAGATION_WAIT"
+  run_tests allow-ns-monitoring || FAILED_SCENARIOS+=("allow-ns-monitoring")
+  cleanup
+}
+
+test_restrict_db_egress_allow_backend() {
+  header_scenario "10/12 — restrict-egress em database/pgbouncer + allow egress pgbouncer → backend/worker"
+  echo "  Aplicando via API:"
+  assert_ok "restrict-egress pgbouncer" "$(api POST '/api/networkpolicies/restrict' \
+    '{"service_name":"pgbouncer","namespace":"database","direction":"egress"}')"
+  assert_ok "allow egress pgbouncer→worker" "$(api POST '/api/networkpolicies/egress' \
+    '{"src_workload":"pgbouncer","src_namespace":"database","dst_service":"worker","dst_namespace":"backend","dst_port":8080}')"
   sleep "$PROPAGATION_WAIT"
   run_tests restrict-db-egress-allow-backend || FAILED_SCENARIOS+=("restrict-db-egress-allow-backend")
   cleanup
 }
 
 test_isolate_db_egress_allow_backend() {
-  header_scenario "11/12 — namespace-isolate database (egress) + allow egress db → backend/httpd"
+  header_scenario "11/12 — namespace-isolate database (egress) + allow egress pgbouncer → backend/worker"
   echo "  Aplicando via API:"
   assert_ok "namespace-isolate database (egress)" "$(api POST '/api/networkpolicies/namespace-isolate' \
     '{"namespace":"database","direction":"egress","allow_intra_namespace":false,"allow_egress_internet":false}')"
-  assert_ok "allow egress db→httpd" "$(api POST '/api/networkpolicies/egress' \
-    '{"src_workload":"db","src_namespace":"database","dst_service":"httpd","dst_namespace":"backend","dst_port":8081}')"
+  assert_ok "allow egress pgbouncer→worker" "$(api POST '/api/networkpolicies/egress' \
+    '{"src_workload":"pgbouncer","src_namespace":"database","dst_service":"worker","dst_namespace":"backend","dst_port":8080}')"
   sleep "$PROPAGATION_WAIT"
   run_tests isolate-db-egress-allow-backend || FAILED_SCENARIOS+=("isolate-db-egress-allow-backend")
+  cleanup
+}
+
+test_restrict_multiple() {
+  header_scenario "12/12 — restrict-ingress em database/pgbouncer E backend/worker simultaneamente"
+  echo "  Aplicando via API:"
+  assert_ok "restrict-ingress pgbouncer" "$(api POST '/api/networkpolicies/restrict' \
+    '{"service_name":"pgbouncer","namespace":"database","direction":"ingress"}')"
+  assert_ok "restrict-ingress worker" "$(api POST '/api/networkpolicies/restrict' \
+    '{"service_name":"worker","namespace":"backend","direction":"ingress"}')"
+  sleep "$PROPAGATION_WAIT"
+  run_tests restrict-multiple || FAILED_SCENARIOS+=("restrict-multiple")
   cleanup
 }
 
@@ -251,15 +282,15 @@ test_protocol_api() {
   echo -e "  ${BOLD}TCP explícito${NC}"
   local r body policy_name policy_ns
 
-  r=$(api POST '/api/networkpolicies/restrict' '{"service_name":"db","namespace":"database","direction":"ingress"}')
-  assert_ok "restrict-ingress db (base)" "$r"
+  r=$(api POST '/api/networkpolicies/restrict' '{"service_name":"pgbouncer","namespace":"database","direction":"ingress"}')
+  assert_ok "restrict-ingress pgbouncer (base)" "$r"
 
   r=$(api POST '/api/networkpolicies' \
-    '{"src_workload":"httpd","src_namespace":"backend","dst_service":"db","dst_namespace":"database","dst_ports":[{"port":5432,"protocol":"TCP"}]}')
-  assert_ok "allow ingress TCP 5432" "$r"
+    '{"src_workload":"worker","src_namespace":"backend","dst_service":"pgbouncer","dst_namespace":"database","dst_ports":[{"port":6432,"protocol":"TCP"}]}')
+  assert_ok "allow ingress TCP 6432" "$r"
   body="${r#*|}"
   assert_field "dst_ports[0].protocol"  "$(json_get "$body" "d['dst_ports'][0]['protocol']")"  "TCP"
-  assert_field "dst_ports[0].port"      "$(json_get "$body" "str(d['dst_ports'][0]['port'])")"  "80"  # resolves 5432→targetPort 80
+  assert_field "dst_ports[0].port"      "$(json_get "$body" "str(d['dst_ports'][0]['port'])")"  "6432"
   assert_field "dst_ports count"        "$(json_get "$body" "str(len(d['dst_ports']))")"         "1"
 
   policy_name=$(json_get "$body" "d['name']")
@@ -281,11 +312,11 @@ test_protocol_api() {
   echo ""
   echo -e "  ${BOLD}UDP — allow só UDP 5000 não libera TCP${NC}"
 
-  r=$(api POST '/api/networkpolicies/restrict' '{"service_name":"db","namespace":"database","direction":"ingress"}')
-  assert_ok "restrict-ingress db (base)" "$r"
+  r=$(api POST '/api/networkpolicies/restrict' '{"service_name":"pgbouncer","namespace":"database","direction":"ingress"}')
+  assert_ok "restrict-ingress pgbouncer (base)" "$r"
 
   r=$(api POST '/api/networkpolicies' \
-    '{"src_workload":"httpd","src_namespace":"backend","dst_service":"db","dst_namespace":"database","dst_ports":[{"port":5000,"protocol":"UDP"}]}')
+    '{"src_workload":"worker","src_namespace":"backend","dst_service":"pgbouncer","dst_namespace":"database","dst_ports":[{"port":5000,"protocol":"UDP"}]}')
   assert_ok "allow ingress UDP 5000" "$r"
   body="${r#*|}"
   assert_field "dst_ports[0].protocol" "$(json_get "$body" "d['dst_ports'][0]['protocol']")" "UDP"
@@ -299,7 +330,6 @@ test_protocol_api() {
     local udp_count
     udp_count=$(echo "$yaml_body" | grep -c "protocol: UDP" 2>/dev/null || true)
     assert_field "YAML contém 'protocol: UDP'" "$udp_count" "1"
-    # TCP não deve aparecer no YAML deste allow (só tem UDP)
     tcp_count=$(echo "$yaml_body" | grep -c "protocol: TCP" 2>/dev/null || true)
     assert_field "YAML sem 'protocol: TCP' neste allow" "$tcp_count" "0"
   fi
@@ -313,7 +343,7 @@ test_protocol_api() {
   echo -e "  ${BOLD}SCTP — verifica geração de YAML${NC}"
 
   r=$(api POST '/api/networkpolicies' \
-    '{"src_workload":"httpd","src_namespace":"backend","dst_service":"db","dst_namespace":"database","dst_ports":[{"port":9000,"protocol":"SCTP"}]}')
+    '{"src_workload":"worker","src_namespace":"backend","dst_service":"pgbouncer","dst_namespace":"database","dst_ports":[{"port":9000,"protocol":"SCTP"}]}')
   assert_ok "allow ingress SCTP 9000" "$r"
   body="${r#*|}"
   assert_field "dst_ports[0].protocol" "$(json_get "$body" "d['dst_ports'][0]['protocol']")" "SCTP"
@@ -333,14 +363,14 @@ test_protocol_api() {
 
   # ── Multi-porta TCP + UDP ─────────────────────────────────────────────────────
   echo ""
-  echo -e "  ${BOLD}Multi-porta: TCP 5432 + UDP 5000${NC}"
+  echo -e "  ${BOLD}Multi-porta: TCP 6432 + UDP 5000${NC}"
 
-  r=$(api POST '/api/networkpolicies/restrict' '{"service_name":"db","namespace":"database","direction":"ingress"}')
-  assert_ok "restrict-ingress db (base)" "$r"
+  r=$(api POST '/api/networkpolicies/restrict' '{"service_name":"pgbouncer","namespace":"database","direction":"ingress"}')
+  assert_ok "restrict-ingress pgbouncer (base)" "$r"
 
   r=$(api POST '/api/networkpolicies' \
-    '{"src_workload":"httpd","src_namespace":"backend","dst_service":"db","dst_namespace":"database","dst_ports":[{"port":5432,"protocol":"TCP"},{"port":5000,"protocol":"UDP"}]}')
-  assert_ok "allow ingress TCP 5432 + UDP 5000" "$r"
+    '{"src_workload":"worker","src_namespace":"backend","dst_service":"pgbouncer","dst_namespace":"database","dst_ports":[{"port":6432,"protocol":"TCP"},{"port":5000,"protocol":"UDP"}]}')
+  assert_ok "allow ingress TCP 6432 + UDP 5000" "$r"
   body="${r#*|}"
   assert_field "dst_ports count"        "$(json_get "$body" "str(len(d['dst_ports']))")" "2"
   assert_field "dst_ports[0].protocol"  "$(json_get "$body" "d['dst_ports'][0]['protocol']")" "TCP"
@@ -366,46 +396,21 @@ test_protocol_api() {
   echo -e "  ${BOLD}PATCH — preserva e atualiza protocolos${NC}"
 
   r=$(api POST '/api/networkpolicies' \
-    '{"src_workload":"httpd","src_namespace":"backend","dst_service":"db","dst_namespace":"database","dst_ports":[{"port":5432,"protocol":"TCP"}]}')
+    '{"src_workload":"worker","src_namespace":"backend","dst_service":"pgbouncer","dst_namespace":"database","dst_ports":[{"port":6432,"protocol":"TCP"}]}')
   assert_ok "create TCP policy para patch" "$r"
   body="${r#*|}"
   policy_name=$(json_get "$body" "d['name']")
   policy_ns=$(json_get "$body" "d['namespace']")
 
   if [ -n "$policy_name" ] && [ -n "$policy_ns" ]; then
-    # PATCH — adiciona segundo port TCP (5433 não existe no service, fica como-é)
     local patch_r patch_body
     patch_r=$(api PATCH "/api/networkpolicies/$policy_ns/$policy_name" \
-      '{"dst_ports":[{"port":80,"protocol":"TCP"},{"port":5433,"protocol":"TCP"}]}')
+      '{"dst_ports":[{"port":6432,"protocol":"TCP"},{"port":5433,"protocol":"TCP"}]}')
     assert_ok "PATCH multi-porta TCP" "$patch_r"
     patch_body="${patch_r#*|}"
     assert_field "PATCH dst_ports count" "$(json_get "$patch_body" "str(len(d['dst_ports']))")" "2"
   fi
 
-  cleanup
-}
-
-test_restrict_multiple() {
-  header_scenario "12/12 — restrict-ingress em database/db E backend/httpd simultaneamente"
-  echo "  Aplicando via API:"
-  assert_ok "restrict-ingress db" "$(api POST '/api/networkpolicies/restrict' \
-    '{"service_name":"db","namespace":"database","direction":"ingress"}')"
-  assert_ok "restrict-ingress httpd" "$(api POST '/api/networkpolicies/restrict' \
-    '{"service_name":"httpd","namespace":"backend","direction":"ingress"}')"
-  sleep "$PROPAGATION_WAIT"
-  run_tests restrict-multiple || FAILED_SCENARIOS+=("restrict-multiple")
-  cleanup
-}
-
-test_allow_ns_monitoring() {
-  header_scenario "9/12 — restrict-ingress httpd + allow namespace monitoring → backend"
-  echo "  Aplicando via API:"
-  assert_ok "restrict-ingress httpd" "$(api POST '/api/networkpolicies/restrict' \
-    '{"service_name":"httpd","namespace":"backend","direction":"ingress"}')"
-  assert_ok "allow namespace monitoring→backend" "$(api POST '/api/networkpolicies/namespace-ingress' \
-    '{"src_namespace":"monitoring","dst_service":"httpd","dst_namespace":"backend","dst_port":8081}')"
-  sleep "$PROPAGATION_WAIT"
-  run_tests allow-ns-monitoring || FAILED_SCENARIOS+=("allow-ns-monitoring")
   cleanup
 }
 
@@ -421,13 +426,11 @@ echo ""
 login
 
 echo -e "${YELLOW}Aguardando pods de teste ficarem Ready...${NC}"
-kubectl wait --for=condition=Ready pod -l app=nginx        -n frontend   --timeout=60s 2>/dev/null || true
-kubectl wait --for=condition=Ready pod -l app=httpd        -n backend    --timeout=60s 2>/dev/null || true
-kubectl wait --for=condition=Ready pod -l app=whoami       -n infra      --timeout=60s 2>/dev/null || true
-kubectl wait --for=condition=Ready pod -l app=db           -n database   --timeout=60s 2>/dev/null || true
-kubectl wait --for=condition=Ready pod -l app=db-replica   -n database   --timeout=60s 2>/dev/null || true
-kubectl wait --for=condition=Ready pod -l app=metrics      -n monitoring --timeout=60s 2>/dev/null || true
-kubectl wait --for=condition=Ready pod -l app=alertmanager -n monitoring --timeout=60s 2>/dev/null || true
+kubectl wait --for=condition=Ready pod -l app=app        -n frontend   --timeout=60s 2>/dev/null || true
+kubectl wait --for=condition=Ready pod -l app=worker     -n backend    --timeout=60s 2>/dev/null || true
+kubectl wait --for=condition=Ready pod -l app=haproxy    -n infra      --timeout=60s 2>/dev/null || true
+kubectl wait --for=condition=Ready pod -l app=pgbouncer  -n database   --timeout=60s 2>/dev/null || true
+kubectl wait --for=condition=Ready pod -l app=grafana    -n monitoring --timeout=60s 2>/dev/null || true
 echo ""
 
 # Garante ambiente limpo antes de começar

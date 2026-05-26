@@ -2,18 +2,45 @@
 
 import React, { useState, useEffect, useCallback } from 'react'
 import PasswordModal from '@/components/PasswordModal'
-import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, AppConfig, User, ApprovalRequest, AutosyncStatus } from '@/types'
+import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, AppConfig, User, ApprovalRequest, AutosyncStatus, CiliumFlowSummary, CidrPolicyRequest } from '@/types'
 import {
   deleteNetworkPolicy, patchNetworkPolicyPort,
   getApprovalRequests, voteApprovalRequest, applyApprovalRequest, cancelApprovalRequest, getApprovalRequestYAML,
   getSecurityCoverage, applyDefaultDeny, isolateNamespace,
-  getPausedPolicies, pauseAllPolicies, resumeAllPolicies,
+  getPausedPolicies, pauseAllPolicies, resumeAllPolicies, pausePolicy, resumePolicy,
   getAutosyncStatus, triggerAutosync, updateUserPassword, listUsers,
-  adoptPolicy, unadoptPolicy,
+  adoptPolicy, unadoptPolicy, checkHubble, previewDiscoveryPolicyYAML, createCidrPolicy,
 } from '@/api/client'
 
 // ─── YAML generator (rascunhos) ────────────────────────────────────────────
 function generateYAML(draft: Draft, services: ServiceInfo[]): string {
+  if (draft.src_cidr || draft.dst_cidr) {
+    const cidr = draft.src_cidr ?? draft.dst_cidr!
+    const direction = draft.src_cidr ? 'ingress' : 'egress'
+    const exceptLines = draft.cidr_except?.length
+      ? `\n        except:\n${draft.cidr_except.map(e => `        - ${e}`).join('\n')}`
+      : ''
+    const portsYaml = draft.dst_ports.length
+      ? `\n      ports:\n${draft.dst_ports.map(p => `      - protocol: ${p.protocol}\n        port: ${p.port}`).join('\n')}`
+      : ''
+    const svcTarget = draft.dst_service ? `\n    matchLabels:\n      app: ${draft.dst_service}` : ': {}'
+    return `apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: floodgate-cidr-${direction}-preview
+  namespace: ${draft.dst_namespace}
+  labels:
+    managed-by: floodgate
+spec:
+  podSelector:${svcTarget}
+  policyTypes:
+  - ${direction === 'ingress' ? 'Ingress' : 'Egress'}
+  ${direction === 'ingress' ? 'ingress' : 'egress'}:
+  - ${direction === 'ingress' ? 'from' : 'to'}:
+    - ipBlock:
+        cidr: ${cidr}${exceptLines}${portsYaml}`
+  }
+
   const src = services.find(s => s.name === draft.src_workload && s.namespace === draft.src_namespace)
   const dst = services.find(s => s.name === draft.dst_service && s.namespace === draft.dst_namespace)
   const srcSel = Object.entries(src?.selector ?? {}).map(([k, v]) => `              ${k}: "${v}"`).join('\n') || '              {}'
@@ -29,7 +56,7 @@ function generateYAML(draft: Draft, services: ServiceInfo[]): string {
 }
 
 // ─── Types ─────────────────────────────────────────────────────────────────
-type Tab = 'namespaces' | 'drafts' | 'policies' | 'aprovacoes' | 'seguranca' | 'config'
+type Tab = 'namespaces' | 'drafts' | 'policies' | 'aprovacoes' | 'seguranca' | 'descoberta' | 'config'
 type PausedPolicy = { id: string; name: string; namespace: string; policy_yaml: string; saved_at: string }
 
 // ─── Icons ─────────────────────────────────────────────────────────────────
@@ -51,6 +78,8 @@ const Icon = {
   ChevronDown:  () => <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="6 9 12 15 18 9"/></svg>,
   Alert:     () => <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>,
   Tag:       () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20.59 13.41l-7.17 7.17a2 2 0 01-2.83 0L2 12V2h10l8.59 8.59a2 2 0 010 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>,
+  Radar:     () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/></svg>,
+  XCircle:   () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>,
 }
 
 // ─── Shared styles ──────────────────────────────────────────────────────────
@@ -98,15 +127,29 @@ function LiveYAMLViewer({ namespace, name }: { namespace: string; name: string }
 }
 
 // ─── Namespaces tab ─────────────────────────────────────────────────────────
-function NamespacesTab({ allNamespaces, services, visibleNamespaces, ignoredNamespaces, onToggle }: {
-  allNamespaces: string[]; services: ServiceInfo[]; visibleNamespaces: Set<string>; ignoredNamespaces: string[]; onToggle: (ns: string) => void
+function NamespacesTab({ allNamespaces, services, visibleNamespaces, ignoredNamespaces, onToggle, onIgnore, onUnignore, isAdmin }: {
+  allNamespaces: string[]; services: ServiceInfo[]; visibleNamespaces: Set<string>; ignoredNamespaces: string[]
+  onToggle: (ns: string) => void
+  onIgnore?: (ns: string) => void
+  onUnignore?: (ns: string) => void
+  isAdmin?: boolean
 }) {
-  const [ignoredOpen, setIgnoredOpen] = useState(false)
+  const [ignoredOpen, setIgnoredOpen] = useState(true)
   const [search, setSearch] = useState('')
+  const [addingIgnore, setAddingIgnore] = useState(false)
+  const [newIgnoreNs, setNewIgnoreNs] = useState('')
   const svcCount = (ns: string) => services.filter(s => s.namespace === ns).length
   const filtered = allNamespaces.filter(ns => ns.toLowerCase().includes(search.toLowerCase()))
   const allFilteredOn = filtered.length > 0 && filtered.every(ns => visibleNamespaces.has(ns))
   function toggleAll() { filtered.forEach(ns => { if (allFilteredOn ? visibleNamespaces.has(ns) : !visibleNamespaces.has(ns)) onToggle(ns) }) }
+
+  function submitAddIgnore() {
+    const ns = newIgnoreNs.trim()
+    if (!ns || ignoredNamespaces.includes(ns)) return
+    onIgnore?.(ns)
+    setNewIgnoreNs('')
+    setAddingIgnore(false)
+  }
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
@@ -122,29 +165,70 @@ function NamespacesTab({ allNamespaces, services, visibleNamespaces, ignoredName
       </div>
       <div style={{ flex: 1, overflowY: 'auto' }}>
         {filtered.map(ns => (
-          <label key={ns} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 14px', borderBottom: '1px solid #f9fafb', cursor: 'pointer' }}>
-            <input type="checkbox" checked={visibleNamespaces.has(ns)} onChange={() => onToggle(ns)} style={{ accentColor: '#3b82f6', width: 14, height: 14 }} />
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: '#1e293b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ns}</div>
-              <div style={{ fontSize: 10, color: '#94a3b8' }}>{svcCount(ns)} serviço(s)</div>
-            </div>
-          </label>
+          <div key={ns} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px', borderBottom: '1px solid #f9fafb' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, minWidth: 0, cursor: 'pointer' }}>
+              <input type="checkbox" checked={visibleNamespaces.has(ns)} onChange={() => onToggle(ns)} style={{ accentColor: '#3b82f6', width: 14, height: 14, flexShrink: 0 }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: '#1e293b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ns}</div>
+                <div style={{ fontSize: 10, color: '#94a3b8' }}>{svcCount(ns)} serviço(s)</div>
+              </div>
+            </label>
+            {isAdmin && onIgnore && (
+              <button
+                onClick={() => onIgnore(ns)}
+                title="Ignorar namespace (remove do grafo e da descoberta)"
+                style={{ background: 'none', border: '1px solid #e2e8f0', borderRadius: 5, padding: '2px 7px', fontSize: 10, color: '#94a3b8', cursor: 'pointer', flexShrink: 0, whiteSpace: 'nowrap' }}
+              >Ignorar</button>
+            )}
+          </div>
         ))}
         {filtered.length === 0 && <div style={{ padding: '20px 14px', textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>Nenhum namespace encontrado</div>}
-        {ignoredNamespaces.length > 0 && (
-          <div style={{ borderTop: '2px solid #f1f5f9' }}>
-            <button onClick={() => setIgnoredOpen(v => !v)} style={{ width: '100%', padding: '8px 14px', background: 'none', border: 'none', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+
+        {/* Ignored namespaces section */}
+        <div style={{ borderTop: '2px solid #f1f5f9' }}>
+          <div style={{ display: 'flex', alignItems: 'center', padding: '8px 14px 4px' }}>
+            <button onClick={() => setIgnoredOpen(v => !v)} style={{ flex: 1, background: 'none', border: 'none', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', padding: 0 }}>
               <span>Ignorados ({ignoredNamespaces.length})</span>
               {ignoredOpen ? <Icon.ChevronDown /> : <Icon.ChevronRight />}
             </button>
-            {ignoredOpen && ignoredNamespaces.map(ns => (
-              <div key={ns} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 14px', opacity: 0.5 }}>
-                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
-                <span style={{ fontSize: 11, color: '#64748b' }}>{ns}</span>
-              </div>
-            ))}
+            {isAdmin && onIgnore && (
+              <button
+                onClick={() => setAddingIgnore(v => !v)}
+                title="Adicionar namespace à lista de ignorados"
+                style={{ background: addingIgnore ? '#eff6ff' : 'none', border: `1px solid ${addingIgnore ? '#93c5fd' : '#e2e8f0'}`, borderRadius: 5, padding: '2px 7px', fontSize: 10, color: addingIgnore ? '#1d4ed8' : '#64748b', cursor: 'pointer', marginLeft: 6, flexShrink: 0 }}
+              >+ Adicionar</button>
+            )}
           </div>
-        )}
+
+          {isAdmin && addingIgnore && (
+            <div style={{ display: 'flex', gap: 6, padding: '4px 14px 8px' }}>
+              <input
+                autoFocus
+                type="text"
+                placeholder="nome-do-namespace"
+                value={newIgnoreNs}
+                onChange={e => setNewIgnoreNs(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') submitAddIgnore(); if (e.key === 'Escape') { setAddingIgnore(false); setNewIgnoreNs('') } }}
+                style={{ flex: 1, border: '1px solid #93c5fd', borderRadius: 5, padding: '4px 7px', fontSize: 11, outline: 'none' }}
+              />
+              <button onClick={submitAddIgnore} style={{ ...btn.base, ...btn.blue, fontSize: 10, padding: '3px 8px' }}>OK</button>
+            </div>
+          )}
+
+          {ignoredOpen && ignoredNamespaces.map(ns => (
+            <div key={ns} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 14px' }}>
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
+              <span style={{ flex: 1, fontSize: 11, color: '#64748b' }}>{ns}</span>
+              {isAdmin && onUnignore && (
+                <button
+                  onClick={() => onUnignore(ns)}
+                  title="Remover da lista de ignorados"
+                  style={{ background: 'none', border: '1px solid #e2e8f0', borderRadius: 5, padding: '2px 7px', fontSize: 10, color: '#64748b', cursor: 'pointer', flexShrink: 0 }}
+                >Remover</button>
+              )}
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   )
@@ -152,39 +236,83 @@ function NamespacesTab({ allNamespaces, services, visibleNamespaces, ignoredName
 
 // ─── Drafts tab ─────────────────────────────────────────────────────────────
 // ─── New draft modal ───────────────────────────────────────────────────────
-function NewDraftModal({ services, onAdd, onClose }: {
+function NewDraftModal({ services, ciliumFlows, onAdd, onClose }: {
   services: ServiceInfo[]
+  ciliumFlows: CiliumFlowSummary[]
   onAdd: (d: Omit<Draft, 'id'>) => void
   onClose: () => void
 }) {
   const namespaces = Array.from(new Set(services.map(s => s.namespace))).sort()
 
-  const [srcNs, setSrcNs]   = useState(namespaces[0] ?? '')
-  const [srcSvc, setSrcSvc] = useState('')
-  const [dstNs, setDstNs]   = useState(namespaces[0] ?? '')
-  const [dstSvc, setDstSvc] = useState('')
-  const [ports, setPorts]   = useState<PortSpec[]>([{ port: 80, protocol: 'TCP' }])
-  const [dir, setDir]       = useState<'ingress' | 'egress' | 'both'>('both')
+  const [srcNs, setSrcNs]     = useState(namespaces[0] ?? '')
+  const [srcSvc, setSrcSvc]   = useState('')
+  const [srcManual, setSrcManual] = useState(false)
+  const [dstNs, setDstNs]     = useState(namespaces[0] ?? '')
+  const [dstSvc, setDstSvc]   = useState('')
+  const [dstManual, setDstManual] = useState(false)
+  const [ports, setPorts]     = useState<PortSpec[]>([{ port: 80, protocol: 'TCP' }])
+  const [dir, setDir]         = useState<'ingress' | 'egress' | 'both'>('both')
+  const [srcCidr, setSrcCidr] = useState(false)
+  const [dstCidr, setDstCidr] = useState(false)
+  const [cidrValue, setCidrValue] = useState('')
+  const [cidrExcept, setCidrExcept] = useState('')
 
-  const srcServices = services.filter(s => s.namespace === srcNs).map(s => s.name).sort()
-  const dstServices = services.filter(s => s.namespace === dstNs).map(s => s.name).sort()
+  function workloadOptions(ns: string): string[] {
+    const fromServices = services.filter(s => s.namespace === ns).map(s => s.name)
+    const fromHubble = [
+      ...ciliumFlows.filter(f => f.src_namespace === ns).map(f => f.src_workload),
+      ...ciliumFlows.filter(f => f.dst_namespace === ns).map(f => f.dst_workload),
+    ].map(w => w.replace(/-[a-z0-9]{5,10}-[a-z0-9]{5}$/, '').replace(/-[a-z0-9]{5}$/, ''))
+    return [...new Set([...fromServices, ...fromHubble])].sort()
+  }
 
-  const canSubmit = srcNs.trim() && srcSvc.trim() && dstNs.trim() && dstSvc.trim() && ports.length > 0 && ports.every(p => p.port >= 1 && p.port <= 65535)
+  const cidrValid = /^[\d.a-fA-F:]+\/\d{1,3}$/.test(cidrValue.trim())
+  const isCidr = srcCidr || dstCidr
+  const canSubmit = isCidr
+    ? (cidrValid && (dstCidr ? !!dstNs : !!srcNs))
+    : (!!srcNs.trim() && !!srcSvc.trim() && !!dstNs.trim() && !!dstSvc.trim() && ports.length > 0 && ports.every(p => p.port >= 1 && p.port <= 65535))
+
+  function handleDirChange(d: 'ingress' | 'egress' | 'both') {
+    setDir(d)
+    if (d === 'both') { setSrcCidr(false); setDstCidr(false); setCidrValue('') }
+    else if (d === 'ingress') { setDstCidr(false) }
+    else if (d === 'egress') { setSrcCidr(false) }
+  }
 
   function handleSubmit() {
     if (!canSubmit) return
-    onAdd({ src_namespace: srcNs.trim(), src_workload: srcSvc.trim(), dst_namespace: dstNs.trim(), dst_service: dstSvc.trim(), dst_ports: ports, policy_direction: dir })
+    if (isCidr) {
+      const exceptList = cidrExcept.split(',').map(s => s.trim()).filter(Boolean)
+      onAdd({
+        src_namespace: srcCidr ? '' : srcNs.trim(),
+        src_workload: srcCidr ? '' : srcSvc.trim(),
+        dst_namespace: dstNs.trim(),
+        dst_service: dstCidr ? '' : dstSvc.trim(),
+        dst_ports: ports,
+        policy_direction: srcCidr ? 'ingress' : 'egress',
+        src_cidr: srcCidr ? cidrValue.trim() : undefined,
+        dst_cidr: dstCidr ? cidrValue.trim() : undefined,
+        cidr_except: exceptList.length > 0 ? exceptList : undefined,
+      })
+    } else {
+      onAdd({ src_namespace: srcNs.trim(), src_workload: srcSvc.trim(), dst_namespace: dstNs.trim(), dst_service: dstSvc.trim(), dst_ports: ports, policy_direction: dir })
+    }
     onClose()
   }
 
   const labelStyle: React.CSSProperties = { fontSize: 10, fontWeight: 600, color: '#64748b', marginBottom: 4, display: 'block' }
   const inputStyle: React.CSSProperties = { width: '100%', border: '1px solid #e2e8f0', borderRadius: 6, padding: '6px 8px', fontSize: 11, boxSizing: 'border-box', outline: 'none', background: 'white' }
   const selectStyle: React.CSSProperties = { ...inputStyle, cursor: 'pointer' }
+  const cidrToggleBtn = (active: boolean): React.CSSProperties => ({
+    padding: '2px 8px', fontSize: 10, fontWeight: 600, borderRadius: 4, cursor: 'pointer', border: '1px solid',
+    background: active ? '#7c3aed' : '#f8fafc', color: active ? '#fff' : '#64748b',
+    borderColor: active ? '#6d28d9' : '#e2e8f0',
+  })
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
       onClick={e => { if (e.target === e.currentTarget) onClose() }}>
-      <div style={{ background: 'white', borderRadius: 14, width: 360, boxShadow: '0 8px 40px rgba(0,0,0,0.18)', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
+      <div style={{ background: 'white', borderRadius: 14, width: 380, maxHeight: '90vh', overflowY: 'auto', boxShadow: '0 8px 40px rgba(0,0,0,0.18)', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
 
         {/* Header */}
         <div style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0', padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -199,34 +327,52 @@ function NewDraftModal({ services, onAdd, onClose }: {
 
           {/* Source */}
           <div style={{ background: '#f0f9ff', border: '1px solid #bae6fd', borderRadius: 8, padding: '10px 12px' }}>
-            <div style={{ fontSize: 9, fontWeight: 700, color: '#0369a1', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>Origem</div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <div style={{ flex: 1 }}>
-                <label style={labelStyle}>Namespace</label>
-                <select value={srcNs} onChange={e => { setSrcNs(e.target.value); setSrcSvc('') }} style={selectStyle}>
-                  {namespaces.map(n => <option key={n} value={n}>{n}</option>)}
-                </select>
-              </div>
-              <div style={{ flex: 1 }}>
-                <label style={labelStyle}>Serviço / workload</label>
-                <input
-                  list="src-svc-list"
-                  value={srcSvc}
-                  onChange={e => setSrcSvc(e.target.value)}
-                  placeholder={srcServices[0] ?? 'nome do serviço'}
-                  style={inputStyle}
-                />
-                <datalist id="src-svc-list">
-                  {srcServices.map(s => <option key={s} value={s} />)}
-                </datalist>
-              </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <div style={{ fontSize: 9, fontWeight: 700, color: '#0369a1', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Origem</div>
+              {dir === 'ingress' && (
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <button style={cidrToggleBtn(!srcCidr)} onClick={() => { setSrcCidr(false); setCidrValue('') }}>Workload K8s</button>
+                  <button style={cidrToggleBtn(srcCidr)} onClick={() => setSrcCidr(true)}>Range de IP</button>
+                </div>
+              )}
             </div>
+            {srcCidr ? (
+              <div>
+                <label style={labelStyle}>CIDR de origem</label>
+                <input value={cidrValue} onChange={e => setCidrValue(e.target.value)} placeholder="ex: 10.0.0.0/8"
+                  style={{ ...inputStyle, borderColor: cidrValue && !cidrValid ? '#ef4444' : undefined }} />
+                {cidrValue && !cidrValid && <div style={{ fontSize: 10, color: '#ef4444', marginTop: 2 }}>CIDR inválido</div>}
+                <label style={{ ...labelStyle, marginTop: 8 }}>Excluir CIDRs (opcional, vírgula)</label>
+                <input value={cidrExcept} onChange={e => setCidrExcept(e.target.value)} placeholder="192.168.0.0/16, 172.16.0.0/12" style={inputStyle} />
+              </div>
+            ) : (
+              <div style={{ display: 'flex', gap: 8 }}>
+                <div style={{ flex: 1 }}>
+                  <label style={labelStyle}>Namespace</label>
+                  <select value={srcNs} onChange={e => { setSrcNs(e.target.value); setSrcSvc(''); setSrcManual(false) }} style={selectStyle}>
+                    {namespaces.map(n => <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label style={labelStyle}>Serviço / workload</label>
+                  {srcManual ? (
+                    <input value={srcSvc} onChange={e => setSrcSvc(e.target.value)} placeholder="nome exato" style={inputStyle} autoFocus />
+                  ) : (
+                    <select value={srcSvc} onChange={e => { if (e.target.value === '__manual__') { setSrcManual(true); setSrcSvc('') } else setSrcSvc(e.target.value) }} style={selectStyle}>
+                      <option value="">— selecione —</option>
+                      {workloadOptions(srcNs).map(w => <option key={w} value={w}>{w}</option>)}
+                      <option value="__manual__">Digitar manualmente…</option>
+                    </select>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Direction indicator */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
             {(['ingress', 'both', 'egress'] as const).map(d => (
-              <button key={d} onClick={() => setDir(d)} style={{
+              <button key={d} onClick={() => handleDirChange(d)} style={{
                 padding: '4px 10px', fontSize: 10, fontWeight: 700, borderRadius: 99,
                 border: `1.5px solid ${dir === d ? '#2563eb' : '#e2e8f0'}`,
                 background: dir === d ? '#eff6ff' : 'white',
@@ -240,33 +386,55 @@ function NewDraftModal({ services, onAdd, onClose }: {
 
           {/* Destination */}
           <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '10px 12px' }}>
-            <div style={{ fontSize: 9, fontWeight: 700, color: '#15803d', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>Destino</div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <div style={{ flex: 1 }}>
-                <label style={labelStyle}>Namespace</label>
-                <select value={dstNs} onChange={e => { setDstNs(e.target.value); setDstSvc('') }} style={selectStyle}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <div style={{ fontSize: 9, fontWeight: 700, color: '#15803d', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Destino</div>
+              {dir === 'egress' && (
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <button style={cidrToggleBtn(!dstCidr)} onClick={() => { setDstCidr(false); setCidrValue('') }}>Serviço K8s</button>
+                  <button style={cidrToggleBtn(dstCidr)} onClick={() => setDstCidr(true)}>Range de IP</button>
+                </div>
+              )}
+            </div>
+            {dstCidr ? (
+              <div>
+                <label style={labelStyle}>Namespace (onde a policy é criada)</label>
+                <select value={dstNs} onChange={e => setDstNs(e.target.value)} style={selectStyle}>
                   {namespaces.map(n => <option key={n} value={n}>{n}</option>)}
                 </select>
+                <label style={{ ...labelStyle, marginTop: 8 }}>CIDR de destino</label>
+                <input value={cidrValue} onChange={e => setCidrValue(e.target.value)} placeholder="ex: 52.34.0.0/16 ou 10.1.2.3/32"
+                  style={{ ...inputStyle, borderColor: cidrValue && !cidrValid ? '#ef4444' : undefined }} />
+                {cidrValue && !cidrValid && <div style={{ fontSize: 10, color: '#ef4444', marginTop: 2 }}>CIDR inválido</div>}
+                <label style={{ ...labelStyle, marginTop: 8 }}>Excluir CIDRs (opcional, vírgula)</label>
+                <input value={cidrExcept} onChange={e => setCidrExcept(e.target.value)} placeholder="192.168.0.0/16, 172.16.0.0/12" style={inputStyle} />
               </div>
-              <div style={{ flex: 1 }}>
-                <label style={labelStyle}>Serviço</label>
-                <input
-                  list="dst-svc-list"
-                  value={dstSvc}
-                  onChange={e => setDstSvc(e.target.value)}
-                  placeholder={dstServices[0] ?? 'nome do serviço'}
-                  style={inputStyle}
-                />
-                <datalist id="dst-svc-list">
-                  {dstServices.map(s => <option key={s} value={s} />)}
-                </datalist>
+            ) : (
+              <div style={{ display: 'flex', gap: 8 }}>
+                <div style={{ flex: 1 }}>
+                  <label style={labelStyle}>Namespace</label>
+                  <select value={dstNs} onChange={e => { setDstNs(e.target.value); setDstSvc(''); setDstManual(false) }} style={selectStyle}>
+                    {namespaces.map(n => <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label style={labelStyle}>Serviço</label>
+                  {dstManual ? (
+                    <input value={dstSvc} onChange={e => setDstSvc(e.target.value)} placeholder="nome exato" style={inputStyle} autoFocus />
+                  ) : (
+                    <select value={dstSvc} onChange={e => { if (e.target.value === '__manual__') { setDstManual(true); setDstSvc('') } else setDstSvc(e.target.value) }} style={selectStyle}>
+                      <option value="">— selecione —</option>
+                      {workloadOptions(dstNs).map(w => <option key={w} value={w}>{w}</option>)}
+                      <option value="__manual__">Digitar manualmente…</option>
+                    </select>
+                  )}
+                </div>
               </div>
-            </div>
+            )}
           </div>
 
           {/* Ports */}
           <div>
-            <label style={labelStyle}>Portas</label>
+            <label style={labelStyle}>Portas {isCidr && <span style={{ color: '#94a3b8', fontWeight: 400 }}>(vazio = todas)</span>}</label>
             {ports.map((ps, i) => (
               <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center' }}>
                 <select value={ps.protocol} onChange={e => setPorts(prev => prev.map((p, j) => j === i ? { ...p, protocol: e.target.value as PortSpec['protocol'] } : p))}
@@ -278,16 +446,20 @@ function NewDraftModal({ services, onAdd, onClose }: {
                 <input type="number" value={ps.port} min={1} max={65535}
                   onChange={e => setPorts(prev => prev.map((p, j) => j === i ? { ...p, port: parseInt(e.target.value) || 1 } : p))}
                   style={{ ...inputStyle, width: 80 }} />
-                {ports.length > 1 && (
-                  <button onClick={() => setPorts(prev => prev.filter((_, j) => j !== i))}
-                    style={{ background: '#fee2e2', color: '#dc2626', border: 'none', borderRadius: 5, cursor: 'pointer', padding: '4px 7px', fontSize: 11 }}>✕</button>
-                )}
+                <button onClick={() => setPorts(prev => prev.filter((_, j) => j !== i))}
+                  style={{ background: '#fee2e2', color: '#dc2626', border: 'none', borderRadius: 5, cursor: 'pointer', padding: '4px 7px', fontSize: 11 }}>✕</button>
               </div>
             ))}
-            <button onClick={() => setPorts(prev => [...prev, { port: 80, protocol: 'TCP' as const }])}
+            <button onClick={() => setPorts(prev => [...prev, { port: 443, protocol: 'TCP' as const }])}
               style={{ ...inputStyle, width: 'auto', background: '#f1f5f9', color: '#475569', cursor: 'pointer', border: '1px dashed #cbd5e1', fontSize: 10, fontWeight: 600, padding: '4px 10px' }}>
               + Adicionar porta
             </button>
+            {isCidr && ports.length > 0 && (
+              <button onClick={() => setPorts([])}
+                style={{ ...inputStyle, width: 'auto', background: 'transparent', color: '#94a3b8', cursor: 'pointer', border: 'none', fontSize: 10, padding: '4px 10px' }}>
+                Limpar (todas as portas)
+              </button>
+            )}
           </div>
 
           {/* Submit */}
@@ -300,7 +472,7 @@ function NewDraftModal({ services, onAdd, onClose }: {
               border: 'none', borderRadius: 7, cursor: canSubmit ? 'pointer' : 'not-allowed',
             }}
           >
-            Criar rascunho
+            {isCidr ? 'Criar rascunho CIDR' : 'Criar rascunho'}
           </button>
         </div>
       </div>
@@ -308,8 +480,8 @@ function NewDraftModal({ services, onAdd, onClose }: {
   )
 }
 
-function DraftsTab({ drafts, services, config, currentUser, onRemove, onApply, onApplyAll, onDiscardAll, onUpdatePort, onAddDraft }: {
-  drafts: Draft[]; services: ServiceInfo[]; config: AppConfig; currentUser: User | null
+function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemove, onApply, onApplyAll, onDiscardAll, onUpdatePort, onAddDraft }: {
+  drafts: Draft[]; services: ServiceInfo[]; ciliumFlows: CiliumFlowSummary[]; config: AppConfig; currentUser: User | null
   onRemove: (id: string) => void
   onApply: (d: Draft, allowedApprovers: Array<{ id: string; username: string }>) => Promise<void>
   onApplyAll: () => Promise<void>; onDiscardAll: () => void; onUpdatePort: (id: string, ports: PortSpec[]) => void
@@ -367,7 +539,7 @@ function DraftsTab({ drafts, services, config, currentUser, onRemove, onApply, o
           <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           Nova política
         </button>
-        {showNewModal && <NewDraftModal services={services} onAdd={onAddDraft} onClose={() => setShowNewModal(false)} />}
+        {showNewModal && <NewDraftModal services={services} ciliumFlows={ciliumFlows} onAdd={onAddDraft} onClose={() => setShowNewModal(false)} />}
       </div>
     )
   }
@@ -385,7 +557,7 @@ function DraftsTab({ drafts, services, config, currentUser, onRemove, onApply, o
           <button style={{ ...btn.base, ...btn.green }} onClick={onApplyAll}><Icon.Check /> Aplicar todos</button>
         </div>
       </div>
-      {showNewModal && <NewDraftModal services={services} onAdd={onAddDraft} onClose={() => setShowNewModal(false)} />}
+      {showNewModal && <NewDraftModal services={services} ciliumFlows={ciliumFlows} onAdd={onAddDraft} onClose={() => setShowNewModal(false)} />}
       <div style={{ flex: 1, overflowY: 'auto' }}>
         {drafts.map(draft => {
           const isExpanded = expanded === draft.id
@@ -579,6 +751,8 @@ const POLICY_META: Record<string, { dot: string; label: string }> = {
   'allow-intranamespace': { dot: '#0284c7', label: 'Allow Intra' },
   'restrict-ingress':     { dot: '#ef4444', label: 'Deny IN' },
   'restrict-egress':      { dot: '#f97316', label: 'Deny OUT' },
+  'cidr-ingress':         { dot: '#7c3aed', label: 'CIDR ↓' },
+  'cidr-egress':          { dot: '#7c3aed', label: 'CIDR ↑' },
   'external':             { dot: '#94a3b8', label: 'Ext' },
 }
 
@@ -705,6 +879,17 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   async function handleDelete(ns: string, name: string) {
     if (!confirm('Remover esta NetworkPolicy?')) return
     await deleteNetworkPolicy(ns, name); onDelete()
+  }
+
+  async function handlePauseOne(ns: string, name: string) {
+    if (!confirm(`Pausar "${name}"? A policy será removida do cluster mas salva para restauração.`)) return
+    await pausePolicy(ns, name).catch(() => {})
+    onRefresh(); await loadPaused()
+  }
+
+  async function handleResumeOne(id: string) {
+    await resumePolicy(id).catch(() => {})
+    onRefresh(); await loadPaused()
   }
 
   // Active policy keys (used to deduplicate paused list — if a policy survived pause deletion it appears in both)
@@ -866,6 +1051,9 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
                                 {p.adopted && (
                                   <button style={{ ...btn.base, ...btn.orange, padding: '3px 7px', fontSize: 10 }} title="Desadotar — remove do Floodgate mas mantém no cluster" onClick={() => handleUnadopt(p)}>↩ Desadotar</button>
                                 )}
+                                {isAdmin && (
+                                  <button style={{ ...btn.base, ...btn.orange, padding: '3px 7px', fontSize: 10 }} title="Pausar — salva no DB e remove do cluster" onClick={() => handlePauseOne(p.namespace, p.name)}>⏸</button>
+                                )}
                                 <button style={{ ...btn.base, ...btn.red, padding: '3px 7px' }} onClick={() => handleDelete(p.namespace, p.name)}><Icon.Trash /></button>
                               </>
                             )}
@@ -891,6 +1079,9 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
                           </div>
                           <span style={{ fontSize: 8, fontWeight: 700, color: '#9ca3af', background: '#f3f4f6', border: '1px solid #d1d5db', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>INATIVA</span>
                           <button style={{ ...btn.base, ...btn.gray, padding: '3px 7px', fontSize: 10, flexShrink: 0 }} onClick={() => toggleYAML(key)}><Icon.Eye /></button>
+                          {isAdmin && (
+                            <button style={{ ...btn.base, ...btn.green, padding: '3px 7px', fontSize: 10, flexShrink: 0 }} title="Reativar — aplica novamente no cluster" onClick={() => handleResumeOne(p.id)}>▶</button>
+                          )}
                         </div>
                         {expandedYAML === key && <StaticYAMLViewer yamlStr={p.policy_yaml} />}
                       </div>
@@ -997,13 +1188,15 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
   }, [])
 
   const postures: ServicePosture[] = services.map(svc => {
-    const svcPolicies = policies.filter(p => p.namespace === svc.namespace && p.dst_service === svc.name)
+    const nsPols = policies.filter(p => p.namespace === svc.namespace)
+    // Inclui policies por serviço E policies namespace-wide (dst_service='') que cobrem todos os pods
+    const svcPolicies = nsPols.filter(p => p.dst_service === svc.name || p.dst_service === '')
     return {
       name: svc.name,
       namespace: svc.namespace,
       hasDenyIngress: svcPolicies.some(p => p.policy_type === 'restrict-ingress'),
       hasDenyEgress:  svcPolicies.some(p => p.policy_type === 'restrict-egress'),
-      allowCount: svcPolicies.filter(p => ['allow', 'allow-egress', 'allow-namespace'].includes(p.policy_type)).length,
+      allowCount: nsPols.filter(p => p.dst_service === svc.name && ['allow', 'allow-egress', 'allow-namespace'].includes(p.policy_type)).length,
     }
   })
 
@@ -1034,6 +1227,32 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
     } finally { setIsoApplying(false) }
   }
 
+  async function handleUnisolate(ns: string) {
+    const isolationNames = new Set([
+      `floodgate-ns-deny-ingress-${ns}`.slice(0, 63),
+      `floodgate-ns-deny-egress-${ns}`.slice(0, 63),
+      `floodgate-intra-ingress-${ns}`.slice(0, 63),
+      `floodgate-intra-egress-${ns}`.slice(0, 63),
+      `floodgate-egress-internet-${ns}`.slice(0, 63),
+    ])
+    // Remove policies criadas pelo isolateNamespace (namespace-wide) + restrict por serviço do mesmo namespace
+    // (restrict por serviço cobertos pela regra namespace-wide — remover junto para consistência)
+    const toDelete = policies.filter(p =>
+      p.namespace === ns && (
+        isolationNames.has(p.name) ||
+        p.policy_type === 'restrict-ingress' ||
+        p.policy_type === 'restrict-egress' ||
+        p.policy_type === 'allow-intranamespace'
+      )
+    )
+    if (toDelete.length === 0) return
+    if (!confirm(`Remover ${toDelete.length} policies de isolamento do namespace "${ns}"?`)) return
+    for (const p of toDelete) {
+      try { await deleteNetworkPolicy(p.namespace, p.name) } catch { /* já removida */ }
+    }
+    onRefresh()
+  }
+
   // Per-namespace stats for the namespace view
   const nsList = [...new Set(services.map(s => s.namespace))].sort()
   const nsStats = nsList.map(ns => {
@@ -1044,7 +1263,15 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
     const total = nsSvcs.length
     const fullyProtected = withIn === total && withOut === total
     const anyProtected   = withIn > 0 || withOut > 0
-    return { ns, total, withIn, withOut, fullyProtected, anyProtected }
+    const isolationNames = new Set([
+      `floodgate-ns-deny-ingress-${ns}`.slice(0, 63),
+      `floodgate-ns-deny-egress-${ns}`.slice(0, 63),
+      `floodgate-intra-ingress-${ns}`.slice(0, 63),
+      `floodgate-intra-egress-${ns}`.slice(0, 63),
+      `floodgate-egress-internet-${ns}`.slice(0, 63),
+    ])
+    const hasNsIsolation = nsPols.some(p => isolationNames.has(p.name))
+    return { ns, total, withIn, withOut, fullyProtected, anyProtected, hasNsIsolation }
   })
 
   if (!coverageLoaded) {
@@ -1101,10 +1328,10 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
       <div style={{ flex: 1, overflowY: 'auto' }}>
 
         {/* ── Namespace isolation view ── */}
-        {view === 'namespaces' && nsStats.map(({ ns, total, withIn, withOut, fullyProtected, anyProtected }) => {
-          const color  = fullyProtected ? '#16a34a' : anyProtected ? '#d97706' : '#dc2626'
-          const bg     = fullyProtected ? '#f0fdf4'  : anyProtected ? '#fffbeb'  : '#fef2f2'
-          const border = fullyProtected ? '#bbf7d0'  : anyProtected ? '#fde68a'  : '#fecaca'
+        {view === 'namespaces' && nsStats.map(({ ns, total, withIn, withOut, fullyProtected, anyProtected, hasNsIsolation }) => {
+          const color  = fullyProtected || hasNsIsolation ? '#16a34a' : anyProtected ? '#d97706' : '#dc2626'
+          const bg     = fullyProtected || hasNsIsolation ? '#f0fdf4'  : anyProtected ? '#fffbeb'  : '#fef2f2'
+          const border = fullyProtected || hasNsIsolation ? '#bbf7d0'  : anyProtected ? '#fde68a'  : '#fecaca'
           const isOpen = isoNs === ns
           return (
             <div key={ns} style={{ borderBottom: `1px solid ${border}` }}>
@@ -1113,14 +1340,24 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
                   <div style={{ fontSize: 11, fontWeight: 700, color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ns}</div>
                   <div style={{ fontSize: 9, color: '#94a3b8', marginTop: 2 }}>
                     {total} svc · {withIn}/{total} IN · {withOut}/{total} OUT
+                    {hasNsIsolation && <span style={{ color: '#16a34a', fontWeight: 600 }}> · isolamento ativo</span>}
                   </div>
                 </div>
                 {isAdmin && (!canManageNamespace || canManageNamespace(ns)) && (
-                  <button
-                    style={{ ...btn.base, ...(isOpen ? btn.gray : btn.red), fontSize: 9, padding: '3px 8px', flexShrink: 0 }}
-                    onClick={() => { setIsoNs(isOpen ? null : ns); setIsoDirection('both'); setIsoAllowIntra(true) }}>
-                    {isOpen ? 'Cancelar' : 'Isolar'}
-                  </button>
+                  <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+                    {hasNsIsolation && (
+                      <button
+                        style={{ ...btn.base, ...btn.gray, fontSize: 9, padding: '3px 8px' }}
+                        onClick={() => handleUnisolate(ns)}>
+                        Remover isolamento
+                      </button>
+                    )}
+                    <button
+                      style={{ ...btn.base, ...(isOpen ? btn.gray : btn.red), fontSize: 9, padding: '3px 8px' }}
+                      onClick={() => { setIsoNs(isOpen ? null : ns); setIsoDirection('both'); setIsoAllowIntra(true) }}>
+                      {isOpen ? 'Cancelar' : 'Isolar'}
+                    </button>
+                  </div>
                 )}
               </div>
               {isOpen && (
@@ -1507,10 +1744,6 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
     }
     if (local.autosync_enabled && local.autosync_interval_s < 30)
       errs.push('Intervalo do autosync deve ser de pelo menos 30 segundos.')
-    const watchedSet = new Set(local.watched_namespaces)
-    const overlap = local.ignored_namespaces.filter(ns => watchedSet.has(ns))
-    if (overlap.length > 0)
-      errs.push(`Namespace(s) "${overlap.join(', ')}" estão em monitorados E ignorados ao mesmo tempo.`)
     return errs
   }
 
@@ -1534,14 +1767,15 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
   return (
     <div style={{ flex: 1, overflowY: 'auto', padding: 14 }}>
       <div style={{ marginBottom: 14 }}>
-        <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>Namespaces ignorados (vírgula)</label>
-        <textarea value={local.ignored_namespaces.join(', ')} onChange={e => setLocal(p => ({ ...p, ignored_namespaces: e.target.value.split(',').map(s => s.trim()).filter(Boolean) }))}
-          rows={3} style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 6, padding: '6px 10px', fontSize: 11, resize: 'vertical', boxSizing: 'border-box', fontFamily: 'ui-monospace, monospace' }} />
-      </div>
-      <div style={{ marginBottom: 14 }}>
-        <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>Namespaces monitorados (vazio = todos)</label>
-        <textarea value={local.watched_namespaces.join(', ')} onChange={e => setLocal(p => ({ ...p, watched_namespaces: e.target.value.split(',').map(s => s.trim()).filter(Boolean) }))}
-          rows={2} style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 6, padding: '6px 10px', fontSize: 11, resize: 'vertical', boxSizing: 'border-box', fontFamily: 'ui-monospace, monospace' }} />
+        <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 10 }}>Auto-discover</div>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: '#475569' }}>
+          Retenção de flows
+          <select value={local.hubble_flow_retention_days ?? 7}
+            onChange={e => setLocal(p => ({ ...p, hubble_flow_retention_days: Number(e.target.value) }))}
+            style={{ fontSize: 11, border: '1px solid #e2e8f0', borderRadius: 5, padding: '3px 6px', color: '#334155', background: 'white' }}>
+            {[1, 3, 7, 14, 30].map(d => <option key={d} value={d}>{d} dias</option>)}
+          </select>
+        </label>
       </div>
       <div style={{ marginBottom: 14, borderTop: '1px solid #f1f5f9', paddingTop: 14 }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 10 }}>Workflow de aprovação</div>
@@ -1776,14 +2010,372 @@ function Forbidden() {
   )
 }
 
+// ─── DescobertaTab ───────────────────────────────────────────────────────────
+const DISC_FILTER_KEY = 'floodgate-disc-filters'
+
+function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDraft, onSaveConfig, onSwitchTab }: {
+  flows: CiliumFlowSummary[]
+  config: AppConfig
+  streaming: boolean
+  allPolicies: NetworkPolicyInfo[]
+  onClear?: () => void
+  onAddDraft: (d: Omit<Draft, 'id'>) => void
+  onSaveConfig: (c: AppConfig) => Promise<void>
+  onSwitchTab: (tab: Tab) => void
+}) {
+  const savedFilters = (() => { try { return JSON.parse(localStorage.getItem(DISC_FILTER_KEY) ?? '{}') } catch { return {} } })()
+  const [nsFilter, setNsFilter] = useState<string>(savedFilters.nsFilter ?? 'all')
+  const [verdictFilter, setVerdictFilter] = useState<'all' | 'FORWARDED' | 'DROPPED'>(savedFilters.verdictFilter ?? 'all')
+  const [searchText, setSearchText] = useState<string>(savedFilters.searchText ?? '')
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [hubbleAvailable, setHubbleAvailable] = useState<boolean | null>(null)
+  const [toggleError, setToggleError] = useState<string | null>(null)
+  const [policyYaml, setPolicyYaml] = useState<{ name: string; content: string } | null>(null)
+  const [loadingYaml, setLoadingYaml] = useState<string | null>(null)
+  const [previewFlowId, setPreviewFlowId] = useState<string | null>(null)
+  const [previewYamlMap, setPreviewYamlMap] = useState<Map<string, string>>(new Map())
+  const [collapsedNs, setCollapsedNs] = useState<Set<string>>(new Set())
+  function toggleDiscNs(ns: string) {
+    setCollapsedNs(prev => { const n = new Set(prev); n.has(ns) ? n.delete(ns) : n.add(ns); return n })
+  }
+
+  React.useEffect(() => {
+    checkHubble().then(r => setHubbleAvailable(r.available)).catch(() => setHubbleAvailable(false))
+  }, [])
+
+  // Persiste filtros no localStorage
+  React.useEffect(() => {
+    try { localStorage.setItem(DISC_FILTER_KEY, JSON.stringify({ nsFilter, verdictFilter, searchText })) } catch { }
+  }, [nsFilter, verdictFilter, searchText])
+
+  const visibleFlows = flows.filter(f =>
+    !config.ignored_namespaces.includes(f.src_namespace) &&
+    !config.ignored_namespaces.includes(f.dst_namespace)
+  )
+
+  const namespaces = Array.from(new Set(visibleFlows.map(f => f.dst_namespace))).sort()
+
+  const filtered = visibleFlows.filter(f =>
+    (nsFilter === 'all' || f.dst_namespace === nsFilter) &&
+    (verdictFilter === 'all' || f.verdict === verdictFilter) &&
+    (!searchText || [f.src_workload, f.src_namespace, f.dst_workload, f.dst_namespace].some(s => s.toLowerCase().includes(searchText.toLowerCase())))
+  )
+
+  const grouped = filtered.reduce<Record<string, CiliumFlowSummary[]>>((acc, f) => {
+    ;(acc[f.dst_namespace] ??= []).push(f)
+    return acc
+  }, {})
+
+  const unprotected = filtered.filter(f => !f.has_policy)
+
+  function toggleSelect(id: string) {
+    setSelected(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
+  }
+  function toggleAll() {
+    setSelected(selected.size === unprotected.length ? new Set() : new Set(unprotected.map(f => f.id)))
+  }
+
+  async function handleToggle(enabled: boolean) {
+    setToggleError(null)
+    if (enabled) {
+      const check = await checkHubble().catch(() => ({ available: false }))
+      setHubbleAvailable(check.available)
+      if (!check.available) { setToggleError('Hubble Relay não encontrado. Verifique se está instalado no cluster.'); return }
+    }
+    await onSaveConfig({ ...config, hubble_discovery_enabled: enabled })
+  }
+
+  function findMatchedPolicy(f: CiliumFlowSummary) {
+    return allPolicies.find(p =>
+      p.namespace === f.dst_namespace && (
+        p.dst_service === f.dst_workload ||
+        p.policy_type === 'restrict-ingress' ||
+        p.policy_type === 'restrict-egress'
+      )
+    )
+  }
+
+  async function handleViewPolicy(f: CiliumFlowSummary) {
+    const match = findMatchedPolicy(f)
+    if (!match) return
+    setLoadingYaml(f.id)
+    try {
+      const res = await fetch(`/api/networkpolicies/${match.namespace}/${match.name}`)
+      const text = await res.text()
+      setPolicyYaml({ name: match.name, content: text })
+    } catch { /* silently ignore */ } finally { setLoadingYaml(null) }
+  }
+
+  function createSelectedDrafts() {
+    unprotected.filter(f => selected.has(f.id)).forEach(f => onAddDraft({
+      src_workload: f.src_workload, src_namespace: f.src_namespace,
+      dst_service: f.dst_workload, dst_namespace: f.dst_namespace,
+      dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }],
+      policy_direction: 'ingress',
+    }))
+    setSelected(new Set())
+    onSwitchTab('drafts')
+  }
+
+  const isOn = config.hubble_discovery_enabled
+  const selStyle: React.CSSProperties = { fontSize: 11, border: '1px solid #e2e8f0', borderRadius: 5, padding: '3px 6px', color: '#334155', background: 'white' }
+
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+
+      {/* ─── Header fixo ──────────────────────────────────────────────── */}
+      <div style={{ padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 8, borderBottom: '1px solid #f1f5f9', flexShrink: 0 }}>
+
+        {/* Linha 1: Toggle + Limpar */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <button
+            onClick={() => handleToggle(!isOn)}
+            disabled={hubbleAvailable === false || hubbleAvailable === null}
+            title={hubbleAvailable === false ? 'Hubble Relay não encontrado' : hubbleAvailable === null ? 'Verificando…' : undefined}
+            style={{
+              border: 'none', borderRadius: 20, fontSize: 11, fontWeight: 700,
+              padding: '5px 14px', display: 'flex', alignItems: 'center', gap: 6,
+              background: hubbleAvailable === false ? '#f1f5f9' : isOn ? '#10b981' : '#e2e8f0',
+              color: hubbleAvailable === false ? '#94a3b8' : isOn ? 'white' : '#475569',
+              cursor: hubbleAvailable === false ? 'not-allowed' : 'pointer',
+              opacity: hubbleAvailable === null ? 0.6 : 1,
+            }}
+          >
+            <span style={{ width: 8, height: 8, borderRadius: '50%', display: 'inline-block', background: hubbleAvailable === false ? '#cbd5e1' : isOn ? 'white' : '#94a3b8' }} />
+            {hubbleAvailable === null ? 'Verificando…' : isOn ? 'Auto-discover ON' : 'Auto-discover OFF'}
+          </button>
+          <button onClick={() => onClear?.()} style={{ ...btn.base, ...btn.red, marginLeft: 'auto' }}>
+            <Icon.XCircle /> Limpar
+          </button>
+        </div>
+
+        {/* Linha 2: Retenção + status de streaming (só quando ON) */}
+        {isOn && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 11, color: '#64748b' }}>
+              Flows salvos por <strong>{config.hubble_flow_retention_days ?? 7} dias</strong> · configure em <em>Config</em>
+            </span>
+            <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', display: 'inline-block', background: streaming ? '#10b981' : '#f59e0b' }} />
+              <span style={{ color: streaming ? '#065f46' : '#92400e' }}>
+                {streaming ? 'Transmitindo em tempo real' : 'Aguardando stream…'}
+              </span>
+            </span>
+          </div>
+        )}
+
+        {/* Erro de toggle */}
+        {toggleError && (
+          <div style={{ background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 7, padding: '7px 10px', fontSize: 11, color: '#dc2626', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            {toggleError}
+            <button onClick={() => setToggleError(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#dc2626', fontSize: 14 }}>×</button>
+          </div>
+        )}
+
+        {/* Hubble indisponível */}
+        {hubbleAvailable === false && (
+          <div style={{ background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 8, padding: 12, fontSize: 11, color: '#dc2626', lineHeight: 1.6 }}>
+            <strong>Hubble Relay não encontrado no cluster.</strong> O auto-discover requer o Hubble Relay ativo.<br />
+            <pre style={{ margin: '6px 0 0', background: '#fee2e2', borderRadius: 4, padding: '6px 8px', fontSize: 10, overflowX: 'auto' }}>{`helm upgrade cilium cilium/cilium \\\n  --set hubble.relay.enabled=true \\\n  -n kube-system`}</pre>
+          </div>
+        )}
+
+        {/* Inativo sem flows */}
+        {hubbleAvailable !== false && !isOn && visibleFlows.length === 0 && hubbleAvailable !== null && (
+          <div style={{ background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8, padding: 10, fontSize: 11, color: '#92400e' }}>
+            <strong>Auto-discover desativado.</strong> Ative o toggle para iniciar a captura de tráfego em tempo real.
+          </div>
+        )}
+
+        {/* Streaming ativo mas ainda sem flows */}
+        {isOn && streaming && visibleFlows.length === 0 && (
+          <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 10, fontSize: 11, color: '#166534' }}>
+            Stream ativo — aguardando tráfego nos namespaces monitorados…
+          </div>
+        )}
+
+        {/* Filtros (quando há flows) */}
+        {visibleFlows.length > 0 && (
+          <>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+              <input
+                placeholder="Pesquisar workload / namespace…"
+                value={searchText}
+                onChange={e => setSearchText(e.target.value)}
+                style={{ ...selStyle, flex: 1, minWidth: 120, padding: '3px 7px' }}
+              />
+              <select value={nsFilter} onChange={e => setNsFilter(e.target.value)} style={selStyle}>
+                <option value="all">Todos os namespaces</option>
+                {namespaces.map(ns => <option key={ns} value={ns}>{ns}</option>)}
+              </select>
+              <select value={verdictFilter} onChange={e => setVerdictFilter(e.target.value as typeof verdictFilter)} style={selStyle}>
+                <option value="all">Todos</option>
+                <option value="FORWARDED">FORWARDED</option>
+                <option value="DROPPED">DROPPED</option>
+              </select>
+              <span style={{ fontSize: 10, color: '#94a3b8', whiteSpace: 'nowrap' }}>{filtered.length} flows</span>
+            </div>
+            {unprotected.length > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <label style={{ fontSize: 11, color: '#475569', display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
+                  <input type="checkbox" checked={selected.size === unprotected.length && unprotected.length > 0} onChange={toggleAll} style={{ cursor: 'pointer' }} />
+                  Sem política ({unprotected.length})
+                </label>
+                {selected.size > 0 && (
+                  <button onClick={createSelectedDrafts} style={{ ...btn.base, ...btn.green, marginLeft: 'auto' }}>
+                    Criar Rascunhos ({selected.size})
+                  </button>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* ─── Lista scrollável ──────────────────────────────────────────── */}
+      <div style={{ flex: 1, overflowY: 'auto' }}>
+        {Object.entries(grouped).map(([ns, nsFlows]) => {
+          const isOpen = !collapsedNs.has(ns)
+          return (
+          <div key={ns}>
+            <button onClick={() => toggleDiscNs(ns)}
+              style={{ width: '100%', padding: '7px 14px', background: '#f8fafc', border: 'none', borderBottom: '1px solid #e2e8f0', borderTop: '1px solid #e2e8f0', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, textAlign: 'left' }}>
+              {isOpen ? <Icon.ChevronDown /> : <Icon.ChevronRight />}
+              <span style={{ fontSize: 11, fontWeight: 700, color: '#334155', flex: 1 }}>{ns}</span>
+              <span style={{ fontSize: 10, color: '#94a3b8', background: '#e2e8f0', borderRadius: 10, padding: '1px 7px', fontWeight: 600 }}>{nsFlows.length}</span>
+            </button>
+            {isOpen && (
+            <div style={{ padding: '8px 14px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {nsFlows.map(f => {
+                const matchedPolicy = findMatchedPolicy(f)
+                const vc = f.verdict === 'DROPPED'
+                  ? { bg: '#fff1f2', border: '#fecdd3', badge: '#fee2e2', text: '#dc2626' }
+                  : { bg: '#f8fafc', border: '#e2e8f0', badge: '#dcfce7', text: '#16a34a' }
+                const lastSeen = new Date(f.last_seen)
+                const timeSince = (() => {
+                  const s = Math.floor((Date.now() - lastSeen.getTime()) / 1000)
+                  if (s < 60) return 'agora mesmo'
+                  if (s < 3600) return `há ${Math.floor(s / 60)} min`
+                  return lastSeen.toLocaleTimeString()
+                })()
+                return (
+                  <div key={f.id} style={{ background: vc.bg, border: `1px solid ${vc.border}`, borderRadius: 8, padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+
+                    {/* Linha 1: veredicto + ocorrências + tempo */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      {!f.has_policy && (
+                        <input type="checkbox" checked={selected.has(f.id)} onChange={() => toggleSelect(f.id)} style={{ cursor: 'pointer', flexShrink: 0 }} />
+                      )}
+                      <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 10, background: vc.badge, color: vc.text }}>
+                        {f.verdict}
+                      </span>
+                      {f.has_policy && (
+                        <span style={{ fontSize: 10, color: '#2563eb', fontWeight: 600 }}>✓ com política</span>
+                      )}
+                      <span style={{ fontSize: 10, color: '#94a3b8', marginLeft: 'auto' }}>
+                        {f.flow_count === 1 ? '1 ocorrência' : `${f.flow_count} ocorrências`} · {timeSince}
+                      </span>
+                    </div>
+
+                    {/* Linha 2: de → para (destaque principal) */}
+                    <div title={`${f.src_workload || '?'} → ${f.dst_workload}`} style={{ fontSize: 13, fontWeight: 700, color: '#0f172a', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {f.src_workload || '?'} → {f.dst_workload}
+                    </div>
+
+                    {/* Linha 3: namespaces + porta (info secundária) */}
+                    <div style={{ fontSize: 11, color: '#64748b' }}>
+                      <span style={{ color: '#475569' }}>{f.src_namespace}</span>
+                      <span style={{ color: '#94a3b8' }}> → </span>
+                      <span style={{ color: '#475569' }}>{f.dst_namespace}</span>
+                      <span style={{ color: '#94a3b8' }}> · porta </span>
+                      <span style={{ fontWeight: 600, color: '#475569' }}>{f.dst_port}/{f.protocol}</span>
+                    </div>
+
+                    {/* Linha 4: botões de ação */}
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center', paddingTop: 2 }}>
+                      {!f.has_policy && (
+                        <button onClick={() => {
+                          onAddDraft({ src_workload: f.src_workload, src_namespace: f.src_namespace, dst_service: f.dst_workload, dst_namespace: f.dst_namespace, dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }], policy_direction: 'ingress' })
+                          onSwitchTab('drafts')
+                        }} style={{ ...btn.base, ...btn.green }}>
+                          Criar política
+                        </button>
+                      )}
+                      {!f.has_policy && (
+                        <button onClick={async () => {
+                          if (previewYamlMap.has(f.id)) {
+                            setPreviewFlowId(previewFlowId === f.id ? null : f.id)
+                            return
+                          }
+                          setPreviewFlowId(f.id)
+                          try {
+                            const yaml = await previewDiscoveryPolicyYAML(f)
+                            setPreviewYamlMap(prev => new Map(prev).set(f.id, yaml))
+                          } catch {
+                            setPreviewYamlMap(prev => new Map(prev).set(f.id, '# Erro ao gerar YAML'))
+                          }
+                        }} style={{ ...btn.base, ...btn.gray }}>
+                          <Icon.Eye />{previewYamlMap.has(f.id) && previewFlowId === f.id ? 'Fechar' : 'Ver YAML'}
+                        </button>
+                      )}
+                      {f.has_policy && matchedPolicy && (
+                        <button onClick={() => handleViewPolicy(f)} disabled={loadingYaml === f.id}
+                          style={{ ...btn.base, background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe' }}>
+                          {loadingYaml === f.id ? 'Carregando…' : 'Ver política'}
+                        </button>
+                      )}
+                    </div>
+                    {/* Preview YAML inline */}
+                    {previewFlowId === f.id && (
+                      previewYamlMap.has(f.id)
+                        ? <StaticYAMLViewer yamlStr={previewYamlMap.get(f.id)!} />
+                        : <div style={{ padding: '6px 0 2px', fontSize: 10, color: '#64748b' }}>Gerando YAML…</div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+            )}
+          </div>
+          )
+        })}
+
+        {flows.length > 0 && filtered.length === 0 && (
+          <div style={{ textAlign: 'center', color: '#94a3b8', fontSize: 12, padding: '30px 0' }}>
+            Nenhum flow encontrado com os filtros atuais.
+          </div>
+        )}
+      </div>
+
+      {/* ─── Modal YAML de política ────────────────────────────────────── */}
+      {policyYaml && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}
+          onClick={() => setPolicyYaml(null)}>
+          <div style={{ background: 'white', borderRadius: 12, width: '100%', maxWidth: 560, boxShadow: '0 8px 40px rgba(0,0,0,0.2)', overflow: 'hidden' }}
+            onClick={e => e.stopPropagation()}>
+            <div style={{ padding: '14px 16px', borderBottom: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: '#1e293b' }}>{policyYaml.name}</span>
+              <button onClick={() => setPolicyYaml(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 18, color: '#94a3b8', lineHeight: 1 }}>×</button>
+            </div>
+            <pre style={{ margin: 0, padding: '14px 16px', fontSize: 11, lineHeight: 1.6, overflowX: 'auto', maxHeight: 420, background: '#0f172a', color: '#7dd3fc', fontFamily: 'ui-monospace, monospace' }}>
+              {policyYaml.content}
+            </pre>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Tab label map ────────────────────────────────────────────────────────
 const TAB_LABELS: Record<Tab, string> = {
-  namespaces: 'Namespaces',
-  drafts:     'Rascunhos',
-  policies:   'Policies',
-  aprovacoes: 'Aprovações',
-  seguranca:  'Segurança',
-  config:     'Config',
+  namespaces:  'Namespaces',
+  drafts:      'Rascunhos',
+  policies:    'Policies',
+  aprovacoes:  'Aprovações',
+  seguranca:   'Segurança',
+  descoberta:  'Descoberta',
+  config:      'Config',
 }
 
 // ─── Main panel ───────────────────────────────────────────────────────────
@@ -1801,6 +2393,9 @@ interface Props {
   onApplyDraft: (draft: Draft, allowedApprovers?: Array<{ id: string; username: string }>) => Promise<void>; onApplyAllDrafts: () => Promise<void>
   onDiscardAllDrafts: () => void; onUpdateDraftPort: (id: string, ports: Draft['dst_ports']) => void
   onPoliciesChanged: () => void; onSaveConfig: (c: AppConfig) => Promise<void>
+  ciliumFlows?: CiliumFlowSummary[]
+  ciliumStreaming?: boolean
+  onClearCiliumFlows?: () => void
 }
 
 export default function RightPanel({
@@ -1808,6 +2403,8 @@ export default function RightPanel({
   pendingApprovals = [], requestTab, onTabOpened, openPasswordModal, onPasswordModalClosed,
   onToggleNamespace, onRemoveDraft, onAddDraft, onApplyDraft, onApplyAllDrafts, onDiscardAllDrafts,
   onUpdateDraftPort, onPoliciesChanged, onSaveConfig,
+  ciliumFlows = [], ciliumStreaming = false,
+  onClearCiliumFlows,
 }: Props) {
   const [activeTab, setActiveTab] = useState<Tab | null>(() => {
     try { return (localStorage.getItem('floodgate-active-tab') as Tab) || 'namespaces' } catch { return 'namespaces' }
@@ -1840,12 +2437,15 @@ export default function RightPanel({
     return false
   })()
 
+  const unprotectedFlowCount = ciliumFlows.filter(f => !f.has_policy).length
+
   const navItems: Array<{ id: Tab; icon: React.ReactNode; badge?: number }> = [
     { id: 'namespaces', icon: <Icon.Namespace /> },
     ...(!isViewer ? [{ id: 'drafts' as Tab, icon: <Icon.Draft />, badge: drafts.length }] : []),
     { id: 'policies',   icon: <Icon.Policy />,   badge: policies.length },
     ...(canSeeApprovals ? [{ id: 'aprovacoes' as Tab, icon: <Icon.Clock />, badge: pendingApprovals.length }] : []),
     { id: 'seguranca',  icon: <Icon.Shield /> },
+    ...(isAdmin ? [{ id: 'descoberta' as Tab, icon: <Icon.Radar />, badge: unprotectedFlowCount > 0 ? unprotectedFlowCount : undefined }] : []),
     ...(isAdmin ? [{ id: 'config' as Tab, icon: <Icon.Config /> }] : []),
   ]
 
@@ -2041,11 +2641,19 @@ export default function RightPanel({
             >×</button>
           </div>
           <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-            {activeTab === 'namespaces' && <NamespacesTab allNamespaces={allNamespaces} services={services} visibleNamespaces={visibleNamespaces} ignoredNamespaces={config.ignored_namespaces} onToggle={onToggleNamespace} />}
-            {activeTab === 'drafts' && !isViewer && <DraftsTab drafts={drafts} services={services} config={config} currentUser={currentUser} onRemove={onRemoveDraft} onApply={onApplyDraft} onApplyAll={onApplyAllDrafts} onDiscardAll={onDiscardAllDrafts} onUpdatePort={onUpdateDraftPort} onAddDraft={onAddDraft} />}
+            {activeTab === 'namespaces' && <NamespacesTab
+              allNamespaces={allNamespaces} services={services} visibleNamespaces={visibleNamespaces}
+              ignoredNamespaces={config.ignored_namespaces} onToggle={onToggleNamespace}
+              isAdmin={isAdmin}
+              onIgnore={isAdmin ? (ns) => onSaveConfig({ ...config, ignored_namespaces: [...config.ignored_namespaces.filter(x => x !== ns), ns] }) : undefined}
+              onUnignore={isAdmin ? (ns) => onSaveConfig({ ...config, ignored_namespaces: config.ignored_namespaces.filter(x => x !== ns) }) : undefined}
+            />}
+            {activeTab === 'drafts' && !isViewer && <DraftsTab drafts={drafts} services={services} ciliumFlows={ciliumFlows} config={config} currentUser={currentUser} onRemove={onRemoveDraft} onApply={onApplyDraft} onApplyAll={onApplyAllDrafts} onDiscardAll={onDiscardAllDrafts} onUpdatePort={onUpdateDraftPort} onAddDraft={onAddDraft} />}
             {activeTab === 'policies' && <PoliciesTab policies={policies} allPolicies={allPolicies} services={services} isAdmin={isAdmin} isViewer={isViewer} canManageNamespace={canManageNamespace} onDelete={onPoliciesChanged} onRefresh={onPoliciesChanged} />}
             {activeTab === 'aprovacoes' && <ApprovacoesTab key={approvalTabKey} currentUser={currentUser} config={config} onRefresh={onPoliciesChanged} pendingApprovals={pendingApprovals} />}
             {activeTab === 'seguranca' && <SegurancaTab services={services} policies={policies} config={config} isAdmin={isAdmin} canManageNamespace={canManageNamespace} onRefresh={onPoliciesChanged} />}
+            {activeTab === 'descoberta' && isAdmin && <DescobertaTab flows={ciliumFlows} config={config} streaming={ciliumStreaming} allPolicies={allPolicies} onClear={onClearCiliumFlows} onAddDraft={onAddDraft} onSaveConfig={onSaveConfig} onSwitchTab={(tab) => setActiveTab(tab)} />}
+            {activeTab === 'descoberta' && !isAdmin && <Forbidden />}
             {activeTab === 'config' && isAdmin && <ConfigTab config={config} onSave={onSaveConfig} />}
             {activeTab === 'config' && !isAdmin && <Forbidden />}
           </div>

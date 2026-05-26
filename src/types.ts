@@ -14,7 +14,7 @@ export interface NetworkPolicyInfo {
   dst_service: string
   dst_port: number
   dst_ports: PortSpec[]
-  policy_type: 'allow' | 'allow-egress' | 'allow-namespace' | 'allow-intranamespace' | 'restrict-ingress' | 'restrict-egress' | 'external'
+  policy_type: 'allow' | 'allow-egress' | 'allow-namespace' | 'allow-intranamespace' | 'restrict-ingress' | 'restrict-egress' | 'cidr-ingress' | 'cidr-egress' | 'external'
   managed: boolean
   adopted?: boolean
   policy_types: string[]
@@ -65,6 +65,18 @@ export interface Draft {
   dst_namespace: string
   dst_ports: PortSpec[]
   policy_direction: 'ingress' | 'egress' | 'both'
+  src_cidr?: string
+  dst_cidr?: string
+  cidr_except?: string[]
+}
+
+export interface CidrPolicyRequest {
+  namespace: string
+  service_name?: string
+  cidr: string
+  except?: string[]
+  dst_ports?: PortSpec[]
+  direction: 'ingress' | 'egress'
 }
 
 export interface AppConfig {
@@ -77,6 +89,29 @@ export interface AppConfig {
   auto_default_deny_direction: 'ingress' | 'egress' | 'both'
   autosync_enabled: boolean
   autosync_interval_s: number
+  hubble_discovery_enabled: boolean
+  hubble_flow_retention_days: number
+}
+
+export interface CiliumFlowSummary {
+  id: string
+  src_workload: string
+  src_namespace: string
+  dst_workload: string
+  dst_namespace: string
+  dst_port: number
+  protocol: 'TCP' | 'UDP'
+  verdict: 'FORWARDED' | 'DROPPED' | 'AUDIT'
+  flow_count: number
+  has_policy: boolean
+  first_seen: string
+  last_seen: string
+}
+
+export interface CiliumFlowsResponse {
+  available: boolean
+  streaming: boolean
+  flows: CiliumFlowSummary[]
 }
 
 export interface AutosyncStatus {

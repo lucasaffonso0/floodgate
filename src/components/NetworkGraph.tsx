@@ -21,7 +21,7 @@ import {
   Position,
   applyNodeChanges,
 } from '@xyflow/react'
-import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, ServiceLayout, ApprovalRequest } from '@/types'
+import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, ServiceLayout, ApprovalRequest, CiliumFlowSummary } from '@/types'
 import { deleteNetworkPolicy, restrictService, patchNetworkPolicyPort, isolateNamespace } from '@/api/client'
 
 // ─── Namespace group node ──────────────────────────────────────────────────
@@ -113,14 +113,16 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
     isolatedIn: boolean
     isolatedEg: boolean
     exceptionCount: number
+    virtual?: boolean
   }
   const fullyIsolated = d.isolatedIn && d.isolatedEg
   const partiallyIsolated = d.isolatedIn || d.isolatedEg
   return (
     <div style={{
       width: '100%', height: '100%', borderRadius: 10, boxSizing: 'border-box',
-      border: `2px solid ${selected ? d.borderColor : d.borderColor + '99'}`,
+      border: `2px ${d.virtual ? 'dashed' : 'solid'} ${selected ? d.borderColor : d.borderColor + '99'}`,
       backgroundColor: d.color,
+      opacity: d.virtual ? 0.75 : 1,
       cursor: 'pointer',
       boxShadow: selected
         ? `0 0 0 3px ${d.borderColor}33`
@@ -131,6 +133,9 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
             : 'none',
       transition: 'box-shadow 0.15s',
     }}>
+      <Handle type="target" position={Position.Left}
+        isConnectable={false}
+        style={{ opacity: 0, pointerEvents: 'none', width: 8, height: 8 }} />
       <div
         onMouseEnter={() => setHeaderHovered(true)}
         onMouseLeave={() => setHeaderHovered(false)}
@@ -144,7 +149,10 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
           <path d="M5 9l4-4 4 4M5 15l4 4 4-4M15 9l4-4 4 4M15 15l4 4 4-4" />
         </svg>
         <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.label}</span>
-        <IsolationBadge isolatedIn={d.isolatedIn} isolatedEg={d.isolatedEg} exceptionCount={d.exceptionCount} />
+        {d.virtual && (
+          <span style={{ fontSize: 9, color: '#94a3b8', fontWeight: 400, whiteSpace: 'nowrap', fontStyle: 'italic' }}>descoberto</span>
+        )}
+        {!d.virtual && <IsolationBadge isolatedIn={d.isolatedIn} isolatedEg={d.isolatedEg} exceptionCount={d.exceptionCount} />}
         <button
           onClick={e => { e.stopPropagation(); if (d.canToggleLock) d.onToggleLock() }}
           disabled={!d.canToggleLock}
@@ -167,6 +175,9 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
           {d.locked ? '🔒' : '🔓'}
         </button>
       </div>
+      <Handle type="source" position={Position.Right}
+        isConnectable={false}
+        style={{ opacity: 0, pointerEvents: 'none', width: 8, height: 8 }} />
     </div>
   )
 }
@@ -209,7 +220,29 @@ function ServiceNodeComponent({ data, selected }: NodeProps) {
   )
 }
 
-const nodeTypes: NodeTypes = { namespace: NamespaceGroupNode, service: ServiceNodeComponent }
+function WorkloadNodeComponent({ data }: NodeProps) {
+  const d = data as { label: string }
+  return (
+    <div style={{
+      background: '#f1f5f9', border: '1.5px solid #94a3b8', borderRadius: 8,
+      padding: '6px 10px', fontSize: 11, color: '#475569', fontWeight: 500,
+      display: 'flex', alignItems: 'center', gap: 6, minWidth: 120,
+    }}>
+      <Handle type="target" position={Position.Left}
+        isConnectable={false} style={{ opacity: 0, pointerEvents: 'none', width: 8, height: 8 }} />
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ flexShrink: 0 }}>
+        <rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/>
+      </svg>
+      <span title={d.label} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 130 }}>
+        {d.label}
+      </span>
+      <Handle type="source" position={Position.Right}
+        isConnectable={false} style={{ opacity: 0, pointerEvents: 'none', width: 8, height: 8 }} />
+    </div>
+  )
+}
+
+const nodeTypes: NodeTypes = { namespace: NamespaceGroupNode, service: ServiceNodeComponent, workload: WorkloadNodeComponent }
 
 // ─── Palette ───────────────────────────────────────────────────────────────
 const PALETTE = [
@@ -323,6 +356,13 @@ function computeNamespaceTreeLayout(
   return positions
 }
 
+function normalizeWorkload(workload: string): string {
+  // Remove sufixo de pod gerado por ReplicaSet: -<hash10>-<hash5> ou StatefulSet: -<hash5>
+  return workload
+    .replace(/-[a-z0-9]{5,10}-[a-z0-9]{5}$/, '')
+    .replace(/-[a-z0-9]{5}$/, '')
+}
+
 // ─── Build graph ───────────────────────────────────────────────────────────
 function buildGraph(
   services: ServiceInfo[],
@@ -337,7 +377,17 @@ function buildGraph(
   canManageNamespace: ((namespace: string) => boolean) | undefined,
   layoutMode: 'namespaces' | 'services' | 'both' = 'both',
   globalLocked = false,
+  ciliumFlows: CiliumFlowSummary[] = [],
+  showFlowEdges = false,
+  ignoredNamespaces: string[] = [],
+  visibleNamespaces?: Set<string>,
 ): { nodes: Node[]; edges: BuiltInEdge[] } {
+  const nsVisible = (ns: string) =>
+    !visibleNamespaces || visibleNamespaces.size === 0 || visibleNamespaces.has(ns)
+  const visibleFlows = ciliumFlows.filter(
+    f => nsVisible(f.src_namespace) && nsVisible(f.dst_namespace)
+  )
+
   const nsMap = new Map<string, ServiceInfo[]>()
   for (const svc of services) {
     if (!nsMap.has(svc.namespace)) nsMap.set(svc.namespace, [])
@@ -457,6 +507,138 @@ function buildGraph(
 
   const nodes: Node[] = [...groupNodes, ...serviceNodes]
   const svcSet = new Set(serviceNodes.map(n => n.id))
+  const nsGroupSet = new Set(groupNodes.map(n => n.id))
+  const workloadSet = new Set<string>()
+
+  // Cria nós virtuais para namespaces que aparecem em flows mas não têm K8s Services
+  if (showFlowEdges && visibleFlows.length > 0) {
+    const VIRTUAL_W = NS_PAD * 2 + NODE_W   // 200px — largura mínima legível
+    const WORKLOAD_H = 36
+    const maxY = groupNodes.length > 0
+      ? Math.max(...groupNodes.map(n => n.position.y + ((n.style?.height as number) ?? 0)))
+      : 0
+    let vCol = 0
+    const seen = new Set<string>()
+
+    for (const flow of visibleFlows) {
+      for (const namespace of [flow.src_namespace, flow.dst_namespace]) {
+        const nsId = `ns::${namespace}`
+        if (nsGroupSet.has(nsId) || seen.has(nsId)) continue
+        if (ignoredNamespaces.includes(namespace)) continue
+        seen.add(nsId)
+
+        // Coletar workloads únicos deste namespace sem Service K8s
+        const nsWorkloads = new Set<string>()
+        for (const f of visibleFlows) {
+          if (f.src_namespace === namespace && !svcSet.has(`svc::${namespace}::${f.src_workload}`))
+            nsWorkloads.add(normalizeWorkload(f.src_workload))
+          if (f.dst_namespace === namespace && !svcSet.has(`svc::${namespace}::${f.dst_workload}`))
+            nsWorkloads.add(normalizeWorkload(f.dst_workload))
+        }
+        const workloadList = [...nsWorkloads].sort()
+        const VIRTUAL_H_DYN = NS_HEADER + NS_PAD + workloadList.length * (WORKLOAD_H + 6) + NS_PAD
+
+        const savedPos = nsPositions.get(namespace)
+        const pos = savedPos ?? { x: vCol * (VIRTUAL_W + TREE_COL_GAP), y: maxY + TREE_ROW_GAP }
+        if (!savedPos) nsPositions.set(namespace, pos)
+        if (!nsPaletteIdx.has(namespace)) nsPaletteIdx.set(namespace, autoIdx++ % PALETTE.length)
+
+        nodes.push({
+          id: nsId,
+          type: 'namespace',
+          position: pos,
+          style: { width: VIRTUAL_W, height: VIRTUAL_H_DYN, padding: 0 },
+          data: {
+            label: namespace,
+            color: '#f8fafc',
+            borderColor: '#94a3b8',
+            locked: false,
+            canToggleLock: false,
+            onToggleLock: () => undefined,
+            isolatedIn: false,
+            isolatedEg: false,
+            exceptionCount: 0,
+            virtual: true,
+          },
+          draggable: !globalLocked,
+          zIndex: 0,
+        })
+        nsGroupSet.add(nsId)
+
+        // Nós de workload como filhos do grupo virtual
+        workloadList.forEach((wl, i) => {
+          const wlId = `work::${namespace}::${wl}`
+          workloadSet.add(wlId)
+          nodes.push({
+            id: wlId,
+            type: 'workload',
+            parentId: nsId,
+            extent: 'parent' as const,
+            position: { x: NS_PAD, y: NS_HEADER + NS_PAD + i * (WORKLOAD_H + 6) },
+            style: { width: VIRTUAL_W - NS_PAD * 2 },
+            data: { label: wl },
+            draggable: false,
+            zIndex: 1,
+          })
+        })
+
+        vCol++
+      }
+    }
+  }
+
+  // ── Pré-coleta do flowPairMap (antes de assignCurvatures p/ integrar curvatura) ──
+  const nsSvcNames = new Map<string, string[]>()
+  for (const nodeId of svcSet) {
+    const parts = nodeId.split('::')
+    const ns = parts[1], name = parts[2]
+    if (!nsSvcNames.has(ns)) nsSvcNames.set(ns, [])
+    nsSvcNames.get(ns)!.push(name)
+  }
+  function resolveNodeId(namespace: string, workload: string): string | null {
+    const exact = `svc::${namespace}::${workload}`
+    if (svcSet.has(exact)) return exact
+    const candidates = nsSvcNames.get(namespace) ?? []
+    const fwd = candidates.find(s => workload.startsWith(s + '-') || workload.startsWith(s + '_'))
+    if (fwd) return `svc::${namespace}::${fwd}`
+    const rev = candidates.find(s => s.startsWith(workload + '-') || s.startsWith(workload + '_'))
+    if (rev) return `svc::${namespace}::${rev}`
+    const wlId = `work::${namespace}::${normalizeWorkload(workload)}`
+    if (workloadSet.has(wlId)) return wlId
+    const nsId = `ns::${namespace}`
+    if (nsGroupSet.has(nsId)) return nsId
+    return null
+  }
+  const flowPairMap = new Map<string, { flow: CiliumFlowSummary; srcId: string; dstId: string; ports: Set<number> }>()
+  if (showFlowEdges && visibleFlows.length > 0) {
+    for (const flow of visibleFlows) {
+      const srcId = resolveNodeId(flow.src_namespace, flow.src_workload)
+      const dstId = resolveNodeId(flow.dst_namespace, flow.dst_workload)
+      if (!srcId || !dstId || srcId === dstId) continue
+      const pairKey = `${srcId}→${dstId}::${flow.verdict}`
+      const entry = flowPairMap.get(pairKey)
+      if (entry) {
+        entry.ports.add(flow.dst_port)
+        if (new Date(flow.last_seen) > new Date(entry.flow.last_seen)) entry.flow = flow
+      } else {
+        flowPairMap.set(pairKey, { flow, srcId, dstId, ports: new Set([flow.dst_port]) })
+      }
+    }
+  }
+
+  // ── Conjuntos para lógica UX semântica (Fix 3) ──────────────────────────
+  // Pares cobertos por policies gerenciadas
+  const policyNodePairs = new Set<string>()
+  for (const policy of policies.filter(p => p.managed && p.src_workload)) {
+    const srcId = `svc::${policy.src_namespace}::${policy.src_workload}`
+    const dstId = `svc::${policy.namespace}::${policy.dst_service}`
+    if (svcSet.has(srcId) && svcSet.has(dstId)) policyNodePairs.add(`${srcId}|${dstId}`)
+  }
+  // Pares com tráfego FORWARDED recente (para animar policy edges)
+  const activeFlowPairs = new Set<string>()
+  for (const [, { srcId, dstId, flow }] of flowPairMap) {
+    if (flow.verdict === 'FORWARDED') activeFlowPairs.add(`${srcId}|${dstId}`)
+  }
 
   const rawEdges: Array<{ srcId: string; dstId: string; key: string }> = []
 
@@ -478,6 +660,10 @@ function buildGraph(
     if (!svcSet.has(srcId) || !svcSet.has(dstId)) continue
     rawEdges.push({ srcId, dstId, key: `approval::${apr.id}` })
   }
+  // Flow edges integradas no cálculo de curvatura
+  for (const [pairKey, { srcId, dstId }] of flowPairMap) {
+    rawEdges.push({ srcId, dstId, key: `flow::${pairKey}` })
+  }
 
   const curvatureMap = new Map(
     assignCurvatures(rawEdges).map(({ key, curvature }) => [key, curvature])
@@ -486,19 +672,28 @@ function buildGraph(
   const edges: BuiltInEdge[] = []
 
   for (const policy of policies.filter(p => p.managed && p.src_workload)) {
+    if (!nsVisible(policy.src_namespace) || !nsVisible(policy.namespace)) continue
     const srcId = `svc::${policy.src_namespace}::${policy.src_workload}`
     const dstId = `svc::${policy.namespace}::${policy.dst_service}`
     const id    = `policy::${policy.name}`
     const cur   = curvatureMap.get(id) ?? 0.25
     const isEgress = policy.policy_type === 'allow-egress'
+    // Anima a policy edge quando Hubble confirma tráfego ativo no par
+    const isActive = showFlowEdges && activeFlowPairs.has(`${srcId}|${dstId}`)
+    const color = isEgress ? '#8b5cf6' : '#10b981'
     edges.push({
       id, source: srcId, target: dstId, type: 'default',
+      animated: isActive,
       pathOptions: { curvature: cur },
-      style: { stroke: isEgress ? '#8b5cf6' : '#10b981', strokeWidth: 2.5 },
+      style: {
+        stroke: color,
+        strokeWidth: isActive ? 3 : 2.5,
+        filter: isActive ? `drop-shadow(0 0 4px ${color}99)` : undefined,
+      },
       label: `${isEgress ? 'egress' : 'ingress'} :${policy.dst_port}`,
       labelStyle: { fontSize: 10, fill: isEgress ? '#5b21b6' : '#065f46' },
       labelBgStyle: { fill: 'white', opacity: 0.9 },
-      markerEnd: { type: 'arrowclosed' as const, color: isEgress ? '#8b5cf6' : '#10b981' },
+      markerEnd: { type: 'arrowclosed' as const, color },
       data: { type: 'policy', policy }, zIndex: 20,
     })
   }
@@ -542,6 +737,38 @@ function buildGraph(
       labelBgStyle: { fill: '#fefce8', opacity: 0.97 },
       markerEnd: { type: 'arrowclosed' as const, color: '#eab308' },
       data: { type: 'approval', approval: apr }, zIndex: 20,
+    })
+  }
+
+  // Flow edges: FORWARDED coberto por policy → absorvido na policy animada (sem linha dupla)
+  // Só aparecem: FORWARDED sem policy (azul = sem regra!) e DROPPED (vermelho = bloqueado)
+  for (const [pairKey, { flow, srcId, dstId, ports }] of flowPairMap) {
+    const isDropped = flow.verdict === 'DROPPED'
+    if (!isDropped && policyNodePairs.has(`${srcId}|${dstId}`)) continue
+    const id = `flow::${pairKey}`
+    const cur = curvatureMap.get(id) ?? 0.25
+    const sortedPorts = [...ports].sort((a, b) => a - b)
+    const portLabel = sortedPorts.length <= 3
+      ? sortedPorts.join(',')
+      : `${sortedPorts.slice(0, 3).join(',')}+${sortedPorts.length - 3}`
+    const ageMs = Date.now() - new Date(flow.last_seen).getTime()
+    const opacity = ageMs < 2 * 60 * 1000 ? 0.9 : ageMs < 15 * 60 * 1000 ? 0.65 : 0.35
+    edges.push({
+      id, source: srcId, target: dstId, type: 'default',
+      animated: true,
+      pathOptions: { curvature: cur },
+      style: {
+        stroke: isDropped ? '#dc2626' : '#3b82f6',
+        strokeWidth: isDropped ? 2 : 1.5,
+        strokeDasharray: isDropped ? '4 3' : undefined,
+        opacity,
+      },
+      label: `${isDropped ? '✗' : '↓'} :${portLabel}`,
+      labelStyle: { fontSize: 9, fill: isDropped ? '#991b1b' : '#1e40af' },
+      labelBgStyle: { fill: 'white', opacity: 0.8 },
+      markerEnd: { type: 'arrowclosed' as const, color: isDropped ? '#dc2626' : '#3b82f6' },
+      data: { type: 'flow', flow },
+      zIndex: 15,
     })
   }
 
@@ -862,6 +1089,21 @@ function NamespaceDetailPanel({
     setApplying(true); setResult(null)
     try {
       await deleteNetworkPolicy(p.namespace, p.name)
+      // Se não sobrou nenhuma restrict namespace-wide, limpa companions
+      const otherRestrict = policies.find(op =>
+        op.namespace === namespace &&
+        op.name !== p.name &&
+        (op.policy_type === 'restrict-ingress' || op.policy_type === 'restrict-egress') &&
+        op.dst_service === ''
+      )
+      if (!otherRestrict) {
+        const companions = policies.filter(op =>
+          op.namespace === namespace &&
+          (op.policy_type === 'allow-intranamespace' ||
+           (op.policy_type === 'allow-egress' && op.dst_service === 'internet'))
+        )
+        await Promise.all(companions.map(op => deleteNetworkPolicy(op.namespace, op.name).catch(() => {})))
+      }
       onPolicyChanged()
     } catch {
       setResult('Erro ao remover')
@@ -1084,6 +1326,13 @@ function NamespaceDetailPanel({
                   try {
                     if (nsIngressPolicy) await deleteNetworkPolicy(nsIngressPolicy.namespace, nsIngressPolicy.name)
                     if (nsEgressPolicy)  await deleteNetworkPolicy(nsEgressPolicy.namespace, nsEgressPolicy.name)
+                    // Remove companion policies created by isolateNamespace (intra-namespace allow + internet egress)
+                    const companions = policies.filter(p =>
+                      p.namespace === namespace &&
+                      (p.policy_type === 'allow-intranamespace' ||
+                       (p.policy_type === 'allow-egress' && p.dst_service === 'internet'))
+                    )
+                    for (const c of companions) await deleteNetworkPolicy(c.namespace, c.name)
                     onPolicyChanged()
                   } catch {
                     setResult('Erro ao remover')
@@ -1268,6 +1517,10 @@ interface Props {
   onAddDraft: (d: Omit<Draft, 'id'>) => void
   onRemoveDraft: (id: string) => void
   onPolicyChanged: () => void
+  ciliumFlows?: CiliumFlowSummary[]
+  ciliumStreaming?: boolean
+  ignoredNamespaces?: string[]
+  visibleNamespaces?: Set<string>
 }
 
 // ─── Layout toolbar ────────────────────────────────────────────────────────
@@ -1454,12 +1707,14 @@ export default function NetworkGraph({
   onSaveLayout, onDiscardLayout,
   onAddDraft, onRemoveDraft, onPolicyChanged,
   layoutSaveStatus = 'idle',
+  ciliumFlows, ciliumStreaming, ignoredNamespaces = [], visibleNamespaces,
 }: Props) {
   const [nodes, setNodes] = useNodesState<Node>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<BuiltInEdge>([])
   const [selectedNodeId, setSelectedNodeId] = React.useState<string | null>(null)
   const [selectedNs, setSelectedNs]         = React.useState<string | null>(null)
   const [editingPolicy, setEditingPolicy]   = React.useState<NetworkPolicyInfo | null>(null)
+  const [showFlowEdges, setShowFlowEdges]   = React.useState(true)
 
   const nsPositions  = useRef<Map<string, { x: number; y: number }>>(new Map())
   const nsPaletteIdx = useRef<Map<string, number>>(new Map())
@@ -1475,6 +1730,7 @@ export default function NetworkGraph({
       services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, onToggleNamespaceLock,
       nsPositions.current, nsPaletteIdx.current, canManageNamespace,
       layoutMode, globalLocked,
+      ciliumFlows ?? [], showFlowEdges, ignoredNamespaces, visibleNamespaces,
     )
     setNodes(n)
     setEdges(e)
@@ -1499,7 +1755,7 @@ export default function NetworkGraph({
         .map(node => ({ namespace: node.id.slice(4), x: node.position.x, y: node.position.y }))
       await onAutoLayoutServices([], movedNamespaces)
     }
-  }, [services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, canManageNamespace, onToggleNamespaceLock, onAutoLayoutServices, globalLocked])
+  }, [services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, canManageNamespace, onToggleNamespaceLock, onAutoLayoutServices, globalLocked, ciliumFlows, showFlowEdges, ignoredNamespaces, visibleNamespaces])
 
   useEffect(() => { rebuildRef.current = rebuildGraph }, [rebuildGraph])
   useEffect(() => { rebuildGraph('namespaces').catch(() => {}) }, [rebuildGraph])
@@ -1678,6 +1934,28 @@ export default function NetworkGraph({
             onAutoLayout={(mode) => rebuildGraph(mode, true, true)}
           />
         </Panel>
+        {(ciliumStreaming || (ciliumFlows && ciliumFlows.length > 0)) && (
+          <Panel position="top-left">
+            <button
+              onClick={() => setShowFlowEdges(v => !v)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '5px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600,
+                cursor: 'pointer',
+                background: showFlowEdges ? '#eff6ff' : '#f8fafc',
+                border: `1px solid ${showFlowEdges ? '#93c5fd' : '#cbd5e1'}`,
+                color: showFlowEdges ? '#1d4ed8' : '#64748b',
+              }}
+            >
+              <span style={{
+                width: 7, height: 7, borderRadius: '50%',
+                background: ciliumStreaming ? '#22c55e' : '#94a3b8',
+                flexShrink: 0,
+              }} />
+              Tráfego ao vivo
+            </button>
+          </Panel>
+        )}
       </ReactFlow>
 
       {editingPolicy && (

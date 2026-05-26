@@ -2,13 +2,14 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { FloodgateLogoIcon } from '@/components/FloodgateLogo'
-import { ServiceInfo, NetworkPolicyInfo, Draft, AppConfig, User, ServiceLayout, AutosyncStatus, ApprovalRequest } from '@/types'
+import { ServiceInfo, NetworkPolicyInfo, Draft, AppConfig, User, ServiceLayout, AutosyncStatus, ApprovalRequest, CiliumFlowSummary } from '@/types'
 import {
   getServices, getNetworkPolicies, getAllNetworkPolicies,
-  getConfig, updateConfig, createNetworkPolicy, createEgressNetworkPolicy,
+  getConfig, updateConfig, createNetworkPolicy, createEgressNetworkPolicy, createCidrPolicy,
   createApprovalRequest, getSecurityCoverage, getAutosyncStatus,
   getMe, logout, getServiceLayout, setNamespaceLayoutLock,
   saveAllLayout, setGlobalLayoutLock, getApprovalRequests,
+  getCiliumFlows, clearCiliumFlows,
 } from '@/api/client'
 import NetworkGraph from '@/components/NetworkGraph'
 import RightPanel from '@/components/RightPanel'
@@ -61,6 +62,8 @@ const DEFAULT_CONFIG: AppConfig = {
   auto_default_deny_direction: 'ingress',
   autosync_enabled: false,
   autosync_interval_s: 60,
+  hubble_discovery_enabled: false,
+  hubble_flow_retention_days: 7,
 }
 
 function SaveSpinner({ status }: { status: 'idle' | 'saving' | 'draft' | 'saved' | 'error' }) {
@@ -127,20 +130,25 @@ export default function App() {
   const [showApprovalToast, setShowApprovalToast] = useState(false)
   const [openPasswordModal, setOpenPasswordModal] = useState(false)
   const [requestTab, setRequestTab] = useState<'aprovacoes' | 'drafts' | null>(null)
+  const [ciliumFlows, setCiliumFlows] = useState<CiliumFlowSummary[]>([])
+  const [ciliumStreaming, setCiliumStreaming] = useState(false)
   const currentUserRef = useRef<User | null>(null)
 
   const refresh = useCallback(async () => {
     try {
-      const [svcs, pols, allPols, layoutData, sync, approvals] = await Promise.all([
+      const [svcs, pols, allPols, layoutData, sync, approvals, ciliumData] = await Promise.all([
         getServices(), getNetworkPolicies(), getAllNetworkPolicies(), getServiceLayout(),
         getAutosyncStatus().catch(() => null),
         getApprovalRequests('pending').catch(() => [] as ApprovalRequest[]),
+        getCiliumFlows().catch(() => ({ available: false, streaming: false, flows: [] as CiliumFlowSummary[] })),
       ])
       setAutosyncStatus(sync)
       setServices(svcs)
       setPolicies(pols)
       setAllPolicies(allPols)
       setPendingApprovals(approvals)
+      setCiliumFlows(ciliumData.flows)
+      setCiliumStreaming(ciliumData.streaming)
 
       // Protect in-flight dragged positions from being overwritten by poll
       const dbLayouts = layoutData.layouts.map(l => {
@@ -343,6 +351,12 @@ export default function App() {
     })
   }
 
+  function showAllNamespaces() {
+    const all = new Set(allNamespaces)
+    setVisibleNamespaces(all)
+    saveHiddenToStorage(new Set())
+  }
+
   function addDraft(d: Omit<Draft, 'id'>) {
     setDrafts(prev => {
       const exists = prev.some(x =>
@@ -374,6 +388,19 @@ export default function App() {
       removeDraft(draft.id)
       return
     }
+    if (draft.src_cidr || draft.dst_cidr) {
+      await createCidrPolicy({
+        namespace: draft.dst_namespace,
+        service_name: draft.dst_service || undefined,
+        cidr: (draft.src_cidr ?? draft.dst_cidr)!,
+        except: draft.cidr_except,
+        dst_ports: draft.dst_ports.length > 0 ? draft.dst_ports : undefined,
+        direction: draft.src_cidr ? 'ingress' : 'egress',
+      })
+      removeDraft(draft.id)
+      await refresh()
+      return
+    }
     const req = {
       src_workload: draft.src_workload, src_namespace: draft.src_namespace,
       dst_service: draft.dst_service, dst_namespace: draft.dst_namespace, dst_ports: draft.dst_ports,
@@ -398,6 +425,17 @@ export default function App() {
       return
     }
     await Promise.all(drafts.map(async d => {
+      if (d.src_cidr || d.dst_cidr) {
+        await createCidrPolicy({
+          namespace: d.dst_namespace,
+          service_name: d.dst_service || undefined,
+          cidr: (d.src_cidr ?? d.dst_cidr)!,
+          except: d.cidr_except,
+          dst_ports: d.dst_ports.length > 0 ? d.dst_ports : undefined,
+          direction: d.src_cidr ? 'ingress' : 'egress',
+        })
+        return
+      }
       const req = {
         src_workload: d.src_workload, src_namespace: d.src_namespace,
         dst_service: d.dst_service, dst_namespace: d.dst_namespace, dst_ports: d.dst_ports,
@@ -805,33 +843,68 @@ export default function App() {
           onTabOpened={() => setRequestTab(null)}
           openPasswordModal={openPasswordModal}
           onPasswordModalClosed={() => setOpenPasswordModal(false)}
+          ciliumFlows={ciliumFlows}
+          ciliumStreaming={ciliumStreaming}
+          onClearCiliumFlows={() => clearCiliumFlows().then(() => setCiliumFlows([])).catch(() => {})}
         />
-        <NetworkGraph
-          services={visibleServices}
-          policies={policies}
-          drafts={drafts}
-          pendingApprovals={pendingApprovals}
-          layoutSaveStatus={layoutSaveStatus}
-          serviceLayouts={serviceLayouts}
-          namespaceLocks={namespaceLocks}
-          nsPositionsFromDB={savedNsPositions}
-          layoutResetKey={layoutResetKey}
-          globalLocked={globalLayoutLocked}
-          isViewer={currentUser?.role === 'viewer' || currentUser?.role === 'audit'}
-          isAdmin={currentUser?.role === 'admin'}
-          canManageNamespace={canManageNamespace}
-          onServiceMove={handleServiceMove}
-          onNsMove={handleNsMove}
-          onAutoLayoutServices={handleAutoLayoutServices}
-          onToggleNamespaceLock={handleToggleNamespaceLock}
-          autosave={currentUser?.role === 'admin' ? autosave : false}
-          onToggleAutosave={currentUser?.role === 'admin' ? handleToggleAutosave : undefined}
-          onSaveLayout={currentUser?.role === 'admin' ? handleSaveLayout : undefined}
-          onDiscardLayout={handleDiscardLayout}
-          onAddDraft={addDraft}
-          onRemoveDraft={removeDraft}
-          onPolicyChanged={refresh}
-        />
+        <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
+          {visibleNamespaces.size > 0 && visibleNamespaces.size < allNamespaces.length && (
+            <div style={{
+              position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)',
+              zIndex: 10, display: 'flex', alignItems: 'center', gap: 8,
+              background: '#fffbeb', border: '1px solid #f59e0b', borderRadius: 20,
+              padding: '5px 8px 5px 12px', fontSize: 12, color: '#92400e',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.1)', whiteSpace: 'nowrap',
+              pointerEvents: 'auto',
+            }}>
+              <span>
+                {allNamespaces.length - visibleNamespaces.size === 1
+                  ? '1 namespace oculto — conexões não exibidas'
+                  : `${allNamespaces.length - visibleNamespaces.size} namespaces ocultos — conexões não exibidas`}
+              </span>
+              <button
+                onClick={showAllNamespaces}
+                style={{
+                  background: '#f59e0b', border: 'none', borderRadius: 12,
+                  padding: '3px 10px', fontSize: 11, color: '#fff',
+                  cursor: 'pointer', fontWeight: 600,
+                }}
+              >
+                Exibir todos
+              </button>
+            </div>
+          )}
+          <NetworkGraph
+            services={visibleServices}
+            policies={policies}
+            drafts={drafts}
+            pendingApprovals={pendingApprovals}
+            layoutSaveStatus={layoutSaveStatus}
+            serviceLayouts={serviceLayouts}
+            namespaceLocks={namespaceLocks}
+            nsPositionsFromDB={savedNsPositions}
+            layoutResetKey={layoutResetKey}
+            globalLocked={globalLayoutLocked}
+            isViewer={currentUser?.role === 'viewer' || currentUser?.role === 'audit'}
+            isAdmin={currentUser?.role === 'admin'}
+            canManageNamespace={canManageNamespace}
+            onServiceMove={handleServiceMove}
+            onNsMove={handleNsMove}
+            onAutoLayoutServices={handleAutoLayoutServices}
+            onToggleNamespaceLock={handleToggleNamespaceLock}
+            autosave={currentUser?.role === 'admin' ? autosave : false}
+            onToggleAutosave={currentUser?.role === 'admin' ? handleToggleAutosave : undefined}
+            onSaveLayout={currentUser?.role === 'admin' ? handleSaveLayout : undefined}
+            onDiscardLayout={handleDiscardLayout}
+            onAddDraft={addDraft}
+            onRemoveDraft={removeDraft}
+            onPolicyChanged={refresh}
+            ciliumFlows={ciliumFlows}
+            ciliumStreaming={ciliumStreaming}
+            ignoredNamespaces={config.ignored_namespaces}
+            visibleNamespaces={visibleNamespaces}
+          />
+        </div>
       </div>
     </div>
   )
