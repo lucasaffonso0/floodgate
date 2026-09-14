@@ -179,6 +179,11 @@ function detectPolicyMeta(spec: k8s.V1NetworkPolicySpec): {
   return { policyType: 'allow', srcNamespace: '', targetPort: 0 }
 }
 
+export async function listNamespaceNames(): Promise<Set<string>> {
+  const list = await core.listNamespace()
+  return new Set(list.items.map(ns => ns.metadata!.name!))
+}
+
 export async function listNetworkPolicies(allPolicies = false): Promise<NetworkPolicyInfo[]> {
   const labelSel = allPolicies ? undefined : `managed-by=${MANAGED_BY}`
   const list = await networking.listNetworkPolicyForAllNamespaces(

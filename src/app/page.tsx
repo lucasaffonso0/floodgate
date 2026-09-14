@@ -658,10 +658,17 @@ export default function App() {
 
           {/* Sync status pill — only when autosync has drift data */}
           {autosyncStatus && autosyncStatus.desired_count > 0 && autosyncStatus.drift !== null && (() => {
-            const missing = autosyncStatus.drift?.missing?.length ?? 0
+            const missingList = autosyncStatus.drift?.missing ?? []
+            const missing = missingList.length
+            const nsGone = missingList.filter(p => p.namespace_missing).length
             const inSync = missing === 0
+            const title = inSync
+              ? 'Todas as policies rastreadas estão no cluster'
+              : nsGone > 0
+                ? `${missing} policy(s) ausente(s) — ${nsGone} com namespace inexistente (não podem ser restauradas)`
+                : `${missing} policy(s) ausente(s) no cluster`
             return (
-              <span title={inSync ? 'Todas as policies rastreadas estão no cluster' : `${missing} policy(s) ausente(s) no cluster`} style={{
+              <span title={title} style={{
                 display: 'flex', alignItems: 'center', gap: 5,
                 background: inSync ? '#f0fdf4' : '#fef2f2',
                 color: inSync ? '#059669' : '#dc2626',
