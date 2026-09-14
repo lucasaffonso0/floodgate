@@ -176,6 +176,9 @@ export const getAutosyncStatus = (): Promise<AutosyncStatus> =>
 export const triggerAutosync = (): Promise<AutosyncStatus['last_result']> =>
   api.post('/autosync').then(r => r.data)
 
+export const removeOrphanedManagedPolicy = (namespace: string, name: string): Promise<void> =>
+  api.delete('/autosync', { params: { namespace, name } }).then(() => undefined)
+
 // ── Cilium Auto-Discover ───────────────────────────────────────────────────
 export const getCiliumFlows = (): Promise<CiliumFlowsResponse> =>
   api.get('/cilium/flows').then(r => r.data)

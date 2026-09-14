@@ -1,6 +1,20 @@
 import 'server-only'
 import { getDb } from './db'
-import { listNetworkPolicies, applyPolicyYAML, getPolicyYAML } from './k8s'
+import { listNetworkPolicies, applyPolicyYAML, getPolicyYAML, listNamespaceNames } from './k8s'
+
+// The target namespace itself (not just the policy) is gone — restoring will
+// keep failing until someone recreates it. Kept apart from a transient error
+// so callers can surface it distinctly instead of a generic "sync failed".
+function isNamespaceGoneError(e: unknown): boolean {
+  const err = e as { body?: unknown }
+  try {
+    const body = typeof err.body === 'string' ? JSON.parse(err.body) : err.body
+    const b = body as { reason?: string; details?: { kind?: string } }
+    return b?.reason === 'NotFound' && b?.details?.kind === 'namespaces'
+  } catch {
+    return false
+  }
+}
 
 export function saveManagedPolicy(namespace: string, name: string, policyYaml: string): void {
   getDb().prepare(`
@@ -23,6 +37,7 @@ export interface DriftEntry {
   namespace: string
   name: string
   policy_yaml?: string
+  namespace_missing?: boolean
 }
 
 export interface DriftResult {
@@ -57,11 +72,14 @@ export async function checkDrift(): Promise<DriftResult> {
     return r
   }
 
-  const active = await listNetworkPolicies(false)
+  const [active, namespaces] = await Promise.all([listNetworkPolicies(false), listNamespaceNames()])
   const activeSet = new Set(active.map(p => `${p.namespace}/${p.name}`))
   const missing: DriftEntry[] = desired
     .filter(r => !activeSet.has(`${r.namespace}/${r.name}`))
-    .map(r => ({ namespace: r.namespace, name: r.name, policy_yaml: r.policy_yaml }))
+    .map(r => ({
+      namespace: r.namespace, name: r.name, policy_yaml: r.policy_yaml,
+      namespace_missing: !namespaces.has(r.namespace),
+    }))
 
   const result: DriftResult = { missing, timestamp: new Date().toISOString() }
   g._floodgateDriftResult = result
@@ -119,13 +137,23 @@ export async function runAutosync(): Promise<SyncResult> {
   const activeSet = new Set(active.map(p => `${p.namespace}/${p.name}`))
   const drifted: DriftEntry[] = []
 
+  const unrecoverable: DriftEntry[] = []
+
   for (const row of desired) {
     if (!activeSet.has(`${row.namespace}/${row.name}`)) {
       try {
         await applyPolicyYAML(row.namespace, row.policy_yaml)
         drifted.push({ namespace: row.namespace, name: row.name })
       } catch (e) {
-        console.error(`[autosync] Failed to restore ${row.namespace}/${row.name}:`, e)
+        if (isNamespaceGoneError(e)) {
+          // Namespace itself is gone — kept in managed_policies so it
+          // auto-restores if the namespace comes back, but logged once as a
+          // warning instead of an error dump repeated every cycle.
+          console.warn(`[autosync] Namespace ${row.namespace} does not exist — ${row.name} stays tracked but cannot be restored`)
+          unrecoverable.push({ namespace: row.namespace, name: row.name, namespace_missing: true })
+        } else {
+          console.error(`[autosync] Failed to restore ${row.namespace}/${row.name}:`, e)
+        }
       }
     }
   }
@@ -135,6 +163,6 @@ export async function runAutosync(): Promise<SyncResult> {
     timestamp: new Date().toISOString(),
   }
   g._floodgateSyncResult = r
-  g._floodgateDriftResult = { missing: [], timestamp: r.timestamp }
+  g._floodgateDriftResult = { missing: unrecoverable, timestamp: r.timestamp }
   return r
 }

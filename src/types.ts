@@ -118,7 +118,7 @@ export interface AutosyncStatus {
   enabled: boolean
   interval_s: number
   desired_count: number
-  drift: { missing: Array<{ namespace: string; name: string; policy_yaml?: string }>; timestamp: string } | null
+  drift: { missing: Array<{ namespace: string; name: string; policy_yaml?: string; namespace_missing?: boolean }>; timestamp: string } | null
   last_result: {
     checked: number
     fixed: number

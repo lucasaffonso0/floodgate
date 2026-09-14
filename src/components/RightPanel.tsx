@@ -8,7 +8,7 @@ import {
   getApprovalRequests, voteApprovalRequest, applyApprovalRequest, cancelApprovalRequest, getApprovalRequestYAML,
   getSecurityCoverage, applyDefaultDeny, isolateNamespace,
   getPausedPolicies, pauseAllPolicies, resumeAllPolicies, pausePolicy, resumePolicy,
-  getAutosyncStatus, triggerAutosync, updateUserPassword, listUsers,
+  getAutosyncStatus, triggerAutosync, removeOrphanedManagedPolicy, updateUserPassword, listUsers,
   adoptPolicy, unadoptPolicy, checkHubble, previewDiscoveryPolicyYAML, createCidrPolicy,
 } from '@/api/client'
 
@@ -788,6 +788,8 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   const [adoptType, setAdoptType] = useState('')
   const [adopting, setAdopting] = useState(false)
   const [editingPolicy, setEditingPolicy] = useState<NetworkPolicyInfo | null>(null)
+  const [orphanedManaged, setOrphanedManaged] = useState<Array<{ namespace: string; name: string; policy_yaml?: string }>>([])
+  const [removingOrphan, setRemovingOrphan] = useState<string | null>(null)
 
   function toggleYAML(key: string) { setExpandedYAML(prev => prev === key ? null : key) }
 
@@ -863,7 +865,38 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
     if (isAdmin) setPaused(await getPausedPolicies().catch(() => []))
   }, [isAdmin])
 
+  const loadOrphanedManaged = useCallback(async () => {
+    if (!isAdmin) return
+    const status = await getAutosyncStatus().catch(() => null)
+    setOrphanedManaged((status?.drift?.missing ?? []).filter(m => m.namespace_missing))
+  }, [isAdmin])
+
   useEffect(() => { loadPaused() }, [loadPaused, policies])
+  useEffect(() => { loadOrphanedManaged() }, [loadOrphanedManaged, policies])
+
+  async function handleRemoveOrphanManaged(ns: string, name: string) {
+    if (!confirm(`Remover "${name}" do rastreamento? O namespace "${ns}" não existe mais — esta policy nunca será restaurada.`)) return
+    setRemovingOrphan(`${ns}/${name}`)
+    try {
+      await removeOrphanedManagedPolicy(ns, name)
+      await loadOrphanedManaged()
+    } catch (e: unknown) {
+      alert((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? String(e))
+    } finally {
+      setRemovingOrphan(null)
+    }
+  }
+
+  async function handleRemoveAllOrphanManaged() {
+    if (!confirm(`Remover ${orphanedManaged.length} policy(s) órfã(s) do rastreamento? Os namespaces não existem mais — elas nunca serão restauradas.`)) return
+    setRemovingOrphan('*')
+    try {
+      await Promise.all(orphanedManaged.map(p => removeOrphanedManagedPolicy(p.namespace, p.name).catch(() => {})))
+      await loadOrphanedManaged()
+    } finally {
+      setRemovingOrphan(null)
+    }
+  }
 
   async function handlePause() {
     if (!confirm(`Pausar ${policies.length} policies? Elas serão removidas do cluster mas salvas para restauração.`)) return
@@ -1156,6 +1189,48 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
                       </div>
                     </div>
                   )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        {/* Orphaned managed_policies — tracked for autosync but the namespace was deleted, so they can never be restored */}
+        {orphanedManaged.length > 0 && (
+          <div style={{ borderTop: '2px solid #f1f5f9' }}>
+            <div style={{ padding: '8px 14px', display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#64748b' }}>
+              <span style={{ fontWeight: 600 }}>Órfãs (namespace removido)</span>
+              <span style={{ fontSize: 10, color: '#94a3b8', background: '#f1f5f9', borderRadius: 10, padding: '1px 7px' }}>{orphanedManaged.length}</span>
+              {isAdmin && (
+                <button
+                  style={{ ...btn.base, ...btn.red, padding: '2px 7px', fontSize: 9, marginLeft: 'auto' }}
+                  disabled={removingOrphan === '*'}
+                  onClick={handleRemoveAllOrphanManaged}
+                >
+                  <Icon.Trash /> {removingOrphan === '*' ? 'Removendo…' : 'Remover todas'}
+                </button>
+              )}
+            </div>
+            {orphanedManaged.map(p => {
+              const key = `${p.namespace}/${p.name}`
+              return (
+                <div key={key} style={{ borderBottom: '1px solid #f0f4f8', background: '#fff7ed' }}>
+                  <div style={{ padding: '7px 14px 7px 20px', display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#f97316', flexShrink: 0 }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 11, color: '#7c2d12', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</div>
+                      <div style={{ fontSize: 9, color: '#9a3412' }}>namespace &quot;{p.namespace}&quot; não existe mais no cluster</div>
+                    </div>
+                    {isAdmin && (
+                      <button
+                        style={{ ...btn.base, ...btn.red, padding: '3px 7px', fontSize: 10, flexShrink: 0 }}
+                        disabled={removingOrphan === key || removingOrphan === '*'}
+                        onClick={() => handleRemoveOrphanManaged(p.namespace, p.name)}
+                      >
+                        <Icon.Trash /> {removingOrphan === key ? 'Removendo…' : 'Remover'}
+                      </button>
+                    )}
+                  </div>
                 </div>
               )
             })}
@@ -1908,7 +1983,9 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
               </div>
               {hasDrift && (
                 <div style={{ fontSize: 9.5, color: '#64748b', marginBottom: 4 }}>
-                  {local.autosync_enabled ? 'Será restaurado no próximo ciclo.' : 'Habilite o autosync ou clique em "Forçar sync" para restaurar.'}
+                  {missing.some(p => p.namespace_missing)
+                    ? 'Algumas não podem ser restauradas (veja abaixo). As demais serão restauradas no próximo ciclo.'
+                    : local.autosync_enabled ? 'Será restaurado no próximo ciclo.' : 'Habilite o autosync ou clique em "Forçar sync" para restaurar.'}
                 </div>
               )}
               <button
@@ -1934,6 +2011,11 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
                             </button>
                           )}
                         </div>
+                        {p.namespace_missing && (
+                          <div style={{ fontSize: 9, color: '#b91c1c', marginTop: 3 }}>
+                            ⚠ Namespace <strong>{p.namespace}</strong> não existe mais no cluster — a policy fica rastreada, mas não pode ser restaurada até o namespace voltar a existir.
+                          </div>
+                        )}
                         {expandedPolicy === key && p.policy_yaml && (
                           <div style={{ marginTop: 6 }}>
                             <StaticYAMLViewer yamlStr={p.policy_yaml} />
