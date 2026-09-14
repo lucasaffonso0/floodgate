@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
 import { applyPolicyYAML } from '@/lib/k8s'
 import { getDb } from '@/lib/db'
+import { apiError } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { emit } from '@/lib/sse'
 
@@ -24,7 +25,7 @@ export async function POST(req: NextRequest) {
       await applyPolicyYAML(row.namespace, row.policy_yaml)
       db.prepare('DELETE FROM saved_policies WHERE id = ?').run(row.id)
     } catch (e) {
-      return NextResponse.json({ error: String(e) }, { status: 400 })
+      return apiError(e, 'Falha ao reativar policy', 400)
     }
     logAudit({ user_id: user.sub, username: user.username, action: 'resume_policy', resource_type: 'NetworkPolicy', resource_name: row.name, namespace: row.namespace, details: `policy resumed` })
     emit({ type: 'policy_created' })

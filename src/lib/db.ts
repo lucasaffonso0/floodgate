@@ -17,43 +17,36 @@ function initDb(): DbType {
   fs.chmodSync(DB_PATH, 0o600)
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
+  db.pragma('busy_timeout = 5000')
 
-  // ── Migration: add ns_admin to users.role constraint ──────────────────────
+  // ── Migration: widen users.role CHECK constraint (ns_admin, audit) ────────
+  // Recreates the table with the full current schema and copies only the
+  // columns both versions share — SELECT * would break if the old table has
+  // extra columns, and OR IGNORE would silently drop rows.
   const usersSchema = (db.prepare(
     "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
   ).get() as { sql: string } | undefined)?.sql ?? ''
-  if (usersSchema && !usersSchema.includes('ns_admin')) {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS users_new (
-        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        role TEXT NOT NULL CHECK(role IN ('admin','ns_admin','viewer')) DEFAULT 'viewer',
-        created_at TEXT DEFAULT (datetime('now'))
-      );
-      INSERT OR IGNORE INTO users_new SELECT * FROM users;
-      DROP TABLE IF EXISTS users;
-      ALTER TABLE users_new RENAME TO users;
-    `)
-  }
-
-  // ── Migration: add audit to users.role constraint ──────────────────────────
-  const usersSchema2 = (db.prepare(
-    "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
-  ).get() as { sql: string } | undefined)?.sql ?? ''
-  if (usersSchema2 && !usersSchema2.includes('audit')) {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS users_new (
-        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
-        username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        role TEXT NOT NULL CHECK(role IN ('admin','ns_admin','viewer','audit')) DEFAULT 'viewer',
-        created_at TEXT DEFAULT (datetime('now'))
-      );
-      INSERT OR IGNORE INTO users_new SELECT * FROM users;
-      DROP TABLE IF EXISTS users;
-      ALTER TABLE users_new RENAME TO users;
-    `)
+  if (usersSchema && (!usersSchema.includes('ns_admin') || !usersSchema.includes('audit'))) {
+    const oldCols = (db.prepare('PRAGMA table_info(users)').all() as { name: string }[]).map(c => c.name)
+    const newCols = ['id', 'username', 'password_hash', 'role', 'token_version', 'must_change_password', 'created_at']
+    const copyCols = newCols.filter(c => oldCols.includes(c)).join(', ')
+    db.transaction(() => {
+      db.exec(`
+        DROP TABLE IF EXISTS users_new;
+        CREATE TABLE users_new (
+          id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+          username TEXT UNIQUE NOT NULL,
+          password_hash TEXT NOT NULL,
+          role TEXT NOT NULL CHECK(role IN ('admin','ns_admin','viewer','audit')) DEFAULT 'viewer',
+          token_version INTEGER NOT NULL DEFAULT 1,
+          must_change_password INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT DEFAULT (datetime('now'))
+        );
+        INSERT INTO users_new (${copyCols}) SELECT ${copyCols} FROM users;
+        DROP TABLE users;
+        ALTER TABLE users_new RENAME TO users;
+      `)
+    })()
   }
 
   // ── Migration: add must_change_password column ────────────────────────────
@@ -171,6 +164,10 @@ function initDb(): DbType {
       first_seen   TEXT NOT NULL,
       last_seen    TEXT NOT NULL
     );
+
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+    CREATE INDEX IF NOT EXISTS idx_approval_votes_request_id ON approval_votes(request_id);
+    CREATE INDEX IF NOT EXISTS idx_discovered_flows_flow_count ON discovered_flows(flow_count);
   `)
 
   // ── Seed default admin user ────────────────────────────────────────────────

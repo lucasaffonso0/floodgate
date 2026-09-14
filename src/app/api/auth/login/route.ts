@@ -1,10 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { login, COOKIE } from '@/lib/auth'
 import { logAudit } from '@/lib/audit'
-import { checkRateLimit, clearRateLimit } from '@/lib/ratelimit'
+import { checkRateLimit, checkIpRateLimit, clearRateLimit } from '@/lib/ratelimit'
 
 export async function POST(req: NextRequest) {
   try {
+    const ip = req.headers.get('x-forwarded-for')?.split(',')[0].trim()
+      ?? req.headers.get('x-real-ip')
+      ?? 'unknown'
+    const ipRl = checkIpRateLimit(ip)
+    if (!ipRl.allowed) {
+      const retryAfterS = Math.ceil((ipRl.retryAfterMs ?? 0) / 1000)
+      return NextResponse.json(
+        { detail: 'Muitas tentativas. Tente novamente mais tarde.' },
+        { status: 429, headers: { 'Retry-After': String(retryAfterS) } },
+      )
+    }
+
     const { username, password } = await req.json()
     const rlKey = `login:${(username ?? '').toLowerCase()}`
     const rl = checkRateLimit(rlKey)
@@ -34,6 +46,7 @@ export async function POST(req: NextRequest) {
     })
     return res
   } catch (e) {
-    return NextResponse.json({ detail: String(e) }, { status: 500 })
+    console.error('[floodgate] login error:', e)
+    return NextResponse.json({ detail: 'Erro interno. Tente novamente.' }, { status: 500 })
   }
 }

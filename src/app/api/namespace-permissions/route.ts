@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
 import { getDb } from '@/lib/db'
+import { apiError, parseBody } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import type { NamespacePermission } from '@/types'
 
@@ -21,16 +22,20 @@ export async function POST(req: NextRequest) {
   const user = await getCurrentUser()
   if (!user || user.role !== 'admin') return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
 
-  const { user_id, namespace } = await req.json()
+  const body = await parseBody<{ user_id?: string; namespace?: string }>(req)
+  if (!body) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
+  const { user_id, namespace } = body
   if (!user_id || !namespace) return NextResponse.json({ detail: 'user_id e namespace obrigatórios' }, { status: 400 })
 
   const db = getDb()
+  const target = db.prepare('SELECT id FROM users WHERE id = ?').get(user_id)
+  if (!target) return NextResponse.json({ detail: 'Usuário não encontrado' }, { status: 404 })
   try {
     db.prepare('INSERT OR IGNORE INTO namespace_permissions (user_id, namespace) VALUES (?, ?)').run(user_id, namespace)
     // Upgrade viewer to ns_admin
     db.prepare("UPDATE users SET role='ns_admin' WHERE id=? AND role='viewer'").run(user_id)
   } catch (e) {
-    return NextResponse.json({ detail: String(e) }, { status: 400 })
+    return apiError(e, 'Falha ao conceder permissão', 400)
   }
 
   const row = db.prepare(`

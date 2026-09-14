@@ -1,15 +1,52 @@
 import 'server-only'
 import * as k8s from '@kubernetes/client-node'
 import yaml from 'js-yaml'
+import { createHash } from 'crypto'
+import { UserFacingError } from '@/lib/api-helpers'
 import type { ServiceInfo, NetworkPolicyInfo, CreatePolicyRequest, PortSpec, RestrictPolicyRequest, IsolateNamespaceRequest, CidrPolicyRequest } from '@/types'
 
 const MANAGED_BY = 'floodgate'
+
+// DNS-1123 subdomain-safe policy name. No-op for names that are already valid
+// and ≤63 chars (keeps existing policy names stable); otherwise cleans invalid
+// chars and appends a deterministic hash so two long inputs can't collide by
+// truncation (the 409→replace fallback would silently overwrite the first).
+export function sanitizeK8sName(raw: string): string {
+  const cleaned = raw.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '')
+  if (cleaned === raw && raw.length > 0 && raw.length <= 63) return raw
+  const hash = createHash('sha1').update(raw).digest('hex').slice(0, 6)
+  const base = (cleaned || 'policy').slice(0, 56).replace(/-+$/, '')
+  return `${base}-${hash}`
+}
+
+// Valid K8s label value: alphanumeric start/end, [-A-Za-z0-9_.] middle, ≤63.
+// No-op for valid values (service/namespace names always are).
+function sanitizeLabelValue(raw: string): string {
+  return raw
+    .replace(/[^A-Za-z0-9\-_.]+/g, '-')
+    .slice(0, 63)
+    .replace(/^[^A-Za-z0-9]+/, '')
+    .replace(/[^A-Za-z0-9]+$/, '')
+}
 
 const kc = new k8s.KubeConfig()
 kc.loadFromDefault()
 
 const core = kc.makeApiClient(k8s.CoreV1Api)
 const networking = kc.makeApiClient(k8s.NetworkingV1Api)
+
+// @kubernetes/client-node models V1NetworkPolicyIngressRule.from as `_from`
+// (its JS identifier), since it's serialized back to `from` only through the
+// client's own ObjectSerializer — never when we hand the raw object to
+// yaml.dump directly. Rename before dumping any spec read from the API.
+function yamlSafeSpec(spec: k8s.V1NetworkPolicySpec | undefined): unknown {
+  if (!spec) return spec
+  const ingress = spec.ingress?.map(rule => {
+    const { _from, ...rest } = rule as typeof rule & { _from?: unknown }
+    return _from !== undefined ? { ...rest, from: _from } : rest
+  })
+  return ingress ? { ...spec, ingress } : spec
+}
 
 function getK8sStatus(e: unknown): number | undefined {
   const err = e as { statusCode?: number; body?: unknown; message?: string }
@@ -57,17 +94,54 @@ export async function listServices(): Promise<ServiceInfo[]> {
   return result
 }
 
+function selectorOf(svc: k8s.V1Service, name: string, namespace: string): Record<string, string> {
+  const sel = svc.spec?.selector
+  // An empty matchLabels selects ALL pods in the namespace — a policy meant
+  // for one service would silently become namespace-wide.
+  if (!sel || Object.keys(sel).length === 0) {
+    throw new UserFacingError(`Service ${namespace}/${name} não possui selector — não é possível criar política restrita a ele`)
+  }
+  return sel as Record<string, string>
+}
+
 async function getServiceSelector(name: string, namespace: string): Promise<Record<string, string>> {
   const svc = await core.readNamespacedService({ name, namespace })
-  return (svc.spec?.selector ?? {}) as Record<string, string>
+  return selectorOf(svc, name, namespace)
+}
+
+// Resolves the pod port for a given service port. Named targetPorts (e.g.
+// "http") are resolved by inspecting containerPorts of the service's pods —
+// falling back to the service port would allow the wrong port in the policy.
+async function resolveTargetPortFromService(svc: k8s.V1Service, namespace: string, servicePort: number): Promise<number> {
+  const svcName = svc.metadata?.name ?? ''
+  const portDef = (svc.spec?.ports ?? []).find(p => p.port === servicePort)
+  if (!portDef || portDef.targetPort === undefined) return servicePort
+  const target = portDef.targetPort as unknown
+  if (typeof target === 'number') return target
+  const numeric = parseInt(target as string, 10)
+  if (!isNaN(numeric)) return numeric
+
+  const selector = svc.spec?.selector ?? {}
+  const labelSelector = Object.entries(selector).map(([k, v]) => `${k}=${v}`).join(',')
+  if (labelSelector) {
+    try {
+      const pods = await core.listNamespacedPod({ namespace, labelSelector })
+      for (const pod of pods.items) {
+        for (const c of pod.spec?.containers ?? []) {
+          const cp = (c.ports ?? []).find(cp => cp.name === target)
+          if (cp) return cp.containerPort
+        }
+      }
+    } catch (e) {
+      throw new UserFacingError(`Não foi possível listar pods para resolver a targetPort nomeada "${target}" de ${namespace}/${svcName} — verifique se o RBAC inclui "pods" (${getK8sStatus(e) ?? 'erro'})`, 500)
+    }
+  }
+  throw new UserFacingError(`Não foi possível resolver a targetPort nomeada "${target}" do service ${namespace}/${svcName} — nenhum pod com containerPort correspondente`)
 }
 
 async function resolveTargetPort(svcName: string, namespace: string, servicePort: number): Promise<number> {
   const svc = await core.readNamespacedService({ name: svcName, namespace })
-  for (const p of svc.spec?.ports ?? []) {
-    if (p.port === servicePort) return parseIntOrString(p.targetPort, servicePort)
-  }
-  return servicePort
+  return resolveTargetPortFromService(svc, namespace, servicePort)
 }
 
 // ── Auto-detect policy metadata from raw K8s spec ──────────────────────────
@@ -166,20 +240,21 @@ export async function listNetworkPolicies(allPolicies = false): Promise<NetworkP
 }
 
 export async function createNetworkPolicy(req: CreatePolicyRequest): Promise<NetworkPolicyInfo> {
-  const [srcSelector, dstSelector] = await Promise.all([
+  const [srcSelector, dstSvc] = await Promise.all([
     getServiceSelector(req.src_workload, req.src_namespace),
-    getServiceSelector(req.dst_service, req.dst_namespace),
+    core.readNamespacedService({ name: req.dst_service, namespace: req.dst_namespace }),
   ])
+  const dstSelector = selectorOf(dstSvc, req.dst_service, req.dst_namespace)
 
   const resolvedPorts = await Promise.all(
     req.dst_ports.map(async ps => ({
-      port: await resolveTargetPort(req.dst_service, req.dst_namespace, ps.port),
+      port: await resolveTargetPortFromService(dstSvc, req.dst_namespace, ps.port),
       protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP',
     }))
   )
 
   const firstPort = req.dst_ports[0]?.port ?? 0
-  const policyName = `floodgate-allow-${req.src_workload}-${req.src_namespace}-to-${req.dst_service}`.slice(0, 63)
+  const policyName = sanitizeK8sName(`floodgate-allow-${req.src_workload}-${req.src_namespace}-to-${req.dst_service}`)
 
   const body: k8s.V1NetworkPolicy = {
     metadata: {
@@ -188,9 +263,9 @@ export async function createNetworkPolicy(req: CreatePolicyRequest): Promise<Net
       labels: {
         'managed-by': MANAGED_BY,
         'floodgate-policy-type': 'allow',
-        'source-workload': req.src_workload.slice(0, 63),
-        'source-namespace': req.src_namespace.slice(0, 63),
-        'target-service': req.dst_service.slice(0, 63),
+        'source-workload': sanitizeLabelValue(req.src_workload),
+        'source-namespace': sanitizeLabelValue(req.src_namespace),
+        'target-service': sanitizeLabelValue(req.dst_service),
         'target-port': String(firstPort),
       },
     },
@@ -235,20 +310,21 @@ export async function createNetworkPolicy(req: CreatePolicyRequest): Promise<Net
 }
 
 export async function createEgressNetworkPolicy(req: CreatePolicyRequest): Promise<NetworkPolicyInfo> {
-  const [srcSelector, dstSelector] = await Promise.all([
+  const [srcSelector, dstSvc] = await Promise.all([
     getServiceSelector(req.src_workload, req.src_namespace),
-    getServiceSelector(req.dst_service, req.dst_namespace),
+    core.readNamespacedService({ name: req.dst_service, namespace: req.dst_namespace }),
   ])
+  const dstSelector = selectorOf(dstSvc, req.dst_service, req.dst_namespace)
 
   const resolvedPorts = await Promise.all(
     req.dst_ports.map(async ps => ({
-      port: await resolveTargetPort(req.dst_service, req.dst_namespace, ps.port),
+      port: await resolveTargetPortFromService(dstSvc, req.dst_namespace, ps.port),
       protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP',
     }))
   )
   const firstPort = req.dst_ports[0]?.port ?? 0
 
-  const policyName = `floodgate-egress-${req.src_workload}-to-${req.dst_service}`.slice(0, 63)
+  const policyName = sanitizeK8sName(`floodgate-egress-${req.src_workload}-to-${req.dst_service}`)
 
   const body: k8s.V1NetworkPolicy = {
     metadata: {
@@ -257,9 +333,9 @@ export async function createEgressNetworkPolicy(req: CreatePolicyRequest): Promi
       labels: {
         'managed-by': MANAGED_BY,
         'floodgate-policy-type': 'allow-egress',
-        'source-workload': req.src_workload.slice(0, 63),
-        'source-namespace': req.src_namespace.slice(0, 63),
-        'target-service': req.dst_service.slice(0, 63),
+        'source-workload': sanitizeLabelValue(req.src_workload),
+        'source-namespace': sanitizeLabelValue(req.src_namespace),
+        'target-service': sanitizeLabelValue(req.dst_service),
         'target-port': String(firstPort),
       },
     },
@@ -309,7 +385,7 @@ export async function createEgressNetworkPolicy(req: CreatePolicyRequest): Promi
 export async function createRestrictPolicy(req: RestrictPolicyRequest): Promise<NetworkPolicyInfo> {
   const svcSelector = await getServiceSelector(req.service_name, req.namespace)
   const policyType = `restrict-${req.direction}` as 'restrict-ingress' | 'restrict-egress'
-  const policyName = `floodgate-restrict-${req.direction}-${req.service_name}`.slice(0, 63)
+  const policyName = sanitizeK8sName(`floodgate-restrict-${req.direction}-${req.service_name}`)
 
   const spec: k8s.V1NetworkPolicySpec = {
     podSelector: { matchLabels: svcSelector },
@@ -325,7 +401,7 @@ export async function createRestrictPolicy(req: RestrictPolicyRequest): Promise<
       labels: {
         'managed-by': MANAGED_BY,
         'floodgate-policy-type': policyType,
-        'target-service': req.service_name.slice(0, 63),
+        'target-service': sanitizeLabelValue(req.service_name),
         'source-workload': '',
         'source-namespace': '',
         'target-port': '0',
@@ -334,7 +410,13 @@ export async function createRestrictPolicy(req: RestrictPolicyRequest): Promise<
     spec,
   }
 
-  const created = await networking.createNamespacedNetworkPolicy({ namespace: req.namespace, body })
+  let created: k8s.V1NetworkPolicy
+  try {
+    created = await networking.createNamespacedNetworkPolicy({ namespace: req.namespace, body })
+  } catch (e: unknown) {
+    if (getK8sStatus(e) !== 409) throw e
+    created = await networking.replaceNamespacedNetworkPolicy({ name: policyName, namespace: req.namespace, body })
+  }
   return {
     name: created.metadata!.name!,
     namespace: created.metadata!.namespace!,
@@ -364,22 +446,26 @@ export async function patchNetworkPolicyPort(
   const labels = existing.metadata?.labels ?? {}
   const policyType = labels['floodgate-policy-type'] ?? 'allow'
 
-  await deleteNetworkPolicy(namespace, name)
+  if (policyType !== 'allow' && policyType !== 'allow-egress') {
+    throw new UserFacingError(`Tipo de policy "${policyType}" não suporta edição de porta`)
+  }
 
+  // Create/replace the new policy FIRST, then remove the old one only if the
+  // name changed (adopted policies) — deleting first would leave the workload
+  // unprotected if the recreate fails midway.
+  let result: NetworkPolicyInfo
   if (policyType === 'allow') {
-    return createNetworkPolicy({
+    result = await createNetworkPolicy({
       src_workload: labels['source-workload'] ?? '',
       src_namespace: labels['source-namespace'] ?? '',
       dst_service: labels['target-service'] ?? '',
       dst_namespace: namespace,
       dst_ports: newPorts,
     })
-  }
-
-  if (policyType === 'allow-egress') {
+  } else {
     const dstNs = (existing.spec?.egress?.[0]?.to?.[0]?.namespaceSelector
       ?.matchLabels?.['kubernetes.io/metadata.name'] as string | undefined) ?? ''
-    return createEgressNetworkPolicy({
+    result = await createEgressNetworkPolicy({
       src_workload: labels['source-workload'] ?? '',
       src_namespace: namespace,
       dst_service: labels['target-service'] ?? '',
@@ -388,7 +474,8 @@ export async function patchNetworkPolicyPort(
     })
   }
 
-  throw new Error(`Tipo de policy "${policyType}" não suporta edição de porta`)
+  if (result.name !== name) await deleteNetworkPolicy(namespace, name)
+  return result
 }
 
 export async function createNamespaceIngressPolicy(req: {
@@ -402,7 +489,7 @@ export async function createNamespaceIngressPolicy(req: {
     resolveTargetPort(req.dst_service, req.dst_namespace, req.dst_port),
   ])
 
-  const policyName = `floodgate-allow-ns-${req.src_namespace}-to-${req.dst_service}`.slice(0, 63)
+  const policyName = sanitizeK8sName(`floodgate-allow-ns-${req.src_namespace}-to-${req.dst_service}`)
 
   const body: k8s.V1NetworkPolicy = {
     metadata: {
@@ -412,8 +499,8 @@ export async function createNamespaceIngressPolicy(req: {
         'managed-by': MANAGED_BY,
         'floodgate-policy-type': 'allow-namespace',
         'source-workload': '',
-        'source-namespace': req.src_namespace.slice(0, 63),
-        'target-service': req.dst_service.slice(0, 63),
+        'source-namespace': sanitizeLabelValue(req.src_namespace),
+        'target-service': sanitizeLabelValue(req.dst_service),
         'target-port': String(req.dst_port),
       },
     },
@@ -453,7 +540,7 @@ export async function isolateNamespace(req: IsolateNamespaceRequest): Promise<{ 
   // One namespace-wide deny policy per direction (podSelector: {} = all pods).
   // Existing per-service allow rules continue to work via K8s OR semantics.
   for (const dir of directions) {
-    const policyName = `floodgate-ns-deny-${dir}-${req.namespace}`.slice(0, 63)
+    const policyName = sanitizeK8sName(`floodgate-ns-deny-${dir}-${req.namespace}`)
     const policyType = `restrict-${dir}` as 'restrict-ingress' | 'restrict-egress'
     const spec: k8s.V1NetworkPolicySpec = {
       podSelector: {},
@@ -480,12 +567,16 @@ export async function isolateNamespace(req: IsolateNamespaceRequest): Promise<{ 
     try {
       await networking.createNamespacedNetworkPolicy({ namespace: req.namespace, body })
       created++
-    } catch { skipped++ }
+    } catch (e) {
+      // Only "already exists" counts as skipped — RBAC/validation failures must surface
+      if (getK8sStatus(e) === 409) skipped++
+      else throw e
+    }
   }
 
   if (req.allow_intra_namespace) {
     for (const dir of directions) {
-      const policyName = `floodgate-intra-${dir}-${req.namespace}`.slice(0, 63)
+      const policyName = sanitizeK8sName(`floodgate-intra-${dir}-${req.namespace}`)
       const spec: k8s.V1NetworkPolicySpec = {
         podSelector: {},
         policyTypes: [dir === 'ingress' ? 'Ingress' : 'Egress'],
@@ -516,12 +607,15 @@ export async function isolateNamespace(req: IsolateNamespaceRequest): Promise<{ 
       try {
         await networking.createNamespacedNetworkPolicy({ namespace: req.namespace, body })
         created++
-      } catch { skipped++ }
+      } catch (e) {
+        if (getK8sStatus(e) === 409) skipped++
+        else throw e
+      }
     }
   }
 
   if (req.allow_egress_internet && (req.direction === 'egress' || req.direction === 'both')) {
-    const policyName = `floodgate-egress-internet-${req.namespace}`.slice(0, 63)
+    const policyName = sanitizeK8sName(`floodgate-egress-internet-${req.namespace}`)
     const body: k8s.V1NetworkPolicy = {
       metadata: {
         name: policyName,
@@ -559,7 +653,11 @@ export async function isolateNamespace(req: IsolateNamespaceRequest): Promise<{ 
     try {
       await networking.createNamespacedNetworkPolicy({ namespace: req.namespace, body })
       created++
-    } catch { skipped++ }
+    } catch (e) {
+      // Only "already exists" counts as skipped — RBAC/validation failures must surface
+      if (getK8sStatus(e) === 409) skipped++
+      else throw e
+    }
   }
 
   return { created, skipped }
@@ -577,7 +675,7 @@ export async function createCidrPolicy(req: CidrPolicyRequest): Promise<NetworkP
   const ipBlock: k8s.V1IPBlock = { cidr, ...(except?.length ? { except } : {}) }
   const policyType = `cidr-${direction}` as 'cidr-ingress' | 'cidr-egress'
   const safeCidr = cidr.replace(/\//g, '-').replace(/\./g, '-')
-  const policyName = `floodgate-cidr-${direction}-${safeCidr}${service_name ? `-${service_name}` : ''}`.slice(0, 63)
+  const policyName = sanitizeK8sName(`floodgate-cidr-${direction}-${safeCidr}${service_name ? `-${service_name}` : ''}`)
 
   const spec: k8s.V1NetworkPolicySpec = {
     podSelector: { matchLabels: podSelector },
@@ -618,28 +716,38 @@ export async function previewPolicyYAML(
   req: CreatePolicyRequest,
   direction: 'ingress' | 'egress' | 'both',
 ): Promise<string> {
-  const [srcSelector, dstSelector] = await Promise.all([
+  const [srcSelector, dstSvc] = await Promise.all([
     getServiceSelector(req.src_workload, req.src_namespace),
-    getServiceSelector(req.dst_service, req.dst_namespace),
+    core.readNamespacedService({ name: req.dst_service, namespace: req.dst_namespace }),
   ])
+  const dstSelector = selectorOf(dstSvc, req.dst_service, req.dst_namespace)
 
   const resolvedPorts = await Promise.all(
     req.dst_ports.map(async ps => ({
-      port: await resolveTargetPort(req.dst_service, req.dst_namespace, ps.port),
+      port: await resolveTargetPortFromService(dstSvc, req.dst_namespace, ps.port),
       protocol: ps.protocol,
     }))
   )
 
   const docs: object[] = []
+  const firstPort = req.dst_ports[0]?.port ?? 0
+  const commonLabels = {
+    'source-workload': sanitizeLabelValue(req.src_workload),
+    'source-namespace': sanitizeLabelValue(req.src_namespace),
+    'target-service': sanitizeLabelValue(req.dst_service),
+    'target-port': String(firstPort),
+  }
 
+  // Must mirror createNetworkPolicy / createEgressNetworkPolicy exactly —
+  // this YAML is what reviewers approve.
   if (direction === 'ingress' || direction === 'both') {
     docs.push({
       apiVersion: 'networking.k8s.io/v1',
       kind: 'NetworkPolicy',
       metadata: {
-        name: `floodgate-allow-${req.src_workload}-${req.src_namespace}-to-${req.dst_service}`.slice(0, 63),
+        name: sanitizeK8sName(`floodgate-allow-${req.src_workload}-${req.src_namespace}-to-${req.dst_service}`),
         namespace: req.dst_namespace,
-        labels: { 'managed-by': 'floodgate', 'floodgate-policy-type': 'allow' },
+        labels: { 'managed-by': 'floodgate', 'floodgate-policy-type': 'allow', ...commonLabels },
       },
       spec: {
         podSelector: { matchLabels: dstSelector },
@@ -654,14 +762,18 @@ export async function previewPolicyYAML(
       apiVersion: 'networking.k8s.io/v1',
       kind: 'NetworkPolicy',
       metadata: {
-        name: `floodgate-egress-${req.src_workload}-to-${req.dst_service}`.slice(0, 63),
+        name: sanitizeK8sName(`floodgate-egress-${req.src_workload}-to-${req.dst_service}`),
         namespace: req.src_namespace,
-        labels: { 'managed-by': 'floodgate', 'floodgate-policy-type': 'allow-egress' },
+        labels: { 'managed-by': 'floodgate', 'floodgate-policy-type': 'allow-egress', ...commonLabels },
       },
       spec: {
         podSelector: { matchLabels: srcSelector },
         policyTypes: ['Egress'],
-        egress: [{ to: [{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': req.dst_namespace } }, podSelector: { matchLabels: dstSelector } }], ports: resolvedPorts }],
+        egress: [
+          { to: [{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': req.dst_namespace } }, podSelector: { matchLabels: dstSelector } }], ports: resolvedPorts },
+          // DNS rule included by createEgressNetworkPolicy
+          { ports: [{ protocol: 'UDP', port: 53 }, { protocol: 'TCP', port: 53 }] },
+        ],
       },
     })
   }
@@ -679,7 +791,7 @@ export async function getPolicyYAML(namespace: string, name: string): Promise<st
       namespace: policy.metadata?.namespace,
       labels: policy.metadata?.labels,
     },
-    spec: policy.spec,
+    spec: yamlSafeSpec(policy.spec),
   }
   return yaml.dump(clean, { lineWidth: -1 })
 }
@@ -731,7 +843,7 @@ export async function adoptPolicy(
       namespace: updated.metadata?.namespace,
       labels:    updated.metadata?.labels,
     },
-    spec: updated.spec,
+    spec: yamlSafeSpec(updated.spec),
   }
   return yaml.dump(clean, { lineWidth: -1 })
 }
@@ -765,7 +877,7 @@ export async function exportManagedPoliciesYAML(): Promise<string> {
         namespace: p.metadata?.namespace,
         labels: p.metadata?.labels,
       },
-      spec: p.spec,
+      spec: yamlSafeSpec(p.spec),
     }
     return yaml.dump(clean, { lineWidth: -1 })
   }).join('---\n')

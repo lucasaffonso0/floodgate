@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
 import { listServices, listNetworkPolicies, createRestrictPolicy, getPolicyYAML } from '@/lib/k8s'
 import { getConfig, isNamespaceWatched } from '@/lib/config'
+import { parseBody } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { getDb } from '@/lib/db'
 import { saveManagedPolicy } from '@/lib/autosync'
@@ -36,7 +37,9 @@ export async function GET() {
     let applied_ingress = has_deny_ingress
     let applied_egress = has_deny_egress
 
-    if (cfg.auto_default_deny_enabled && !isPaused) {
+    // Auto-apply only runs for admins: GET must stay side-effect-free for
+    // read-only roles (viewer/audit), which the middleware does not block.
+    if (cfg.auto_default_deny_enabled && !isPaused && user.role === 'admin') {
       const dir = cfg.auto_default_deny_direction
       if ((dir === 'ingress' || dir === 'both') && !has_deny_ingress) {
         const noDenyServices = svcs.filter(name => !nsPolicies.some(p => p.dst_service === name && p.policy_type === 'restrict-ingress'))
@@ -72,26 +75,32 @@ export async function POST(req: NextRequest) {
   const user = await getCurrentUser()
   if (!user || user.role !== 'admin') return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
 
-  const { namespace, direction } = await req.json()
+  const body = await parseBody<{ namespace?: string; direction?: string }>(req)
+  if (!body) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
+  const { namespace, direction } = body
   if (!namespace || !direction) return NextResponse.json({ detail: 'namespace e direction são obrigatórios' }, { status: 400 })
   if (!['ingress', 'egress', 'both'].includes(direction)) return NextResponse.json({ detail: "direction deve ser 'ingress', 'egress' ou 'both'" }, { status: 400 })
   const services = await listServices()
   const nsSvcs = services.filter(s => s.namespace === namespace)
 
   const results = []
+  const errors: string[] = []
+  const dirs = direction === 'both' ? ['ingress', 'egress'] as const : [direction as 'ingress' | 'egress']
   for (const svc of nsSvcs) {
-    if (direction === 'ingress' || direction === 'both') {
-      const p = await createRestrictPolicy({ service_name: svc.name, namespace, direction: 'ingress' })
-      results.push(p)
-      logAudit({ user_id: user.sub, username: user.username, action: 'apply_default_deny_ingress', resource_type: 'NetworkPolicy', resource_name: svc.name, namespace })
-      getPolicyYAML(p.namespace, p.name).then(y => saveManagedPolicy(p.namespace, p.name, y)).catch(() => {})
+    for (const dir of dirs) {
+      try {
+        const p = await createRestrictPolicy({ service_name: svc.name, namespace, direction: dir })
+        results.push(p)
+        logAudit({ user_id: user.sub, username: user.username, action: `apply_default_deny_${dir}`, resource_type: 'NetworkPolicy', resource_name: svc.name, namespace })
+        getPolicyYAML(p.namespace, p.name).then(y => saveManagedPolicy(p.namespace, p.name, y)).catch(() => {})
+      } catch (e) {
+        console.error(`[floodgate] default-deny ${dir} falhou para ${namespace}/${svc.name}:`, e)
+        errors.push(`${svc.name} (${dir})`)
+      }
     }
-    if (direction === 'egress' || direction === 'both') {
-      const p = await createRestrictPolicy({ service_name: svc.name, namespace, direction: 'egress' })
-      results.push(p)
-      logAudit({ user_id: user.sub, username: user.username, action: 'apply_default_deny_egress', resource_type: 'NetworkPolicy', resource_name: svc.name, namespace })
-      getPolicyYAML(p.namespace, p.name).then(y => saveManagedPolicy(p.namespace, p.name, y)).catch(() => {})
-    }
+  }
+  if (errors.length > 0) {
+    return NextResponse.json({ detail: `Falha ao aplicar default-deny em: ${errors.join(', ')}` }, { status: 500 })
   }
   return NextResponse.json(results, { status: 201 })
 }

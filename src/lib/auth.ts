@@ -85,6 +85,7 @@ export async function getCurrentUser(): Promise<JWTPayload & { allowed_namespace
 
 export async function canManageNamespace(userId: string, role: string, namespace: string): Promise<boolean> {
   if (role === 'admin') return true
+  if (role === 'audit') return false
   const perm = getDb()
     .prepare('SELECT id FROM namespace_permissions WHERE user_id = ? AND namespace = ?')
     .get(userId, namespace)

@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
 import { getDb } from '@/lib/db'
+import { apiError, parseBody } from '@/lib/api-helpers'
+import { logAudit } from '@/lib/audit'
 import bcrypt from 'bcryptjs'
 
 export async function GET() {
@@ -16,19 +18,22 @@ export async function POST(req: NextRequest) {
   if (me?.role !== 'admin') return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
 
   try {
-    const { username, password, role } = await req.json()
+    const body = await parseBody<{ username?: string; password?: string; role?: string }>(req)
+    if (!body) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
+    const { username, password, role } = body
     if (!username || !password) return NextResponse.json({ detail: 'username e password obrigatórios' }, { status: 400 })
     if (typeof password !== 'string' || password.length < 10) return NextResponse.json({ detail: 'Senha deve ter no mínimo 10 caracteres' }, { status: 400 })
-    if (!['admin', 'viewer', 'audit'].includes(role)) return NextResponse.json({ detail: 'role deve ser admin, viewer ou audit' }, { status: 400 })
+    if (!role || !['admin', 'viewer', 'audit'].includes(role)) return NextResponse.json({ detail: 'role deve ser admin, viewer ou audit' }, { status: 400 })
 
     const db = getDb()
     const hash = bcrypt.hashSync(password, 10)
     db.prepare('INSERT INTO users (username, password_hash, role, must_change_password) VALUES (?, ?, ?, 1)').run(username, hash, role)
     const user = db.prepare("SELECT id, username, role, must_change_password, created_at FROM users WHERE username = ?").get(username)
+    logAudit({ user_id: me.sub, username: me.username, action: 'create_user', resource_type: 'User', resource_name: username, details: `role=${role}` })
     return NextResponse.json(user, { status: 201 })
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e)
+    const msg = e instanceof Error ? e.message : ''
     if (msg.includes('UNIQUE')) return NextResponse.json({ detail: 'Username já existe' }, { status: 409 })
-    return NextResponse.json({ detail: msg }, { status: 500 })
+    return apiError(e, 'Falha ao criar usuário')
   }
 }

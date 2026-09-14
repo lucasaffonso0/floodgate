@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
 import { listNetworkPolicies, getPolicyYAML, deleteNetworkPolicy } from '@/lib/k8s'
 import { getDb } from '@/lib/db'
+import { apiError } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { emit } from '@/lib/sse'
 
@@ -29,7 +30,7 @@ export async function POST(req: NextRequest) {
       insert.run(body.name, body.namespace, yamlStr)
       await deleteNetworkPolicy(body.namespace, body.name)
     } catch (e) {
-      return NextResponse.json({ error: String(e) }, { status: 400 })
+      return apiError(e, 'Falha ao pausar policy', 400)
     }
     logAudit({ user_id: user.sub, username: user.username, action: 'pause_policy', resource_type: 'NetworkPolicy', resource_name: body.name, namespace: body.namespace, details: `policy paused` })
     emit({ type: 'policy_deleted' })
