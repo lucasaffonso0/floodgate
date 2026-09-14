@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser, canManageNamespace } from '@/lib/auth'
 import { createNamespaceIngressPolicy, getPolicyYAML } from '@/lib/k8s'
+import { isNamespaceWatched } from '@/lib/config'
+import { apiError, parseBody } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { saveManagedPolicy } from '@/lib/autosync'
 import { emit } from '@/lib/sse'
@@ -10,12 +12,16 @@ export async function POST(req: NextRequest) {
     const user = await getCurrentUser()
     if (!user) return NextResponse.json({ detail: 'Unauthorized' }, { status: 401 })
 
-    const body = await req.json()
+    const body = await parseBody<{ src_namespace?: string; dst_service?: string; dst_namespace?: string; dst_port?: number }>(req)
+    if (!body) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
     const { src_namespace, dst_service, dst_namespace, dst_port } = body
     if (!src_namespace || !dst_service || !dst_namespace || !dst_port) {
       return NextResponse.json({ detail: 'Campos obrigatórios: src_namespace, dst_service, dst_namespace, dst_port' }, { status: 400 })
     }
 
+    if (!isNamespaceWatched(dst_namespace)) {
+      return NextResponse.json({ detail: 'Namespace fora do escopo gerenciado pelo floodgate' }, { status: 400 })
+    }
     if (!(await canManageNamespace(user.sub, user.role, dst_namespace))) {
       return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
     }
@@ -31,6 +37,6 @@ export async function POST(req: NextRequest) {
     emit({ type: 'policy_created' })
     return NextResponse.json(result, { status: 201 })
   } catch (e) {
-    return NextResponse.json({ detail: String(e) }, { status: 500 })
+    return apiError(e, 'Falha ao criar policy de namespace')
   }
 }

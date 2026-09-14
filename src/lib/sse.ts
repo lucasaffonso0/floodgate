@@ -1,7 +1,7 @@
 import 'server-only'
 
 export type SSEEvent =
-  | { type: 'approval_created';   id: string; created_by: string; allowed_approvers: Array<{ id: string; username: string }> }
+  | { type: 'approval_created';   id: string; created_by: string; allowed_approver_ids: string[] }
   | { type: 'approval_applied';   id: string }
   | { type: 'approval_voted';     id: string }
   | { type: 'approval_rejected';  id: string }
@@ -14,10 +14,26 @@ export type SSEEvent =
 
 type Writer = (chunk: string) => void
 
-const g = global as typeof global & { _sseWriters?: Set<Writer> }
+const g = global as typeof global & { _sseWriters?: Set<Writer>; _sseHeartbeat?: ReturnType<typeof setInterval> }
 if (!g._sseWriters) g._sseWriters = new Set()
 
-export function addWriter(w: Writer)    { g._sseWriters!.add(w) }
+// Heartbeat prunes writers whose connections died silently (proxy drops
+// without cancel()) — otherwise, during quiet periods with no events, dead
+// writers accumulate until the connection cap rejects new clients.
+const HEARTBEAT_MS = 30_000
+function ensureHeartbeat() {
+  if (g._sseHeartbeat) return
+  g._sseHeartbeat = setInterval(() => {
+    const writers = g._sseWriters!
+    if (writers.size === 0) return
+    for (const w of writers) {
+      try { w(': ping\n\n') } catch { writers.delete(w) }
+    }
+  }, HEARTBEAT_MS)
+  g._sseHeartbeat.unref?.()
+}
+
+export function addWriter(w: Writer)    { ensureHeartbeat(); g._sseWriters!.add(w) }
 export function removeWriter(w: Writer) { g._sseWriters!.delete(w) }
 export function writerCount()           { return g._sseWriters!.size }
 

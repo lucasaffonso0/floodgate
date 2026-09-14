@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser, canManageNamespace } from '@/lib/auth'
 import { getDb } from '@/lib/db'
+import { parseBody } from '@/lib/api-helpers'
 import { listServices } from '@/lib/k8s'
 
 export async function GET() {
@@ -52,7 +53,9 @@ export async function POST(req: NextRequest) {
   const user = await getCurrentUser()
   if (!user) return NextResponse.json({ detail: 'Unauthorized' }, { status: 401 })
 
-  const { namespace, service_name, x, y } = await req.json()
+  const postBody = await parseBody<{ namespace?: string; service_name?: string; x?: number; y?: number }>(req)
+  if (!postBody) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
+  const { namespace, service_name, x, y } = postBody
   if (!namespace || !service_name || typeof x !== 'number' || typeof y !== 'number') {
     return NextResponse.json({ detail: 'Campos obrigatórios: namespace, service_name, x, y' }, { status: 400 })
   }
@@ -97,7 +100,8 @@ export async function PATCH(req: NextRequest) {
   if (!user) return NextResponse.json({ detail: 'Unauthorized' }, { status: 401 })
   if (user.role === 'viewer' || user.role === 'audit') return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
 
-  const body = await req.json()
+  const body = await parseBody<Record<string, unknown>>(req)
+  if (!body) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
   const { scope } = body
   const db = getDb()
 
@@ -146,7 +150,7 @@ export async function PATCH(req: NextRequest) {
     return NextResponse.json({ ok: true, locked })
   }
 
-  const { namespace, locked } = body
+  const { namespace, locked } = body as { namespace?: string; locked?: boolean }
   if (typeof locked !== 'boolean') return NextResponse.json({ detail: 'locked deve ser boolean' }, { status: 400 })
 
   if (scope === 'all') {
@@ -160,10 +164,12 @@ export async function PATCH(req: NextRequest) {
       DO UPDATE SET locked=excluded.locked, updated_by=excluded.updated_by, updated_at=datetime('now')
     `)
     const updateSvc = db.prepare('UPDATE service_layouts SET locked = ?, updated_by = ?, updated_at = datetime(\'now\') WHERE namespace = ?')
-    for (const ns of namespaces) {
-      upsertLock.run(ns, locked ? 1 : 0, user.sub)
-      updateSvc.run(locked ? 1 : 0, user.sub, ns)
-    }
+    db.transaction(() => {
+      for (const ns of namespaces) {
+        upsertLock.run(ns, locked ? 1 : 0, user.sub)
+        updateSvc.run(locked ? 1 : 0, user.sub, ns)
+      }
+    })()
     return NextResponse.json({ updated: true, scope: 'all', locked })
   }
 

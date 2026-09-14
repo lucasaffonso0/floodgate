@@ -311,10 +311,10 @@ export default function App() {
           if (event.type === 'approval_created') {
             const user = currentUserRef.current
             if (!user || event.created_by === user.id) return
-            const approvers: Array<{ id: string }> = event.allowed_approvers ?? []
+            const approverIds: string[] = event.allowed_approver_ids ?? []
             const canApprove = user.role === 'admin'
-              || (approvers.length === 0 && user.role === 'ns_admin')
-              || approvers.some((a) => a.id === user.id)
+              || (approverIds.length === 0 && user.role === 'ns_admin')
+              || approverIds.includes(user.id)
             if (!canApprove) return
             setShowApprovalToast(true)
             if ('Notification' in window && Notification.permission === 'granted') {

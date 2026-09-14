@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser, canManageNamespace } from '@/lib/auth'
 import { getDb } from '@/lib/db'
+import { parseBody } from '@/lib/api-helpers'
 import { getConfig } from '@/lib/config'
 import { logAudit } from '@/lib/audit'
 import { emit } from '@/lib/sse'
@@ -81,7 +82,9 @@ export async function POST(req: NextRequest) {
   const cfg = getConfig()
   if (!cfg.approval_enabled) return NextResponse.json({ detail: 'Approval workflow desativado' }, { status: 400 })
 
-  const { allowed_approvers = [], ...draft } = await req.json()
+  const parsed = await parseBody(req)
+  if (!parsed) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
+  const { allowed_approvers = [], ...draft } = parsed as Record<string, never> & { allowed_approvers?: Array<{ id: string; username: string }> }
 
   if (!draft.dst_namespace || !draft.src_namespace || !draft.dst_service) {
     return NextResponse.json({ detail: 'dst_namespace, src_namespace e dst_service são obrigatórios' }, { status: 400 })
@@ -89,6 +92,12 @@ export async function POST(req: NextRequest) {
 
   if (!(await canManageNamespace(user.sub, user.role, draft.dst_namespace))) {
     return NextResponse.json({ detail: 'Sem permissão para criar drafts neste namespace' }, { status: 403 })
+  }
+  // Egress/both drafts create the policy in src_namespace (see createEgressNetworkPolicy),
+  // so the creator must be able to manage that namespace too
+  if ((draft.policy_direction === 'egress' || draft.policy_direction === 'both') &&
+      !(await canManageNamespace(user.sub, user.role, draft.src_namespace))) {
+    return NextResponse.json({ detail: 'Sem permissão no namespace de origem (política egress é criada lá)' }, { status: 403 })
   }
 
   const db = getDb()
@@ -102,6 +111,6 @@ export async function POST(req: NextRequest) {
 
   const row = db.prepare('SELECT * FROM approval_requests WHERE rowid = ?').get(result.lastInsertRowid) as Record<string, unknown>
   logAudit({ user_id: user.sub, username: user.username, action: 'create_approval_request', resource_type: 'ApprovalRequest', resource_name: row.id as string })
-  emit({ type: 'approval_created', id: row.id as string, created_by: user.sub, allowed_approvers: effectiveApprovers })
+  emit({ type: 'approval_created', id: row.id as string, created_by: user.sub, allowed_approver_ids: effectiveApprovers.map(a => a.id) })
   return NextResponse.json(buildRequest(row), { status: 201 })
 }

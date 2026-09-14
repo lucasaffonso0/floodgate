@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
 import { getConfig } from '@/lib/config'
 import { runAutosync, checkDrift, getLastSyncResult, getManagedPolicyCount } from '@/lib/autosync'
+import { apiError } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 
 export async function GET() {
@@ -18,7 +19,7 @@ export async function GET() {
       last_result: getLastSyncResult(),
     })
   } catch (e) {
-    return NextResponse.json({ detail: String(e) }, { status: 500 })
+    return apiError(e, 'Falha ao consultar status do autosync')
   }
 }
 
@@ -41,6 +42,6 @@ export async function POST() {
 
     return NextResponse.json(result)
   } catch (e) {
-    return NextResponse.json({ detail: String(e) }, { status: 500 })
+    return apiError(e, 'Falha ao executar autosync')
   }
 }

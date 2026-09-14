@@ -196,7 +196,8 @@ rbac:
   # Rules granted to the ServiceAccount
   rules:
     - apiGroups: [""]
-      resources: ["services", "namespaces", "endpoints"]
+      # pods: needed to resolve named targetPorts (containerPort lookup)
+      resources: ["services", "namespaces", "endpoints", "pods"]
       verbs: ["get", "list", "watch"]
     - apiGroups: ["networking.k8s.io"]
       resources: ["networkpolicies"]

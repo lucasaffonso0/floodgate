@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
 import { exportManagedPoliciesYAML } from '@/lib/k8s'
+import { apiError } from '@/lib/api-helpers'
 
 export async function GET() {
   const user = await getCurrentUser()
@@ -17,6 +18,6 @@ export async function GET() {
       },
     })
   } catch (e) {
-    return NextResponse.json({ detail: String(e) }, { status: 500 })
+    return apiError(e, 'Falha ao exportar policies')
   }
 }

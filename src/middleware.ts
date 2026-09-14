@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { jwtVerify } from 'jose'
 
+if (process.env.NODE_ENV === 'production' &&
+    (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'floodgate-secret-change-me')) {
+  throw new Error('[floodgate] JWT_SECRET não definido ou usando valor padrão inseguro.')
+}
 const SECRET = new TextEncoder().encode(process.env.JWT_SECRET ?? 'floodgate-secret-change-me')
 const COOKIE = 'floodgate-token'
 const PUBLIC = ['/login', '/api/auth/login', '/api/auth/logout', '/api/health']

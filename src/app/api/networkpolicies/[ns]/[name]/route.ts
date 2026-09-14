@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { deleteNetworkPolicy, patchNetworkPolicyPort, getPolicyYAML } from '@/lib/k8s'
 import { getCurrentUser, canManageNamespace } from '@/lib/auth'
+import { apiError, parseBody } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { removeManagedPolicy, saveManagedPolicy } from '@/lib/autosync'
 import { emit } from '@/lib/sse'
@@ -10,10 +11,12 @@ type Params = { params: Promise<{ ns: string; name: string }> }
 export async function GET(_req: NextRequest, { params }: Params) {
   try {
     const { ns, name } = await params
+    const user = await getCurrentUser()
+    if (!user) return NextResponse.json({ detail: 'Unauthorized' }, { status: 401 })
     const yamlStr = await getPolicyYAML(ns, name)
     return new NextResponse(yamlStr, { headers: { 'Content-Type': 'text/yaml' } })
   } catch (e) {
-    return NextResponse.json({ detail: String(e) }, { status: 500 })
+    return apiError(e, 'Falha ao carregar YAML da policy')
   }
 }
 
@@ -31,7 +34,7 @@ export async function DELETE(_req: NextRequest, { params }: Params) {
     emit({ type: 'policy_deleted' })
     return new NextResponse(null, { status: 204 })
   } catch (e) {
-    return NextResponse.json({ detail: String(e) }, { status: 500 })
+    return apiError(e, 'Falha ao deletar policy')
   }
 }
 
@@ -43,7 +46,8 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     if (!(await canManageNamespace(user.sub, user.role, ns))) {
       return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
     }
-    const body = await req.json()
+    const body = await parseBody<{ dst_ports?: Array<{ port: number; protocol: 'TCP' | 'UDP' | 'SCTP' }>; dst_port?: number }>(req)
+    if (!body) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
     const dst_ports: Array<{ port: number; protocol: 'TCP' | 'UDP' | 'SCTP' }> =
       body.dst_ports ?? (body.dst_port ? [{ port: body.dst_port, protocol: 'TCP' as const }] : [])
     if (dst_ports.length === 0) {
@@ -58,6 +62,6 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     emit({ type: 'policy_created' })
     return NextResponse.json(updated)
   } catch (e) {
-    return NextResponse.json({ detail: String(e) }, { status: 500 })
+    return apiError(e, 'Falha ao atualizar portas da policy')
   }
 }

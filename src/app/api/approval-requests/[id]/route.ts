@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser, canManageNamespace } from '@/lib/auth'
 import { getDb } from '@/lib/db'
+import { parseBody } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { emit } from '@/lib/sse'
 import { createNetworkPolicy, createEgressNetworkPolicy, createCidrPolicy, previewPolicyYAML } from '@/lib/k8s'
@@ -104,12 +105,21 @@ export async function GET(httpReq: NextRequest, { params }: Params) {
       )
       return new NextResponse(yamlStr, { headers: { 'Content-Type': 'text/plain' } })
     } catch (e) {
-      return NextResponse.json({ detail: String(e) }, { status: 500 })
+      console.error('[floodgate] preview YAML failed:', e)
+      return NextResponse.json({ detail: 'Falha ao gerar preview do YAML' }, { status: 500 })
     }
   }
 
   const req = getRequest(id)
   if (!req) return NextResponse.json({ detail: 'Not found' }, { status: 404 })
+
+  if (user.role === 'viewer') {
+    const approvers: Array<{ id: string }> = req.allowed_approvers
+    if (approvers.length > 0 && !approvers.some(a => a.id === user.sub)) {
+      return NextResponse.json({ detail: 'Not found' }, { status: 404 })
+    }
+  }
+
   return NextResponse.json(req)
 }
 
@@ -135,23 +145,32 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   // audit role can never mutate
   if (user.role === 'audit') return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
 
-  const { action, comment, decision } = await req.json()
+  const patchBody = await parseBody<{ action?: string; comment?: string; decision?: string }>(req)
+  if (!patchBody) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
+  const { action, comment, decision } = patchBody
 
   if (action === 'vote') {
-    // Viewers can vote if explicitly listed as an approver (checked below)
+    const row = getDb().prepare('SELECT created_by, status, allowed_approvers FROM approval_requests WHERE id = ?').get(id) as { created_by: string; status: string; allowed_approvers?: string } | undefined
+    if (!row) return NextResponse.json({ detail: 'Not found' }, { status: 404 })
+    const allowedApprovers: Array<{ id: string; username: string }> = JSON.parse(row.allowed_approvers ?? '[]')
+
+    if (user.sub === row.created_by) {
+      // Block self-approval only when there are other eligible approvers.
+      // If the creator is the only approver (e.g. single-admin setup), allow voting to avoid deadlock.
+      const otherApprovers = allowedApprovers.filter(a => a.id !== user.sub)
+      if (allowedApprovers.length === 0 || otherApprovers.length > 0) {
+        return NextResponse.json({ detail: 'O criador do pedido não pode votar nele' }, { status: 403 })
+      }
+    }
+
+    // Viewers can vote only if explicitly listed as an approver
     if (user.role === 'viewer') {
-      const row = getDb().prepare('SELECT allowed_approvers FROM approval_requests WHERE id = ?').get(id) as { allowed_approvers?: string } | undefined
-      if (!row) return NextResponse.json({ detail: 'Not found' }, { status: 404 })
-      const approvers: Array<{ id: string }> = JSON.parse(row.allowed_approvers ?? '[]')
-      if (approvers.length === 0 || !approvers.some(a => a.id === user.sub)) {
+      if (allowedApprovers.length === 0 || !allowedApprovers.some(a => a.id === user.sub)) {
         return NextResponse.json({ detail: 'Viewers só podem votar quando explicitamente listados como aprovadores' }, { status: 403 })
       }
     }
-    if (!['approve', 'reject'].includes(decision)) return NextResponse.json({ detail: 'decision inválido' }, { status: 400 })
-    const row = getDb().prepare('SELECT status, allowed_approvers FROM approval_requests WHERE id = ?').get(id) as { status: string; allowed_approvers?: string } | undefined
-    if (!row) return NextResponse.json({ detail: 'Not found' }, { status: 404 })
+    if (!decision || !['approve', 'reject'].includes(decision)) return NextResponse.json({ detail: 'decision inválido' }, { status: 400 })
     if (row.status !== 'pending') return NextResponse.json({ detail: 'Request não está pendente' }, { status: 400 })
-    const allowedApprovers: Array<{ id: string; username: string }> = JSON.parse(row.allowed_approvers ?? '[]')
     if (user.role !== 'admin' && allowedApprovers.length > 0 && !allowedApprovers.some(a => a.id === user.sub)) {
       return NextResponse.json({ detail: 'Você não está na lista de aprovadores deste request' }, { status: 403 })
     }
@@ -162,7 +181,8 @@ export async function PATCH(req: NextRequest, { params }: Params) {
         ON CONFLICT(request_id, user_id) DO UPDATE SET decision=excluded.decision, comment=excluded.comment, created_at=datetime('now')
       `).run(id, user.sub, user.username, decision, comment ?? '')
     } catch (e) {
-      return NextResponse.json({ detail: String(e) }, { status: 400 })
+      console.error('[floodgate] vote insert failed:', e)
+      return NextResponse.json({ detail: 'Não foi possível registrar o voto' }, { status: 400 })
     }
 
     // Auto-reject if anyone rejects
@@ -180,17 +200,25 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     const updated = getRequest(id)!
     let autoApplyError: string | null = null
     if (updated.approve_count >= updated.approvals_required && updated.reject_count === 0) {
-      const draft = normalizeDraft(updated.draft_data as Draft & { dst_port?: number })
-      try {
-        await applyDraftPolicy(draft)
-        getDb().prepare("UPDATE approval_requests SET status='applied', applied_at=datetime('now') WHERE id=?").run(id)
-        logAudit({ user_id: user.sub, username: user.username, action: 'auto_apply_approval_request', resource_type: 'ApprovalRequest', resource_name: id, namespace: draft.dst_namespace })
-        emit({ type: 'approval_applied', id })
-        emit({ type: 'policy_created' })
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e)
-        console.error('[floodgate] auto-apply failed:', msg)
-        autoApplyError = msg
+      // Atomic claim: only one concurrent voter transitions pending→applied.
+      // Two votes reaching quorum simultaneously would otherwise both apply the policy.
+      const claim = getDb().prepare("UPDATE approval_requests SET status='applied', applied_at=datetime('now') WHERE id=? AND status='pending'").run(id)
+      if (claim.changes === 1) {
+        const draft = normalizeDraft(updated.draft_data as Draft & { dst_port?: number })
+        try {
+          await applyDraftPolicy(draft)
+          logAudit({ user_id: user.sub, username: user.username, action: 'auto_apply_approval_request', resource_type: 'ApprovalRequest', resource_name: id, namespace: draft.dst_namespace })
+          emit({ type: 'approval_applied', id })
+          emit({ type: 'policy_created' })
+        } catch (e: unknown) {
+          // Release the claim so the request can be applied again
+          getDb().prepare("UPDATE approval_requests SET status='pending', applied_at=NULL WHERE id=?").run(id)
+          const msg = e instanceof Error ? e.message : String(e)
+          console.error('[floodgate] auto-apply failed:', msg)
+          autoApplyError = msg
+          emit({ type: 'approval_voted', id })
+        }
+      } else {
         emit({ type: 'approval_voted', id })
       }
     } else {
@@ -214,9 +242,16 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     const canManage = await canManageNamespace(user.sub, user.role, draft.dst_namespace)
     if (!canManage) return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
 
-    await applyDraftPolicy(draft)
-
-    getDb().prepare("UPDATE approval_requests SET status='applied', applied_at=datetime('now') WHERE id=?").run(id)
+    // Atomic claim (see auto-apply above): prevents two concurrent applies
+    const claim = getDb().prepare("UPDATE approval_requests SET status='applied', applied_at=datetime('now') WHERE id=? AND status='pending'").run(id)
+    if (claim.changes !== 1) return NextResponse.json({ detail: 'Request não está pendente' }, { status: 400 })
+    try {
+      await applyDraftPolicy(draft)
+    } catch (e) {
+      getDb().prepare("UPDATE approval_requests SET status='pending', applied_at=NULL WHERE id=?").run(id)
+      console.error('[floodgate] apply failed:', e)
+      return NextResponse.json({ detail: 'Falha ao aplicar a política' }, { status: 500 })
+    }
     logAudit({ user_id: user.sub, username: user.username, action: 'apply_approval_request', resource_type: 'ApprovalRequest', resource_name: id, namespace: draft.dst_namespace })
     emit({ type: 'approval_applied', id })
     emit({ type: 'policy_created' })
