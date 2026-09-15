@@ -10,6 +10,7 @@ import {
   useNodesState,
   useEdgesState,
   useReactFlow,
+  getViewportForBounds,
   type Connection,
   type Node,
   type Edge,
@@ -21,6 +22,7 @@ import {
   Position,
   applyNodeChanges,
 } from '@xyflow/react'
+import { toPng } from 'html-to-image'
 import dagre from '@dagrejs/dagre'
 import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, ServiceLayout, ApprovalRequest, CiliumFlowSummary } from '@/types'
 import { deleteNetworkPolicy, restrictService, patchNetworkPolicyPort, isolateNamespace } from '@/api/client'
@@ -1743,9 +1745,47 @@ function LayoutToolbar({
   onToggleAutosave?: () => void
   onAutoLayout: (mode: 'namespaces' | 'services' | 'both') => void
 }) {
-  const { fitView } = useReactFlow()
+  // getNodesBounds from the hook (not the top-level export) is needed here:
+  // service nodes are positioned relative to their namespace parent node, and
+  // only the hook version resolves that via the internal nodeLookup to give
+  // correct absolute bounds.
+  const { fitView, getNodes, getNodesBounds } = useReactFlow()
   const [layoutMode, setLayoutMode] = React.useState<'namespaces' | 'services' | 'both'>('both')
   const [tick, setTick] = React.useState(0)
+  const [capturing, setCapturing] = React.useState(false)
+
+  const handleScreenshot = useCallback(async () => {
+    const nodes = getNodes()
+    if (nodes.length === 0 || capturing) return
+    setCapturing(true)
+    try {
+      const viewportEl = document.querySelector<HTMLElement>('.react-flow__viewport')
+      if (!viewportEl) return
+      const bounds = getNodesBounds(nodes)
+      const SCALE = 2 // high-resolution multiplier
+      const imageWidth  = Math.max(1, Math.round(bounds.width  * SCALE))
+      const imageHeight = Math.max(1, Math.round(bounds.height * SCALE))
+      const viewport = getViewportForBounds(bounds, imageWidth, imageHeight, 0.1, 4, 0.08)
+      const dataUrl = await toPng(viewportEl, {
+        backgroundColor: '#f8fafc',
+        width: imageWidth,
+        height: imageHeight,
+        style: {
+          width: `${imageWidth}px`,
+          height: `${imageHeight}px`,
+          transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})`,
+        },
+      })
+      const a = document.createElement('a')
+      a.href = dataUrl
+      a.download = `floodgate-grafo-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`
+      a.click()
+    } catch {
+      // captura falhou silenciosamente (ex: imagem grande demais) — usuário pode tentar de novo
+    } finally {
+      setCapturing(false)
+    }
+  }, [getNodes, getNodesBounds, capturing])
   useEffect(() => {
     if (layoutSaveStatus !== 'saving') return
     const id = setInterval(() => setTick(t => t + 1), 120)
@@ -1900,6 +1940,28 @@ function LayoutToolbar({
           Organizar
         </button>
       </div>
+      <div style={divStyle} />
+
+      {/* ── Screenshot ── */}
+      <button
+        onClick={handleScreenshot}
+        disabled={capturing}
+        title="Baixar screenshot do grafo inteiro em alta resolução"
+        style={{
+          height: 36, padding: '0 10px', border: 'none', background: 'none',
+          fontSize: 11, fontWeight: 600, color: capturing ? '#94a3b8' : '#475569',
+          cursor: capturing ? 'default' : 'pointer',
+          display: 'flex', alignItems: 'center', gap: 5, transition: 'background 0.12s',
+        }}
+        onMouseEnter={e => { if (!capturing) e.currentTarget.style.background = '#f1f5f9' }}
+        onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+      >
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+          <circle cx="12" cy="13" r="4"/>
+        </svg>
+        {capturing ? 'Capturando…' : 'Screenshot'}
+      </button>
     </div>
   )
 }

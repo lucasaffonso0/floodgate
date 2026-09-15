@@ -18,6 +18,7 @@
     "axios": "^1.7.9",
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "^12.9.0",
+    "html-to-image": "^1.11.13",
     "jose": "^6.2.3",
     "js-yaml": "^4.1.1",
     "next": "^15.3.2",
