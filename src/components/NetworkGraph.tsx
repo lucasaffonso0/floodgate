@@ -2076,11 +2076,11 @@ export default function NetworkGraph({
     })
   }, [])
 
-  const handleNodeDragStart = useCallback((_: React.MouseEvent, node: Node) => {
+  const handleNodeDragStart = useCallback((_: React.MouseEvent | MouseEvent | TouchEvent, node: Node) => {
     dragStartPos.current.set(node.id, { x: node.position.x, y: node.position.y })
   }, [])
 
-  const handleNodeDragStop = useCallback((_: React.MouseEvent, node: Node) => {
+  const handleNodeDragStop = useCallback((_: React.MouseEvent | MouseEvent | TouchEvent, node: Node) => {
     const start = dragStartPos.current.get(node.id)
     if (!start) return
 
