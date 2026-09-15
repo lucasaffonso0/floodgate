@@ -24,6 +24,7 @@ import {
 import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, ServiceLayout, ApprovalRequest, CiliumFlowSummary } from '@/types'
 import { deleteNetworkPolicy, restrictService, patchNetworkPolicyPort, isolateNamespace } from '@/api/client'
 import { explainAccess, type ExplainResult } from '@/lib/explainAccess'
+import { normalizeWorkload } from '@/lib/flowMatch'
 
 // ─── Namespace group node ──────────────────────────────────────────────────
 const ShieldIcon = ({ color }: { color: string }) => (
@@ -355,13 +356,6 @@ function computeNamespaceTreeLayout(
     x += colW + TREE_COL_GAP
   }
   return positions
-}
-
-function normalizeWorkload(workload: string): string {
-  // Remove sufixo de pod gerado por ReplicaSet: -<hash10>-<hash5> ou StatefulSet: -<hash5>
-  return workload
-    .replace(/-[a-z0-9]{5,10}-[a-z0-9]{5}$/, '')
-    .replace(/-[a-z0-9]{5}$/, '')
 }
 
 // ─── Build graph ───────────────────────────────────────────────────────────

@@ -11,6 +11,7 @@ import {
   getAutosyncStatus, triggerAutosync, removeOrphanedManagedPolicy, updateUserPassword, listUsers,
   adoptPolicy, unadoptPolicy, checkHubble, previewDiscoveryPolicyYAML, createCidrPolicy,
 } from '@/api/client'
+import { normalizeWorkload } from '@/lib/flowMatch'
 
 // ─── YAML generator (rascunhos) ────────────────────────────────────────────
 function generateYAML(draft: Draft, services: ServiceInfo[]): string {
@@ -2094,14 +2095,6 @@ function Forbidden() {
 
 // ─── DescobertaTab ───────────────────────────────────────────────────────────
 const DISC_FILTER_KEY = 'floodgate-disc-filters'
-
-// Strips the ReplicaSet/StatefulSet pod suffix (-<hash10>-<hash5> or -<hash5>)
-// so a raw pod name matches the clean workload name stored on policy labels.
-function normalizeWorkload(workload: string): string {
-  return workload
-    .replace(/-[a-z0-9]{5,10}-[a-z0-9]{5}$/, '')
-    .replace(/-[a-z0-9]{5}$/, '')
-}
 
 function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDraft, onSaveConfig, onSwitchTab }: {
   flows: CiliumFlowSummary[]
