@@ -117,9 +117,11 @@ export default function App() {
   const [layoutMeta, setLayoutMeta] = useState<{ saved_by: string; saved_at: string } | null>(null)
   const [layoutResetKey, setLayoutResetKey] = useState(0)
   const [layoutSaveStatus, setLayoutSaveStatus] = useState<'idle' | 'saving' | 'draft' | 'saved' | 'error'>('idle')
-  const [autosave, setAutosave] = useState<boolean>(() => {
-    try { return localStorage.getItem(LS_AUTOSAVE_KEY) !== 'false' } catch { return true }
-  })
+  // Default must match the server render (no localStorage access during the
+  // initial render) — reading it happens in the mount effect below, otherwise
+  // the server-rendered HTML and the client's first render disagree and React
+  // throws a hydration mismatch (#418) whenever a user has saved 'false'.
+  const [autosave, setAutosave] = useState<boolean>(true)
   const autosaveRef = useRef(autosave)
   const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const draftTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -229,6 +231,13 @@ export default function App() {
       setLayoutSaveStatus('error')
       setTimeout(() => setLayoutSaveStatus(s => s === 'error' ? 'idle' : s), 4000)
     }
+  }, [])
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(LS_AUTOSAVE_KEY)
+      if (saved === 'false') setAutosave(false)
+    } catch {}
   }, [])
 
   useEffect(() => { autosaveRef.current = autosave && currentUser?.role === 'admin' }, [autosave, currentUser])

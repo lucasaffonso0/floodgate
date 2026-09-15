@@ -2525,14 +2525,25 @@ export default function RightPanel({
   ciliumFlows = [], ciliumStreaming = false,
   onClearCiliumFlows,
 }: Props) {
-  const [activeTab, setActiveTab] = useState<Tab | null>(() => {
-    try { return (localStorage.getItem('floodgate-active-tab') as Tab) || 'namespaces' } catch { return 'namespaces' }
-  })
+  // Defaults here must match what the server renders (no localStorage access
+  // during the initial render) — reading it happens in the mount effect
+  // below, otherwise the server-rendered HTML and the client's first render
+  // disagree and React throws a hydration mismatch (#418) whenever a user
+  // has a non-default value saved.
+  const [activeTab, setActiveTab] = useState<Tab | null>('namespaces')
   const [approvalTabKey, setApprovalTabKey] = useState(0)
-  const [showLabels, setShowLabels] = useState<boolean>(() => {
-    try { return localStorage.getItem('floodgate-nav-labels') === 'true' } catch { return false }
-  })
+  const [showLabels, setShowLabels] = useState<boolean>(false)
   const [showPwModal, setShowPwModal] = useState(false)
+
+  React.useEffect(() => {
+    try {
+      const savedTab = localStorage.getItem('floodgate-active-tab') as Tab | null
+      if (savedTab) setActiveTab(savedTab)
+    } catch {}
+    try {
+      setShowLabels(localStorage.getItem('floodgate-nav-labels') === 'true')
+    } catch {}
+  }, [])
 
   // Allow parent (header avatar) to open the modal
   React.useEffect(() => { if (openPasswordModal) setShowPwModal(true) }, [openPasswordModal])
