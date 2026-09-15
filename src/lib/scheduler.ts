@@ -1,7 +1,7 @@
 import 'server-only'
 import { getDb } from './db'
 import { checkDrift, runAutosync } from './autosync'
-import { startHubbleStream, stopHubbleStream, isHubbleStreaming, updateFlowPolicies, runRetentionCleanup } from './hubble'
+import { startHubbleStream, stopHubbleStream, isHubbleStreaming, updateFlowPolicies, runRetentionCleanup, normalizeStoredFlows } from './hubble'
 
 const TICK_MS = 15_000
 // Cleanup de retenção uma vez por hora
@@ -67,6 +67,7 @@ async function tick() {
     const hubbleEnabled = readHubbleEnabled()
     if (hubbleEnabled) {
       if (!isHubbleStreaming()) startHubbleStream()
+      normalizeStoredFlows()
       await updateFlowPolicies()
       if (Date.now() - lastRetentionCleanup > 3_600_000) {
         lastRetentionCleanup = Date.now()

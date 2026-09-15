@@ -884,6 +884,7 @@ export default function App() {
           <NetworkGraph
             services={visibleServices}
             policies={policies}
+            allPolicies={allPolicies}
             drafts={drafts}
             pendingApprovals={pendingApprovals}
             layoutSaveStatus={layoutSaveStatus}

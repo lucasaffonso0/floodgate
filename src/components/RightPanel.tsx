@@ -2095,6 +2095,14 @@ function Forbidden() {
 // ─── DescobertaTab ───────────────────────────────────────────────────────────
 const DISC_FILTER_KEY = 'floodgate-disc-filters'
 
+// Strips the ReplicaSet/StatefulSet pod suffix (-<hash10>-<hash5> or -<hash5>)
+// so a raw pod name matches the clean workload name stored on policy labels.
+function normalizeWorkload(workload: string): string {
+  return workload
+    .replace(/-[a-z0-9]{5,10}-[a-z0-9]{5}$/, '')
+    .replace(/-[a-z0-9]{5}$/, '')
+}
+
 function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDraft, onSaveConfig, onSwitchTab }: {
   flows: CiliumFlowSummary[]
   config: AppConfig
@@ -2114,7 +2122,6 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   const [toggleError, setToggleError] = useState<string | null>(null)
   const [policyYaml, setPolicyYaml] = useState<{ name: string; content: string } | null>(null)
   const [loadingYaml, setLoadingYaml] = useState<string | null>(null)
-  const [previewFlowId, setPreviewFlowId] = useState<string | null>(null)
   const [previewYamlMap, setPreviewYamlMap] = useState<Map<string, string>>(new Map())
   const [collapsedNs, setCollapsedNs] = useState<Set<string>>(new Set())
   function toggleDiscNs(ns: string) {
@@ -2148,7 +2155,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
     return acc
   }, {})
 
-  const unprotected = filtered.filter(f => !f.has_policy)
+  const unprotected = filtered.filter(f => !f.has_policy && f.verdict === 'DROPPED')
 
   function toggleSelect(id: string) {
     setSelected(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
@@ -2168,13 +2175,15 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   }
 
   function findMatchedPolicy(f: CiliumFlowSummary) {
-    return allPolicies.find(p =>
-      p.namespace === f.dst_namespace && (
-        p.dst_service === f.dst_workload ||
-        p.policy_type === 'restrict-ingress' ||
-        p.policy_type === 'restrict-egress'
-      )
-    )
+    const srcWorkload = normalizeWorkload(f.src_workload)
+    return allPolicies.find(p => {
+      if (p.namespace !== f.dst_namespace || p.dst_service !== f.dst_workload) return false
+      const portMatches = p.dst_ports.some(ps => ps.port === f.dst_port) || p.dst_port === f.dst_port
+      if (!portMatches) return false
+      if (p.policy_type === 'allow') return p.src_workload === srcWorkload && p.src_namespace === f.src_namespace
+      if (p.policy_type === 'allow-namespace') return p.src_namespace === f.src_namespace
+      return false
+    })
   }
 
   async function handleViewPolicy(f: CiliumFlowSummary) {
@@ -2345,7 +2354,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
 
                     {/* Linha 1: veredicto + ocorrências + tempo */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      {!f.has_policy && (
+                      {!f.has_policy && f.verdict === 'DROPPED' && (
                         <input type="checkbox" checked={selected.has(f.id)} onChange={() => toggleSelect(f.id)} style={{ cursor: 'pointer', flexShrink: 0 }} />
                       )}
                       <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 10, background: vc.badge, color: vc.text }}>
@@ -2375,7 +2384,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
 
                     {/* Linha 4: botões de ação */}
                     <div style={{ display: 'flex', gap: 6, alignItems: 'center', paddingTop: 2 }}>
-                      {!f.has_policy && (
+                      {!f.has_policy && f.verdict === 'DROPPED' && (
                         <button onClick={() => {
                           onAddDraft({ src_workload: f.src_workload, src_namespace: f.src_namespace, dst_service: f.dst_workload, dst_namespace: f.dst_namespace, dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }], policy_direction: 'ingress' })
                           onSwitchTab('drafts')
@@ -2385,19 +2394,23 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                       )}
                       {!f.has_policy && (
                         <button onClick={async () => {
+                          const title = `Preview: ${f.src_workload} → ${f.dst_workload}`
                           if (previewYamlMap.has(f.id)) {
-                            setPreviewFlowId(previewFlowId === f.id ? null : f.id)
+                            setPolicyYaml({ name: title, content: previewYamlMap.get(f.id)! })
                             return
                           }
-                          setPreviewFlowId(f.id)
+                          setLoadingYaml(f.id)
                           try {
                             const yaml = await previewDiscoveryPolicyYAML(f)
                             setPreviewYamlMap(prev => new Map(prev).set(f.id, yaml))
+                            setPolicyYaml({ name: title, content: yaml })
                           } catch {
-                            setPreviewYamlMap(prev => new Map(prev).set(f.id, '# Erro ao gerar YAML'))
+                            setPolicyYaml({ name: title, content: '# Erro ao gerar YAML' })
+                          } finally {
+                            setLoadingYaml(null)
                           }
-                        }} style={{ ...btn.base, ...btn.gray }}>
-                          <Icon.Eye />{previewYamlMap.has(f.id) && previewFlowId === f.id ? 'Fechar' : 'Ver YAML'}
+                        }} disabled={loadingYaml === f.id} style={{ ...btn.base, ...btn.gray }}>
+                          <Icon.Eye />{loadingYaml === f.id ? 'Carregando…' : 'Ver YAML'}
                         </button>
                       )}
                       {f.has_policy && matchedPolicy && (
@@ -2407,12 +2420,6 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                         </button>
                       )}
                     </div>
-                    {/* Preview YAML inline */}
-                    {previewFlowId === f.id && (
-                      previewYamlMap.has(f.id)
-                        ? <StaticYAMLViewer yamlStr={previewYamlMap.get(f.id)!} />
-                        : <div style={{ padding: '6px 0 2px', fontSize: 10, color: '#64748b' }}>Gerando YAML…</div>
-                    )}
                   </div>
                 )
               })}
@@ -2519,7 +2526,7 @@ export default function RightPanel({
     return false
   })()
 
-  const unprotectedFlowCount = ciliumFlows.filter(f => !f.has_policy).length
+  const unprotectedFlowCount = ciliumFlows.filter(f => !f.has_policy && f.verdict === 'DROPPED').length
 
   const navItems: Array<{ id: Tab; icon: React.ReactNode; badge?: number }> = [
     { id: 'namespaces', icon: <Icon.Namespace /> },

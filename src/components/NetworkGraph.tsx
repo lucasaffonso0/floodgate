@@ -23,6 +23,7 @@ import {
 } from '@xyflow/react'
 import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, ServiceLayout, ApprovalRequest, CiliumFlowSummary } from '@/types'
 import { deleteNetworkPolicy, restrictService, patchNetworkPolicyPort, isolateNamespace } from '@/api/client'
+import { explainAccess, type ExplainResult } from '@/lib/explainAccess'
 
 // ─── Namespace group node ──────────────────────────────────────────────────
 const ShieldIcon = ({ color }: { color: string }) => (
@@ -59,20 +60,20 @@ function IsolationBadge({ isolatedIn, isolatedEg, exceptionCount }: {
         style={{
           display: 'inline-flex', alignItems: 'center', gap: 2,
           fontSize: 9, fontWeight: 700,
-          background: hasEx ? '#fef9c3' : '#dcfce7',
-          color: hasEx ? '#854d0e' : '#15803d',
-          border: `1px solid ${hasEx ? '#fde047' : '#86efac'}`,
+          background: '#fef2f2',
+          color: '#b91c1c',
+          border: '1px solid #fecaca',
           borderRadius: 99,
           padding: '1px 5px', whiteSpace: 'nowrap', flexShrink: 0,
         }}
       >
-        <ShieldIcon color={hasEx ? '#854d0e' : '#15803d'} />
+        <ShieldIcon color="#b91c1c" />
         {hasEx && <span>{exceptionCount}</span>}
       </span>
     )
   }
 
-  // Partial isolation — minimal arrows, no text
+  // Partial isolation — minimal arrows, no text — always red, same as full isolation
   return (
     <span style={{ display: 'inline-flex', gap: 2, flexShrink: 0 }}>
       {isolatedIn && (
@@ -80,8 +81,8 @@ function IsolationBadge({ isolatedIn, isolatedEg, exceptionCount }: {
           title="Ingress isolado — default-deny namespace-wide para tráfego de entrada"
           style={{
             fontSize: 9, fontWeight: 700,
-            background: '#dbeafe', color: '#1d4ed8',
-            border: '1px solid #93c5fd', borderRadius: 99,
+            background: '#fef2f2', color: '#b91c1c',
+            border: '1px solid #fecaca', borderRadius: 99,
             padding: '1px 4px', whiteSpace: 'nowrap',
           }}
         >↙</span>
@@ -91,8 +92,8 @@ function IsolationBadge({ isolatedIn, isolatedEg, exceptionCount }: {
           title="Egress isolado — default-deny namespace-wide para tráfego de saída"
           style={{
             fontSize: 9, fontWeight: 700,
-            background: '#f3e8ff', color: '#7e22ce',
-            border: '1px solid #d8b4fe', borderRadius: 99,
+            background: '#fef2f2', color: '#b91c1c',
+            border: '1px solid #fecaca', borderRadius: 99,
             padding: '1px 4px', whiteSpace: 'nowrap',
           }}
         >↗</span>
@@ -127,9 +128,9 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
       boxShadow: selected
         ? `0 0 0 3px ${d.borderColor}33`
         : fullyIsolated
-          ? '0 0 0 3px #86efac66, 0 2px 8px rgba(21,128,61,0.15)'
+          ? '0 0 0 3px #fca5a566, 0 2px 8px rgba(185,28,28,0.15)'
           : partiallyIsolated
-            ? '0 0 0 2px #93c5fd55'
+            ? '0 0 0 2px #fca5a555'
             : 'none',
       transition: 'box-shadow 0.15s',
     }}>
@@ -829,11 +830,12 @@ const smallBtn = (danger = false): React.CSSProperties => ({
 })
 
 function AccessSection({
-  direction, restrictPolicy, connections, isViewer, onRestrict, onRemoveRestrict,
+  direction, restrictPolicy, connections, explain, isViewer, onRestrict, onRemoveRestrict,
 }: {
   direction: 'Inbound' | 'Outbound'
   restrictPolicy: NetworkPolicyInfo | undefined
   connections: ConnEntry[]
+  explain: ExplainResult
   isViewer?: boolean
   onRestrict: () => void
   onRemoveRestrict: () => void
@@ -841,21 +843,19 @@ function AccessSection({
   const dir = direction === 'Inbound' ? 'ingress' : 'egress'
   const blocked = !!restrictPolicy
   const hasAllows = connections.length > 0
+  const [showWhy, setShowWhy] = React.useState(false)
 
-  let icon: string, statusText: string, statusColor: string, bg: string, border: string
-  if (blocked && hasAllows) {
+  let icon: string, statusColor: string, bg: string, border: string
+  if (explain.scope !== 'none' && explain.exceptions.length > 0) {
     icon = '🔒'; statusColor = '#15803d'; bg = '#f0fdf4'; border = '#bbf7d0'
-    statusText = `Default-deny ativo — ${connections.length} serviço(s) com acesso`
-  } else if (blocked) {
+  } else if (explain.scope !== 'none') {
     icon = '🔒'; statusColor = '#b91c1c'; bg = '#fef2f2'; border = '#fecaca'
-    statusText = 'Default-deny ativo — nenhum acesso permitido'
-  } else if (hasAllows) {
-    icon = '🔒'; statusColor = '#0369a1'; bg = '#f0f9ff'; border = '#bae6fd'
-    statusText = `${connections.length} allow rule(s) ativa(s)`
+  } else if (explain.blocked) {
+    icon = '🔒'; statusColor = '#b91c1c'; bg = '#fef2f2'; border = '#fecaca'
   } else {
     icon = '⚠️'; statusColor = '#dc2626'; bg = '#fef2f2'; border = '#fecaca'
-    statusText = 'Aberto para todos'
   }
+  const statusText = explain.headline
 
   return (
     <div>
@@ -864,10 +864,34 @@ function AccessSection({
       </div>
 
       <div style={{ padding: '7px 10px', borderRadius: 7, background: bg, border: `1px solid ${border}` }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+        <div
+          onClick={() => setShowWhy(v => !v)}
+          title="Clique para ver por quê"
+          role="button"
+          tabIndex={0}
+          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') setShowWhy(v => !v) }}
+          style={{ display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}
+        >
           <span style={{ fontSize: 11 }}>{icon}</span>
           <span style={{ fontSize: 10, fontWeight: 700, color: statusColor, flex: 1 }}>{statusText}</span>
+          <span
+            style={{
+              width: 16, height: 16, borderRadius: '50%', flexShrink: 0,
+              border: `1px solid ${statusColor}`, background: 'transparent', color: statusColor,
+              fontSize: 9, fontWeight: 900, lineHeight: 1,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+          >
+            ?
+          </span>
         </div>
+        {showWhy && (
+          <div style={{ marginTop: 6, paddingTop: 6, borderTop: `1px solid ${border}`, display: 'flex', flexDirection: 'column', gap: 3 }}>
+            {explain.detail.map((line, i) => (
+              <div key={i} style={{ fontSize: 9.5, color: '#475569' }}>{line}</div>
+            ))}
+          </div>
+        )}
         {!blocked && !hasAllows && (
           <div style={{ fontSize: 9, color: '#b91c1c', marginTop: 2 }}>
             {dir === 'ingress' ? 'Qualquer pod pode acessar qualquer porta.' : 'Pode alcançar qualquer destino.'}
@@ -928,6 +952,8 @@ function ServiceDetailPanel({
 
   const ingressRestrict = policies.find(p => p.dst_service === name && p.namespace === ns && p.policy_type === 'restrict-ingress')
   const egressRestrict  = policies.find(p => p.dst_service === name && p.namespace === ns && p.policy_type === 'restrict-egress')
+  const ingressExplain = explainAccess(name, ns, 'ingress', policies)
+  const egressExplain  = explainAccess(name, ns, 'egress',  policies)
 
   async function applyRestrict(direction: 'ingress' | 'egress') {
     await restrictService({ service_name: name, namespace: ns, direction })
@@ -968,6 +994,7 @@ function ServiceDetailPanel({
           direction="Inbound"
           restrictPolicy={ingressRestrict}
           connections={inbound}
+          explain={ingressExplain}
           isViewer={!canManageCurrent}
           onRestrict={() => applyRestrict('ingress')}
           onRemoveRestrict={() => ingressRestrict && removeRestrict(ingressRestrict)}
@@ -977,10 +1004,97 @@ function ServiceDetailPanel({
           direction="Outbound"
           restrictPolicy={egressRestrict}
           connections={outbound}
+          explain={egressExplain}
           isViewer={!canManageCurrent}
           onRestrict={() => applyRestrict('egress')}
           onRemoveRestrict={() => egressRestrict && removeRestrict(egressRestrict)}
         />
+      </div>
+    </div>
+  )
+}
+
+// ─── Flow explain panel — why a Hubble-observed DROPPED flow was blocked ───
+function parseServiceNodeId(id: string): { ns: string; name: string } | null {
+  const parts = id.split('::')
+  return parts[0] === 'svc' ? { ns: parts[1], name: parts[2] } : null
+}
+
+// Does this specific flow's source match one of the destination's ingress
+// exceptions? Matched by the same label format explainAccess() generates —
+// good enough since we control that format ourselves.
+function sourceIsExempt(exceptions: ExplainResult['exceptions'], srcNs: string, srcName: string): boolean {
+  return exceptions.some(e =>
+    e.label === `${srcName} (${srcNs})` || e.label === `todo o namespace ${srcNs}` || e.label === 'pods do mesmo namespace')
+}
+
+function FlowExplainPanel({ edge, policies, onClose }: {
+  edge: Edge; policies: NetworkPolicyInfo[]; onClose: () => void
+}) {
+  const flow = edge.data!.flow as CiliumFlowSummary
+  const dst = parseServiceNodeId(edge.target)
+  const src = parseServiceNodeId(edge.source)
+  const dstExplain = dst ? explainAccess(dst.name, dst.ns, 'ingress', policies) : null
+
+  const srcName = src?.name ?? normalizeWorkload(flow.src_workload)
+  const srcNs   = src?.ns   ?? flow.src_namespace
+  const dstName = dst?.name ?? normalizeWorkload(flow.dst_workload)
+  const dstNs   = dst?.ns   ?? flow.dst_namespace
+
+  const exempt = dstExplain ? sourceIsExempt(dstExplain.exceptions, srcNs, srcName) : false
+
+  return (
+    <div style={{
+      position: 'absolute', top: 12, left: 12, zIndex: 100,
+      background: 'white', borderRadius: 12, width: 320,
+      boxShadow: '0 4px 24px rgba(0,0,0,0.13)', border: '1px solid #e2e8f0',
+      overflow: 'hidden',
+    }}>
+      <div style={{ background: '#fef2f2', borderBottom: '1px solid #fecaca', padding: '10px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+        <div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#991b1b' }}>✗ Fluxo bloqueado (DROPPED)</div>
+          <div style={{ fontSize: 10.5, color: '#7f1d1d', marginTop: 3 }}>
+            {srcName} ({srcNs}) → {dstName} ({dstNs}) :{flow.dst_port}/{flow.protocol}
+          </div>
+        </div>
+        <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#94a3b8', fontSize: 16, lineHeight: 1, padding: 2 }}>✕</button>
+      </div>
+
+      <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 10, maxHeight: 420, overflowY: 'auto' }}>
+        {dstExplain ? (
+          <>
+            <div style={{ fontSize: 11, fontWeight: 700, color: exempt ? '#b45309' : '#991b1b' }}>
+              {exempt
+                ? `${srcName} está na lista de liberados. Se mesmo assim foi bloqueado, pode ser porta/protocolo diferente ou um atraso momentâneo do Cilium.`
+                : `${srcName} (${srcNs}) não está liberado para acessar ${dstName} (${dstNs}).`}
+            </div>
+
+            <div>
+              <div style={{ fontSize: 9, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Motivo</div>
+              <div style={{ fontSize: 10.5, color: '#1e293b', fontWeight: 600 }}>{dstExplain.headline}</div>
+              {dstExplain.detail.length === 0 && (
+                <div style={{ fontSize: 9.5, color: '#64748b', marginTop: 2 }}>Nenhuma exceção configurada: ninguém tem acesso.</div>
+              )}
+            </div>
+
+            {dstExplain.exceptions.length > 0 && (
+              <div>
+                <div style={{ fontSize: 9, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Quem tem acesso liberado</div>
+                {dstExplain.exceptions.map((e, i) => (
+                  <div key={i} style={{ fontSize: 9.5, color: '#334155', marginTop: 2 }}>✓ {e.label}</div>
+                ))}
+              </div>
+            )}
+          </>
+        ) : (
+          <div style={{ fontSize: 10, color: '#64748b' }}>
+            O destino (<strong>{dstName}</strong> em <strong>{dstNs}</strong>) não é um Service do Kubernetes rastreado pelo Floodgate. Pode ser um workload sem Service, ou um namespace inteiro. Verifique as NetworkPolicies desse namespace manualmente.
+          </div>
+        )}
+
+        <div style={{ fontSize: 9, color: '#94a3b8', background: '#f8fafc', borderRadius: 6, padding: '6px 8px', lineHeight: 1.5 }}>
+          Baseado em todas as NetworkPolicies do cluster, inclusive não-gerenciadas pelo Floodgate. O Hubble reporta o bloqueio real do Cilium, que pode vir de qualquer policy.
+        </div>
       </div>
     </div>
   )
@@ -1492,6 +1606,7 @@ function EditPolicyModal({
 interface Props {
   services: ServiceInfo[]
   policies: NetworkPolicyInfo[]
+  allPolicies?: NetworkPolicyInfo[]
   drafts: Draft[]
   pendingApprovals: ApprovalRequest[]
   serviceLayouts: ServiceLayout[]
@@ -1699,7 +1814,7 @@ function LayoutToolbar({
 }
 
 export default function NetworkGraph({
-  services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks,
+  services, policies, allPolicies, drafts, pendingApprovals, serviceLayouts, namespaceLocks,
   nsPositionsFromDB, layoutResetKey, globalLocked,
   isViewer, isAdmin, canManageNamespace, onServiceMove, onNsMove,
   onAutoLayoutServices, onToggleNamespaceLock,
@@ -1714,6 +1829,7 @@ export default function NetworkGraph({
   const [selectedNodeId, setSelectedNodeId] = React.useState<string | null>(null)
   const [selectedNs, setSelectedNs]         = React.useState<string | null>(null)
   const [editingPolicy, setEditingPolicy]   = React.useState<NetworkPolicyInfo | null>(null)
+  const [selectedFlowEdge, setSelectedFlowEdge] = React.useState<Edge | null>(null)
   const [showFlowEdges, setShowFlowEdges]   = React.useState(true)
 
   const nsPositions  = useRef<Map<string, { x: number; y: number }>>(new Map())
@@ -1888,6 +2004,11 @@ export default function NetworkGraph({
   }, [onAddDraft, services, isViewer, canManageNamespace])
 
   function handleEdgeClick(_: React.MouseEvent, edge: Edge) {
+    if (edge.data?.type === 'flow') {
+      const flow = edge.data.flow as CiliumFlowSummary
+      if (flow.verdict === 'DROPPED') setSelectedFlowEdge(edge)
+      return
+    }
     if (isViewer) return
     if (edge.data?.type === 'draft') {
       onRemoveDraft((edge.data.draft as Draft).id)
@@ -1910,7 +2031,7 @@ export default function NetworkGraph({
         onConnect={onConnect}
         onEdgeClick={handleEdgeClick}
         onNodeClick={handleNodeClick}
-        onPaneClick={() => { setSelectedNodeId(null); setSelectedNs(null) }}
+        onPaneClick={() => { setSelectedNodeId(null); setSelectedNs(null); setSelectedFlowEdge(null) }}
         nodeTypes={nodeTypes}
         fitView fitViewOptions={{ padding: 0.15 }}
         minZoom={0.08} maxZoom={2}
@@ -1989,6 +2110,14 @@ export default function NetworkGraph({
           canManageNamespace={canManageNamespace}
           onClose={() => setSelectedNs(null)}
           onPolicyChanged={onPolicyChanged}
+        />
+      )}
+
+      {selectedFlowEdge && (
+        <FlowExplainPanel
+          edge={selectedFlowEdge}
+          policies={allPolicies ?? policies}
+          onClose={() => setSelectedFlowEdge(null)}
         />
       )}
 
