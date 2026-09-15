@@ -21,6 +21,7 @@ import {
   Position,
   applyNodeChanges,
 } from '@xyflow/react'
+import dagre from '@dagrejs/dagre'
 import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, ServiceLayout, ApprovalRequest, CiliumFlowSummary } from '@/types'
 import { deleteNetworkPolicy, restrictService, patchNetworkPolicyPort, isolateNamespace } from '@/api/client'
 import { explainAccess, type ExplainResult } from '@/lib/explainAccess'
@@ -259,7 +260,7 @@ const PALETTE = [
 // ─── Layout constants ──────────────────────────────────────────────────────
 const NODE_W = 160, NODE_H = 56, NODE_GAPH = 20, NODE_GAPV = 16
 const NS_PAD = 20, NS_HEADER = 34
-const TREE_COL_GAP = 80, TREE_ROW_GAP = 40
+const TREE_COL_GAP = 130, TREE_ROW_GAP = 70
 
 function rectsOverlap(
   a: { x: number; y: number; w: number; h: number },
@@ -303,58 +304,115 @@ function computeNamespaceTreeLayout(
   nsSizes: Map<string, { w: number; h: number }>,
   policies: NetworkPolicyInfo[],
   drafts: Draft[],
+  ciliumFlows: CiliumFlowSummary[],
 ): Map<string, { x: number; y: number }> {
-  const nsSet   = new Set(namespaces)
-  const outEdges = new Map<string, Set<string>>()
-  const inDegree = new Map<string, number>()
-  for (const ns of namespaces) { outEdges.set(ns, new Set()); inDegree.set(ns, 0) }
+  // Layered graph layout (rank assignment, cycle breaking, multi-pass
+  // crossing minimization, dummy nodes for edges spanning multiple ranks)
+  // is a well-solved problem — dagre is the layout engine React Flow's own
+  // examples use for exactly this, so we hand it off instead of maintaining
+  // a hand-rolled version of the same algorithm.
+  const nsSet = new Set(namespaces)
+  const g = new dagre.graphlib.Graph()
+  g.setGraph({ rankdir: 'LR', nodesep: TREE_ROW_GAP, ranksep: TREE_COL_GAP })
+  g.setDefaultEdgeLabel(() => ({}))
 
+  for (const ns of namespaces) {
+    const { w, h } = nsSizes.get(ns) ?? { w: 200, h: 100 }
+    g.setNode(ns, { width: w, height: h })
+  }
+
+  const seenPair = new Set<string>()
   const addEdge = (src: string, dst: string) => {
     if (src === dst || !nsSet.has(src) || !nsSet.has(dst)) return
-    if (!outEdges.get(src)!.has(dst)) {
-      outEdges.get(src)!.add(dst)
-      inDegree.set(dst, (inDegree.get(dst) ?? 0) + 1)
-    }
+    const key = `${src}->${dst}`
+    if (seenPair.has(key)) return
+    seenPair.add(key)
+    g.setEdge(src, dst)
   }
   for (const p of policies) addEdge(p.src_namespace, p.namespace)
   for (const d of drafts)   addEdge(d.src_namespace, d.dst_namespace)
+  // Real observed traffic counts too — without it, namespaces with no
+  // policy yet (only Hubble flows) have no edges at all and collapse into
+  // a single rank/column, disconnected from the lines actually drawn.
+  for (const f of ciliumFlows) addEdge(f.src_namespace, f.dst_namespace)
 
-  const rank  = new Map<string, number>()
-  const queue = namespaces.filter(ns => inDegree.get(ns) === 0)
-  for (const ns of queue) rank.set(ns, 0)
+  dagre.layout(g)
 
-  let head = 0
-  while (head < queue.length) {
-    const ns = queue[head++]
-    const r  = rank.get(ns) ?? 0
-    for (const next of outEdges.get(ns) ?? []) {
-      const nr = Math.max(rank.get(next) ?? 0, r + 1)
-      rank.set(next, nr)
-      inDegree.set(next, (inDegree.get(next) ?? 1) - 1)
-      if (inDegree.get(next) === 0) queue.push(next)
-    }
-  }
-  for (const ns of namespaces) if (!rank.has(ns)) rank.set(ns, 0)
-
-  const byRank = new Map<number, string[]>()
-  for (const [ns, r] of rank) {
-    if (!byRank.has(r)) byRank.set(r, [])
-    byRank.get(r)!.push(ns)
-  }
-
+  // dagre positions nodes by center; the rest of this file treats a
+  // namespace's {x,y} as its top-left corner.
   const positions = new Map<string, { x: number; y: number }>()
-  const maxRank = Math.max(...rank.values(), 0)
-  let x = 0
-  for (let r = 0; r <= maxRank; r++) {
-    const col  = byRank.get(r) ?? []
-    const colW = Math.max(...col.map(ns => nsSizes.get(ns)?.w ?? 200))
-    let y = 0
-    for (const ns of col) {
-      positions.set(ns, { x, y })
-      y += (nsSizes.get(ns)?.h ?? 100) + TREE_ROW_GAP
-    }
-    x += colW + TREE_COL_GAP
+  for (const ns of namespaces) {
+    const node = g.node(ns)
+    const { w, h } = nsSizes.get(ns) ?? { w: 200, h: 100 }
+    positions.set(ns, node ? { x: node.x - w / 2, y: node.y - h / 2 } : { x: 0, y: 0 })
   }
+
+  // A line between two connected namespaces is drawn straight from center to
+  // center. If an unrelated namespace's box happens to sit near that straight
+  // path, the line cuts right through it. Detect that directly — for every
+  // namespace-pair edge, check every other box against the segment between
+  // the two endpoints — and nudge the box vertically until it's clear,
+  // iterating since one nudge can create a new conflict with another edge.
+  const rectOf = (ns: string) => {
+    const pos = positions.get(ns)!
+    const { w, h } = nsSizes.get(ns) ?? { w: 200, h: 100 }
+    return { x: pos.x, y: pos.y, w, h }
+  }
+  const centerOf = (ns: string) => {
+    const r = rectOf(ns)
+    return { x: r.x + r.w / 2, y: r.y + r.h / 2 }
+  }
+  const CLEARANCE = 26
+
+  for (let pass = 0; pass < 6; pass++) {
+    let moved = false
+    for (const key of seenPair) {
+      const [a, b] = key.split('->')
+      if (!nsSet.has(a) || !nsSet.has(b)) continue
+      const ca = centerOf(a), cb = centerOf(b)
+      if (Math.abs(ca.x - cb.x) < 1) continue // same column, no diagonal path to worry about
+      for (const c of namespaces) {
+        if (c === a || c === b) continue
+        const rect = rectOf(c)
+        const cx = rect.x + rect.w / 2
+        const xLo = Math.min(ca.x, cb.x), xHi = Math.max(ca.x, cb.x)
+        if (cx <= xLo + 1 || cx >= xHi - 1) continue // c's column isn't between a and b
+        const t = (cx - ca.x) / (cb.x - ca.x)
+        const lineY = ca.y + t * (cb.y - ca.y)
+        const cy = rect.y + rect.h / 2
+        const minDist = rect.h / 2 + CLEARANCE
+        const dist = Math.abs(lineY - cy)
+        if (dist < minDist) {
+          const dir = cy >= lineY ? 1 : -1
+          const pos = positions.get(c)!
+          positions.set(c, { ...pos, y: pos.y + dir * (minDist - dist + 4) })
+          moved = true
+        }
+      }
+    }
+    if (!moved) break
+  }
+
+  // Nudging boxes away from lines can push two of them into each other —
+  // separate any that now overlap.
+  for (let i = 0; i < namespaces.length; i++) {
+    for (let j = i + 1; j < namespaces.length; j++) {
+      const a = namespaces[i], b = namespaces[j]
+      const ra = rectOf(a), rb = rectOf(b)
+      if (!rectsOverlap(ra, rb, 16)) continue
+      const pa = positions.get(a)!, pb = positions.get(b)!
+      const overlapY = (ra.h + rb.h) / 2 + 16 - Math.abs((ra.y + ra.h / 2) - (rb.y + rb.h / 2))
+      const push = Math.max(overlapY / 2, 10)
+      if (pa.y <= pb.y) {
+        positions.set(a, { ...pa, y: pa.y - push })
+        positions.set(b, { ...pb, y: pb.y + push })
+      } else {
+        positions.set(a, { ...pa, y: pa.y + push })
+        positions.set(b, { ...pb, y: pb.y - push })
+      }
+    }
+  }
+
   return positions
 }
 
@@ -400,7 +458,7 @@ function buildGraph(
   }
 
   {
-    const tree = computeNamespaceTreeLayout([...nsMap.keys()], nsSizes, policies, drafts)
+    const tree = computeNamespaceTreeLayout([...nsMap.keys()], nsSizes, policies, drafts, showFlowEdges ? visibleFlows : [])
     // Remove stale namespaces that no longer exist in the cluster
     for (const key of [...nsPositions.keys()]) {
       if (!nsMap.has(key)) nsPositions.delete(key)
@@ -408,6 +466,40 @@ function buildGraph(
     // Only assign tree positions to namespaces not already positioned (preserves manual drags)
     for (const [ns, pos] of tree) {
       if (!nsPositions.has(ns)) nsPositions.set(ns, pos)
+    }
+  }
+
+  // Order services within each namespace box by the average X position of
+  // the OTHER namespaces they connect to — same barycenter idea as the
+  // namespace columns above, one level deeper. Services with similar
+  // connections end up next to each other instead of scattered across the
+  // grid, so their edges converge on one side of the box instead of fanning
+  // out across the whole thing.
+  {
+    const svcNsNeighbors = new Map<string, Set<string>>()
+    const addSvcNsNeighbor = (ns: string, svcName: string, otherNs: string) => {
+      if (ns === otherNs || !svcName) return
+      const key = `${ns}::${svcName}`
+      if (!svcNsNeighbors.has(key)) svcNsNeighbors.set(key, new Set())
+      svcNsNeighbors.get(key)!.add(otherNs)
+    }
+    for (const p of policies.filter(p => p.managed && p.src_workload)) {
+      addSvcNsNeighbor(p.namespace, p.dst_service, p.src_namespace)
+      addSvcNsNeighbor(p.src_namespace, p.src_workload, p.namespace)
+    }
+    for (const f of visibleFlows) {
+      addSvcNsNeighbor(f.dst_namespace, f.dst_workload, f.src_namespace)
+      addSvcNsNeighbor(f.src_namespace, f.src_workload, f.dst_namespace)
+    }
+    const NO_SVC_SCORE = Number.MAX_SAFE_INTEGER
+    const svcScore = (ns: string, svcName: string): number => {
+      const neighbors = svcNsNeighbors.get(`${ns}::${svcName}`)
+      if (!neighbors || neighbors.size === 0) return NO_SVC_SCORE
+      const xs = [...neighbors].map(n => nsPositions.get(n)?.x ?? 0)
+      return xs.reduce((a, b) => a + b, 0) / xs.length
+    }
+    for (const [ns, svcs] of nsMap) {
+      svcs.sort((a, b) => svcScore(ns, a.name) - svcScore(ns, b.name))
     }
   }
 

@@ -578,15 +578,8 @@ export default function App() {
       })
       for (const ns of namespaces) pendingNsChanges.current[ns.namespace] = { x: ns.x, y: ns.y }
     }
-    if (autosaveTimerRef.current) { clearTimeout(autosaveTimerRef.current); autosaveTimerRef.current = null }
-    setLayoutSaveStatus('saving')
-    if (!autosaveRef.current) {
-      const draft: LayoutDraft = { services: {}, namespaces: {} }
-      for (const [k, v] of pendingServiceChanges.current) draft.services[k] = { x: v.x, y: v.y }
-      for (const [ns, pos] of Object.entries(pendingNsChanges.current)) draft.namespaces[ns] = pos
-      saveLayoutDraft(draft)
-    }
-  }, [])
+    scheduleAutosave()
+  }, [scheduleAutosave])
 
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: '#f8fafc' }}>
