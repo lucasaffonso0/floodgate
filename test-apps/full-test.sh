@@ -414,6 +414,36 @@ test_protocol_api() {
   cleanup
 }
 
+test_portrange_and_allports() {
+  header_scenario "14/14 — Faixa de portas (endPort) e allow sem restrição de porta"
+
+  echo "  Faixa de portas (endPort): restrict-ingress pgbouncer + allow TCP 6000-7000"
+  assert_ok "restrict-ingress pgbouncer (base)" "$(api POST '/api/networkpolicies/restrict' \
+    '{"service_name":"pgbouncer","namespace":"database","direction":"ingress"}')"
+  r=$(api POST '/api/networkpolicies' \
+    '{"src_workload":"worker","src_namespace":"backend","dst_service":"pgbouncer","dst_namespace":"database","dst_ports":[{"port":6000,"protocol":"TCP","endPort":7000}]}')
+  assert_ok "allow ingress TCP 6000-7000 (endPort)" "$r"
+  body="${r#*|}"
+  assert_field "dst_ports[0].port"    "$(json_get "$body" "str(d['dst_ports'][0]['port'])")"    "6000"
+  assert_field "dst_ports[0].endPort" "$(json_get "$body" "str(d['dst_ports'][0]['endPort'])")" "7000"
+  sleep "$PROPAGATION_WAIT"
+  run_tests protocol-portrange || FAILED_SCENARIOS+=("protocol-portrange")
+  cleanup
+
+  echo ""
+  echo "  Todas as portas: restrict-ingress pgbouncer + allow sem nenhuma porta"
+  assert_ok "restrict-ingress pgbouncer (base)" "$(api POST '/api/networkpolicies/restrict' \
+    '{"service_name":"pgbouncer","namespace":"database","direction":"ingress"}')"
+  r=$(api POST '/api/networkpolicies' \
+    '{"src_workload":"worker","src_namespace":"backend","dst_service":"pgbouncer","dst_namespace":"database","dst_ports":[]}')
+  assert_ok "allow ingress sem restrição de porta" "$r"
+  body="${r#*|}"
+  assert_field "dst_ports count" "$(json_get "$body" "str(len(d['dst_ports']))")" "0"
+  sleep "$PROPAGATION_WAIT"
+  run_tests protocol-allports || FAILED_SCENARIOS+=("protocol-allports")
+  cleanup
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -450,6 +480,7 @@ test_restrict_db_egress_allow_backend
 test_isolate_db_egress_allow_backend
 test_restrict_multiple
 test_protocol_api
+test_portrange_and_allports
 
 # Limpeza final
 cleanup

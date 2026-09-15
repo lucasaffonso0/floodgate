@@ -28,6 +28,8 @@
 #   protocol-tcp-explicit       — allow TCP explicit port
 #   protocol-udp-blocks-tcp     — UDP-only allow does not unblock TCP
 #   protocol-multiport          — multi-port TCP+UDP allow
+#   protocol-portrange          — allow with endPort (port range covering the real port)
+#   protocol-allports           — allow with no port restriction (dst_ports empty = all ports)
 #   scan                        — scan and display current connectivity state
 
 set -euo pipefail
@@ -401,6 +403,36 @@ scenario_restrict_multiple() {
   print_summary "Resultado: restrict-ingress múltiplos serviços"
 }
 
+scenario_protocol_portrange() {
+  echo -e "\n${BOLD}${BLUE}Cenário: allow com faixa de portas (endPort) — restrict-ingress + allow TCP 6000-7000${NC}"
+  separator
+
+  header "Porta 6432 coberta pela faixa 6000-7000: backend/worker acessa database/pgbouncer"
+  check backend    worker   "$DATABASE" OPEN
+  check frontend   app      "$DATABASE" BLOCKED
+  check infra      haproxy  "$DATABASE" BLOCKED
+  check monitoring grafana  "$DATABASE" BLOCKED
+
+  header "Outros tráfegos não afetados"
+  check backend worker "$BACKEND"    OPEN
+  check backend worker "$MONITORING" OPEN
+
+  print_summary "Resultado: allow com faixa de portas worker→pgbouncer"
+}
+
+scenario_protocol_allports() {
+  echo -e "\n${BOLD}${BLUE}Cenário: allow sem restrição de porta — restrict-ingress + allow todas as portas${NC}"
+  separator
+
+  header "Sem restrição de porta: backend/worker acessa database/pgbouncer em qualquer porta"
+  check backend    worker   "$DATABASE" OPEN
+  check frontend   app      "$DATABASE" BLOCKED
+  check infra      haproxy  "$DATABASE" BLOCKED
+  check monitoring grafana  "$DATABASE" BLOCKED
+
+  print_summary "Resultado: allow todas as portas worker→pgbouncer"
+}
+
 scenario_scan() {
   echo -e "\n${BOLD}${BLUE}Scan — estado atual de conectividade${NC}"
   separator
@@ -520,6 +552,8 @@ case $SCENARIO in
   protocol-tcp-explicit)             scenario_protocol_tcp_explicit ;;
   protocol-udp-blocks-tcp)           scenario_protocol_udp_blocks_tcp ;;
   protocol-multiport)                scenario_protocol_multiport ;;
+  protocol-portrange)                scenario_protocol_portrange ;;
+  protocol-allports)                 scenario_protocol_allports ;;
   scan|*)                            scenario_scan ;;
 esac
 

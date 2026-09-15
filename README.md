@@ -16,6 +16,7 @@ Kubernetes NetworkPolicy manager with an interactive drag-and-drop graph UI. Vis
 - **Namespace isolation** — one-click default-deny (ingress, egress, or both)
 - **CIDR/IP range policies** — allow or restrict traffic to/from external IP ranges (e.g. corporate VPN, managed databases, external APIs)
 - **Flow discovery** — Hubble/Cilium integration streams live traffic flows; one click creates a draft policy from any discovered connection
+- **Explain access** — click a service or a blocked flow to see exactly why it's allowed or denied (service-level policy, namespace-wide isolation, or neither)
 - **Pause/Resume** — remove all policies from the cluster temporarily and restore them
 
 ---
