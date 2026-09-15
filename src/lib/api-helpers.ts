@@ -21,7 +21,7 @@ function k8sStatusOf(e: unknown): number | undefined {
   return undefined
 }
 
-// Logs the full error server-side and returns a generic message — raw
+// Logs the full error server-side and returns a generic message: raw
 // K8s/SQLite errors leak cluster paths and internals to clients.
 export function apiError(e: unknown, detail = 'Erro interno', status = 500): NextResponse {
   if (e instanceof UserFacingError) {
@@ -41,4 +41,25 @@ export async function parseBody<T = Record<string, unknown>>(req: NextRequest): 
   } catch {
     return null
   }
+}
+
+// Validates a dst_ports array shape shared by every policy-creation route:
+// port/endPort must be integers 1-65535, and endPort (when present) must be
+// >= port. An empty/absent array is valid: it means "all ports".
+export function invalidPortsMessage(dstPorts: unknown): string | null {
+  if (dstPorts === undefined) return null
+  if (!Array.isArray(dstPorts)) return "'dst_ports' deve ser um array"
+  for (const p of dstPorts) {
+    const port = (p as { port?: unknown })?.port
+    const endPort = (p as { endPort?: unknown })?.endPort
+    if (!Number.isInteger(port) || (port as number) < 1 || (port as number) > 65535)
+      return `porta inválida: ${JSON.stringify(port)} (deve ser 1-65535)`
+    if (endPort !== undefined) {
+      if (!Number.isInteger(endPort) || (endPort as number) < 1 || (endPort as number) > 65535)
+        return `endPort inválido: ${JSON.stringify(endPort)} (deve ser 1-65535)`
+      if ((endPort as number) < (port as number))
+        return `endPort (${endPort}) não pode ser menor que port (${port})`
+    }
+  }
+  return null
 }

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { deleteNetworkPolicy, patchNetworkPolicyPort, getPolicyYAML } from '@/lib/k8s'
 import { getCurrentUser, canManageNamespace } from '@/lib/auth'
-import { apiError, parseBody } from '@/lib/api-helpers'
+import { apiError, parseBody, invalidPortsMessage } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { removeManagedPolicy, saveManagedPolicy } from '@/lib/autosync'
 import { emit } from '@/lib/sse'
@@ -46,16 +46,12 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     if (!(await canManageNamespace(user.sub, user.role, ns))) {
       return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
     }
-    const body = await parseBody<{ dst_ports?: Array<{ port: number; protocol: 'TCP' | 'UDP' | 'SCTP' }>; dst_port?: number }>(req)
+    const body = await parseBody<{ dst_ports?: Array<{ port: number; protocol: 'TCP' | 'UDP' | 'SCTP'; endPort?: number }>; dst_port?: number }>(req)
     if (!body) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
-    const dst_ports: Array<{ port: number; protocol: 'TCP' | 'UDP' | 'SCTP' }> =
+    const dst_ports: Array<{ port: number; protocol: 'TCP' | 'UDP' | 'SCTP'; endPort?: number }> =
       body.dst_ports ?? (body.dst_port ? [{ port: body.dst_port, protocol: 'TCP' as const }] : [])
-    if (dst_ports.length === 0) {
-      return NextResponse.json({ detail: 'dst_ports obrigatório' }, { status: 400 })
-    }
-    if (dst_ports.some(p => !Number.isInteger(p.port) || p.port < 1 || p.port > 65535)) {
-      return NextResponse.json({ detail: 'Cada porta deve ser um inteiro entre 1 e 65535' }, { status: 400 })
-    }
+    const portsError = invalidPortsMessage(dst_ports)
+    if (portsError) return NextResponse.json({ detail: portsError }, { status: 400 })
     const updated = await patchNetworkPolicyPort(ns, name, dst_ports)
     logAudit({ user_id: user.sub, username: user.username, action: 'update_policy_port', resource_type: 'NetworkPolicy', resource_name: name, namespace: ns, details: `ports=${dst_ports.map(p => `${p.protocol}/${p.port}`).join(',')}` })
     getPolicyYAML(updated.namespace, updated.name).then(y => saveManagedPolicy(updated.namespace, updated.name, y)).catch(() => {})

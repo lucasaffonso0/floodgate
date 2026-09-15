@@ -27,7 +27,7 @@ export async function PATCH(
 
   // Role changes: admin only
   if (body.role !== undefined && !isAdmin) {
-    return NextResponse.json({ detail: 'Forbidden — apenas admins podem alterar roles' }, { status: 403 })
+    return NextResponse.json({ detail: 'Forbidden: apenas admins podem alterar roles' }, { status: 403 })
   }
 
   // Password change validation
@@ -41,7 +41,7 @@ export async function PATCH(
       if (!body.current_password) {
         return NextResponse.json({ detail: 'Senha atual é obrigatória' }, { status: 400 })
       }
-      // Rate-limit current-password attempts — otherwise an authenticated
+      // Rate-limit current-password attempts: otherwise an authenticated
       // session can brute-force the password via repeated PATCHes
       const rl = checkRateLimit(`pwd:${me.sub}`)
       if (!rl.allowed) {

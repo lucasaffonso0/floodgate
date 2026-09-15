@@ -38,7 +38,7 @@ function extractEndpoint(ep: any): { workload: string; namespace: string } {
   const labels: string[] = ep?.labels ?? []
 
   // Cilium hasn't always resolved the owner workload (e.g. right after a pod
-  // starts) and falls back to the raw pod name — normalize either way so the
+  // starts) and falls back to the raw pod name: normalize either way so the
   // same logical service always gets the same identity across flow records
   // (this also fixes duplicate rows for what's really one src→dst pair).
   let workload = workloads[0]?.name ?? ep?.pod_name ?? ''
@@ -78,7 +78,7 @@ async function refreshSvcPortCache(): Promise<void> {
     }
     _svcPortCache = cache
     _svcPortCacheAt = Date.now()
-  } catch { /* non-critical — mantém cache antigo */ }
+  } catch { /* non-critical: mantém cache antigo */ }
   finally { _svcPortCacheRefreshing = false }
 }
 
@@ -108,7 +108,7 @@ async function refreshPolicyCache(): Promise<void> {
   try {
     _policyCache = await listNetworkPolicies(true)
     _policyCacheAt = Date.now()
-  } catch { /* non-critical — mantém cache antigo */ }
+  } catch { /* non-critical: mantém cache antigo */ }
   finally { _policyCacheRefreshing = false }
 }
 
@@ -286,7 +286,7 @@ export async function updateFlowPolicies(): Promise<void> {
     const count = (db.prepare('SELECT COUNT(*) as c FROM discovered_flows').get() as { c: number }).c
     if (count === 0) return
 
-    // Fetch fresh rather than trust the cache here — this is the periodic
+    // Fetch fresh rather than trust the cache here: this is the periodic
     // authoritative reconciliation pass, the cache is only for insert-time
     // best-effort classification.
     const allPolicies = await listNetworkPolicies(true).catch(() => [])
@@ -334,7 +334,7 @@ export function normalizeStoredFlows(): void {
         continue
       }
       existing.flow_count += r.flow_count
-      // Don't trust either row's stored has_policy across a merge — it may
+      // Don't trust either row's stored has_policy across a merge: it may
       // have been computed under stale data. updateFlowPolicies() recomputes
       // it fresh right after this runs, every tick.
       existing.has_policy = 0

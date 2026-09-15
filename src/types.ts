@@ -27,6 +27,7 @@ export interface NetworkPolicyInfo {
 export interface PortSpec {
   port: number
   protocol: 'TCP' | 'UDP' | 'SCTP'
+  endPort?: number
 }
 
 export interface CreatePolicyRequest {

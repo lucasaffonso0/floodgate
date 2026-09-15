@@ -18,7 +18,7 @@ const g = global as typeof global & { _sseWriters?: Set<Writer>; _sseHeartbeat?:
 if (!g._sseWriters) g._sseWriters = new Set()
 
 // Heartbeat prunes writers whose connections died silently (proxy drops
-// without cancel()) — otherwise, during quiet periods with no events, dead
+// without cancel()): otherwise, during quiet periods with no events, dead
 // writers accumulate until the connection cap rejects new clients.
 const HEARTBEAT_MS = 30_000
 function ensureHeartbeat() {

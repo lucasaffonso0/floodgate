@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser, canManageNamespace } from '@/lib/auth'
 import { createCidrPolicy, getPolicyYAML } from '@/lib/k8s'
 import { isNamespaceWatched } from '@/lib/config'
-import { apiError, parseBody } from '@/lib/api-helpers'
+import { apiError, parseBody, invalidPortsMessage } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { saveManagedPolicy } from '@/lib/autosync'
 import { emit } from '@/lib/sse'
@@ -31,6 +31,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ detail: `CIDR inválido em 'except': ${invalid}` }, { status: 400 })
     }
   }
+  const portsError = invalidPortsMessage(body.dst_ports)
+  if (portsError) return NextResponse.json({ detail: portsError }, { status: 400 })
   if (!isNamespaceWatched(namespace))
     return NextResponse.json({ detail: 'Namespace fora do escopo gerenciado pelo floodgate' }, { status: 400 })
   if (!await canManageNamespace(user.sub, user.role, namespace))

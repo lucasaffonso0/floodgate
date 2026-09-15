@@ -24,7 +24,7 @@ export async function GET() {
     byNamespace.get(s.namespace)!.push(s.name)
   }
 
-  // Don't apply auto-deny while policies are paused — cluster is intentionally empty
+  // Don't apply auto-deny while policies are paused: cluster is intentionally empty
   const isPaused = (getDb().prepare('SELECT COUNT(*) as n FROM saved_policies').get() as { n: number }).n > 0
 
   const coverage: SecurityCoverage[] = []

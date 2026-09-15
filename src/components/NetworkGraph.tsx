@@ -40,7 +40,7 @@ function IsolationBadge({ isolatedIn, isolatedEg, exceptionCount }: {
 }) {
   if (!isolatedIn && !isolatedEg) return (
     <span
-      title="Namespace sem isolamento — tráfego irrestrito"
+      title="Namespace sem isolamento: tráfego irrestrito"
       style={{ display: 'inline-flex', alignItems: 'center', color: '#cbd5e1', flexShrink: 0 }}
     >
       <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
@@ -55,8 +55,8 @@ function IsolationBadge({ isolatedIn, isolatedEg, exceptionCount }: {
     return (
       <span
         title={hasEx
-          ? `Isolada com ${exceptionCount} ${exceptionCount === 1 ? 'exceção' : 'exceções'} — clique para ver`
-          : 'Namespace totalmente fechada — default-deny em ingress e egress'
+          ? `Isolada com ${exceptionCount} ${exceptionCount === 1 ? 'exceção' : 'exceções'}: clique para ver`
+          : 'Namespace totalmente fechada: default-deny em ingress e egress'
         }
         style={{
           display: 'inline-flex', alignItems: 'center', gap: 2,
@@ -74,12 +74,12 @@ function IsolationBadge({ isolatedIn, isolatedEg, exceptionCount }: {
     )
   }
 
-  // Partial isolation — minimal arrows, no text — always red, same as full isolation
+  // Partial isolation: minimal arrows, no text, always red like full isolation
   return (
     <span style={{ display: 'inline-flex', gap: 2, flexShrink: 0 }}>
       {isolatedIn && (
         <span
-          title="Ingress isolado — default-deny namespace-wide para tráfego de entrada"
+          title="Ingress isolado: default-deny namespace-wide para tráfego de entrada"
           style={{
             fontSize: 9, fontWeight: 700,
             background: '#fef2f2', color: '#b91c1c',
@@ -90,7 +90,7 @@ function IsolationBadge({ isolatedIn, isolatedEg, exceptionCount }: {
       )}
       {isolatedEg && (
         <span
-          title="Egress isolado — default-deny namespace-wide para tráfego de saída"
+          title="Egress isolado: default-deny namespace-wide para tráfego de saída"
           style={{
             fontSize: 9, fontWeight: 700,
             background: '#fef2f2', color: '#b91c1c',
@@ -507,7 +507,7 @@ function buildGraph(
 
   // Cria nós virtuais para namespaces que aparecem em flows mas não têm K8s Services
   if (showFlowEdges && visibleFlows.length > 0) {
-    const VIRTUAL_W = NS_PAD * 2 + NODE_W   // 200px — largura mínima legível
+    const VIRTUAL_W = NS_PAD * 2 + NODE_W   // 200px: largura mínima legível
     const WORKLOAD_H = 36
     const maxY = groupNodes.length > 0
       ? Math.max(...groupNodes.map(n => n.position.y + ((n.style?.height as number) ?? 0)))
@@ -704,7 +704,7 @@ function buildGraph(
       animated: true,
       pathOptions: { curvature: cur },
       style: { stroke: '#f97316', strokeWidth: 2, strokeDasharray: '8 4' },
-      label: `rascunho :${draft.dst_ports.map(p => `${p.protocol !== 'TCP' ? p.protocol + '/' : ''}${p.port}`).join(', ')}`,
+      label: `rascunho: ${draft.dst_ports.length === 0 ? 'liberado todas as portas' : draft.dst_ports.map(p => `${p.protocol !== 'TCP' ? p.protocol + '/' : ''}${p.port}${p.endPort ? `-${p.endPort}` : ''}`).join(', ')}`,
       labelStyle: { fontSize: 10, fill: '#c2410c', fontWeight: 700 },
       labelBgStyle: { fill: '#fff7ed', opacity: 0.95 },
       markerEnd: { type: 'arrowclosed' as const, color: '#f97316' },
@@ -727,7 +727,7 @@ function buildGraph(
       animated: true,
       pathOptions: { curvature: cur },
       style: { stroke: '#eab308', strokeWidth: 2.5, strokeDasharray: '6 3' },
-      label: `pendente ${quorum} :${(d.dst_ports ?? []).map(p => `${p.protocol !== 'TCP' ? p.protocol + '/' : ''}${p.port}`).join(', ') || '?'}`,
+      label: `pendente ${quorum}: ${(d.dst_ports ?? []).length === 0 ? 'todas as portas' : d.dst_ports.map(p => `${p.protocol !== 'TCP' ? p.protocol + '/' : ''}${p.port}${p.endPort ? `-${p.endPort}` : ''}`).join(', ')}`,
       labelStyle: { fontSize: 10, fill: '#854d0e', fontWeight: 700 },
       labelBgStyle: { fill: '#fefce8', opacity: 0.97 },
       markerEnd: { type: 'arrowclosed' as const, color: '#eab308' },
@@ -1008,7 +1008,7 @@ function ServiceDetailPanel({
   )
 }
 
-// ─── Flow explain panel — why a Hubble-observed DROPPED flow was blocked ───
+// ─── Flow explain panel: why a Hubble-observed DROPPED flow was blocked ───
 function parseServiceNodeId(id: string): { ns: string; name: string } | null {
   const parts = id.split('::')
   return parts[0] === 'svc' ? { ns: parts[1], name: parts[2] } : null
@@ -1293,14 +1293,14 @@ function NamespaceDetailPanel({
               <div style={{ fontSize: 9, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 3 }}>
                 Exceções
               </div>
-              <div style={{ fontSize: 10, color: '#94a3b8', fontStyle: 'italic' }}>Nenhuma — namespace totalmente fechada.</div>
+              <div style={{ fontSize: 10, color: '#94a3b8', fontStyle: 'italic' }}>Nenhuma: namespace totalmente fechada.</div>
             </div>
           )
           return (
             <div key="exceptions">
               <div style={{ borderTop: '1px solid #f1f5f9' }} />
               <div style={{ fontSize: 9, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>
-                Exceções — {ingressEx.length + egressEx.length} política(s) de allow
+                Exceções: {ingressEx.length + egressEx.length} política(s) de allow
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                 {ingressEx.map(p => (
@@ -1336,7 +1336,7 @@ function NamespaceDetailPanel({
           <>
             <div style={{ borderTop: '1px solid #f1f5f9' }} />
 
-            {/* Live toggles — shown whenever at least one direction is isolated */}
+            {/* Live toggles: shown whenever at least one direction is isolated */}
             {anyIsolated && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 <div style={{ fontSize: 9, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Opções de isolamento</div>
@@ -1357,7 +1357,7 @@ function NamespaceDetailPanel({
                     <span style={{ position: 'absolute', top: 2, left: hasIntraPolicy ? 18 : 2, width: 16, height: 16, borderRadius: '50%', background: 'white', transition: 'left 0.2s', display: 'block' }} />
                   </button>
                 </div>
-                {/* Internet egress toggle — only relevant when egress is isolated */}
+                {/* Internet egress toggle: only relevant when egress is isolated */}
                 {nsIsolatedEg && (
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 10px', borderRadius: 7, background: '#f8fafc', border: '1px solid #e2e8f0' }}>
                     <div>
@@ -1379,7 +1379,7 @@ function NamespaceDetailPanel({
               </div>
             )}
 
-            {/* Pre-apply options — shown only when not fully isolated yet */}
+            {/* Pre-apply options: shown only when not fully isolated yet */}
             {!fullyIsolated && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {!anyIsolated && (
@@ -1546,7 +1546,7 @@ function EditPolicyModal({
 
           <div style={{ marginBottom: 16 }}>
             <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 6 }}>
-              Portas
+              Portas <span style={{ color: '#94a3b8', fontWeight: 400 }}>(vazio = todas)</span>
             </label>
             {ports.map((ps, i) => (
               <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center' }}>
@@ -1557,12 +1557,17 @@ function EditPolicyModal({
                   <option value="SCTP">SCTP</option>
                 </select>
                 <input type="number" value={ps.port} min={1} max={65535}
-                  onChange={e => setPorts(prev => prev.map((p, j) => j === i ? { ...p, port: parseInt(e.target.value) || 1 } : p))}
+                  onChange={e => setPorts(prev => prev.map((p, j) => j === i ? { ...p, port: Math.min(65535, Math.max(1, parseInt(e.target.value) || 1)) } : p))}
                   style={{ flex: 1, border: '1px solid #cbd5e1', borderRadius: 6, padding: '6px 8px', fontSize: 13, boxSizing: 'border-box' }} />
-                {ports.length > 1 && (
-                  <button onClick={() => setPorts(prev => prev.filter((_, j) => j !== i))}
-                    style={{ background: '#fee2e2', color: '#dc2626', border: 'none', borderRadius: 5, cursor: 'pointer', padding: '5px 8px', fontSize: 12 }}>✕</button>
-                )}
+                <span style={{ fontSize: 9, color: '#94a3b8', flexShrink: 0 }}>até</span>
+                <input type="number" value={ps.endPort ?? ''} min={1} max={65535} placeholder="—"
+                  onChange={e => {
+                    const v = e.target.value === '' ? undefined : Math.min(65535, Math.max(1, parseInt(e.target.value) || 1))
+                    setPorts(prev => prev.map((p, j) => j === i ? { ...p, endPort: v } : p))
+                  }}
+                  style={{ flex: 1, border: '1px solid #cbd5e1', borderRadius: 6, padding: '6px 8px', fontSize: 13, boxSizing: 'border-box' }} />
+                <button onClick={() => setPorts(prev => prev.filter((_, j) => j !== i))}
+                  style={{ background: '#fee2e2', color: '#dc2626', border: 'none', borderRadius: 5, cursor: 'pointer', padding: '5px 8px', fontSize: 12 }}>✕</button>
               </div>
             ))}
             <button onClick={() => setPorts(prev => [...prev, { port: 80, protocol: 'TCP' as const }])}
@@ -1577,7 +1582,7 @@ function EditPolicyModal({
           <div style={{ display: 'flex', gap: 8 }}>
             <button
               onClick={handleSave}
-              disabled={saving}
+              disabled={saving || !ports.every(p => !p.endPort || p.endPort >= p.port)}
               style={{ flex: 1, background: saving ? '#93c5fd' : '#2563eb', color: 'white', border: 'none', borderRadius: 7, padding: '9px', fontSize: 12, fontWeight: 600, cursor: saving ? 'not-allowed' : 'pointer' }}
             >
               {saving ? 'Salvando…' : 'Salvar'}
@@ -1710,7 +1715,7 @@ function LayoutToolbar({
                     : saved ? 'Salvo' : 'Erro ao salvar'}
             </span>
 
-            {/* Salvar — admin only, quando tem rascunho ou está salvando local */}
+            {/* Salvar: admin only, quando tem rascunho ou está salvando local */}
             {(hasDraft || isSavingLocal) && isAdmin && (
               <button
                 onClick={onSaveLayout}
@@ -1722,7 +1727,7 @@ function LayoutToolbar({
                 Salvar
               </button>
             )}
-            {/* Descartar — todos os usuários */}
+            {/* Descartar: todos os usuários */}
             {dirty && (
               <button
                 onClick={onDiscardLayout}
@@ -1739,12 +1744,12 @@ function LayoutToolbar({
         </>
       )}
 
-      {/* ── Auto-save toggle — admin only ── */}
+      {/* ── Auto-save toggle: admin only ── */}
       {isAdmin && (
         <>
           <button
             onClick={onToggleAutosave}
-            title={autosave ? 'Auto-save ativo — clique para desativar' : 'Auto-save desativado — clique para ativar'}
+            title={autosave ? 'Auto-save ativo: clique para desativar' : 'Auto-save desativado: clique para ativar'}
             style={{ ...segStyle, height: '100%', background: 'none', border: 'none', cursor: 'pointer', gap: 7 }}
             onMouseEnter={e => (e.currentTarget.style.background = '#f8fafc')}
             onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}

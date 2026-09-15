@@ -157,7 +157,7 @@ export default function App() {
       })
       savedServiceLayoutsRef.current = dbLayouts
       if (!layoutInitialized.current) {
-        // First load: always start from DB — draft is restored later in didInitUserLayout
+        // First load: always start from DB: draft is restored later in didInitUserLayout
         setServiceLayouts(dbLayouts)
       } else if (pendingLayouts.current.size === 0 && !loadLayoutDraft()) {
         // Subsequent polls with no local changes → always reflect DB (picks up admin layout changes)
@@ -178,7 +178,7 @@ export default function App() {
         setLocalNsPositions(nsFromDB)
       }
 
-      // Namespace drag locks — default unlocked so services are draggable
+      // Namespace drag locks: default unlocked so services are draggable
       const locks: Record<string, boolean> = {}
       for (const ns of layoutData.namespaces) locks[ns] = false
       for (const row of layoutData.namespace_locks) locks[row.namespace] = row.locked
@@ -215,7 +215,7 @@ export default function App() {
         services: svcChanges,
         namespaces: nsEntries.map(([ns, pos]) => ({ namespace: ns, x: pos.x, y: pos.y })),
       })
-      // Update discard baselines (refs only — no state update, no re-render)
+      // Update discard baselines (refs only: no state update, no re-render)
       const svcMap = new Map(svcChanges.map(s => [`${s.namespace}::${s.service_name}`, s]))
       savedServiceLayoutsRef.current = savedServiceLayoutsRef.current.map(
         l => { const u = svcMap.get(`${l.namespace}::${l.service_name}`); return u ? { ...l, x: u.x, y: u.y } : l }
@@ -318,7 +318,7 @@ export default function App() {
             if (!canApprove) return
             setShowApprovalToast(true)
             if ('Notification' in window && Notification.permission === 'granted') {
-              new Notification('Floodgate — Nova aprovação', {
+              new Notification('Floodgate: Nova aprovação', {
                 body: 'Uma policy aguarda sua aprovação.',
                 icon: '/favicon.ico',
               })
@@ -656,7 +656,7 @@ export default function App() {
             </span>
           ))}
 
-          {/* Sync status pill — only when autosync has drift data */}
+          {/* Sync status pill: only when autosync has drift data */}
           {autosyncStatus && autosyncStatus.desired_count > 0 && autosyncStatus.drift !== null && (() => {
             const missingList = autosyncStatus.drift?.missing ?? []
             const missing = missingList.length
@@ -665,7 +665,7 @@ export default function App() {
             const title = inSync
               ? 'Todas as policies rastreadas estão no cluster'
               : nsGone > 0
-                ? `${missing} policy(s) ausente(s) — ${nsGone} com namespace inexistente (não podem ser restauradas)`
+                ? `${missing} policy(s) ausente(s): ${nsGone} com namespace inexistente (não podem ser restauradas)`
                 : `${missing} policy(s) ausente(s) no cluster`
             return (
               <span title={title} style={{
@@ -694,7 +694,7 @@ export default function App() {
               {/* Global lock */}
               <button
                 onClick={() => handleGlobalLock(!globalLayoutLocked)}
-                title={globalLayoutLocked ? 'Layout bloqueado — clique para desbloquear' : 'Bloquear layout (ninguém arrasta)'}
+                title={globalLayoutLocked ? 'Layout bloqueado: clique para desbloquear' : 'Bloquear layout (ninguém arrasta)'}
                 style={{
                   width: 30, height: 30, borderRadius: 7, border: `1px solid ${globalLayoutLocked ? '#fbbf24' : '#e2e8f0'}`,
                   background: globalLayoutLocked ? '#fffbeb' : 'none', cursor: 'pointer',
@@ -709,7 +709,7 @@ export default function App() {
                   }
                 </svg>
               </button>
-              {/* Save status spinner — always visible when saving/saved/error */}
+              {/* Save status spinner: always visible when saving/saved/error */}
               <SaveSpinner status={layoutSaveStatus} />
             </div>
           )}
@@ -767,7 +767,7 @@ export default function App() {
                 </a>
               )}
 
-              {/* Avatar + name — clica para trocar senha */}
+              {/* Avatar + name: clica para trocar senha */}
               <button
                 onClick={() => setOpenPasswordModal(true)}
                 title="Trocar senha"
@@ -866,8 +866,8 @@ export default function App() {
             }}>
               <span>
                 {allNamespaces.length - visibleNamespaces.size === 1
-                  ? '1 namespace oculto — conexões não exibidas'
-                  : `${allNamespaces.length - visibleNamespaces.size} namespaces ocultos — conexões não exibidas`}
+                  ? '1 namespace oculto: conexões não exibidas'
+                  : `${allNamespaces.length - visibleNamespaces.size} namespaces ocultos: conexões não exibidas`}
               </span>
               <button
                 onClick={showAllNamespaces}

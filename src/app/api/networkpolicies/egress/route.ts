@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createEgressNetworkPolicy, getPolicyYAML } from '@/lib/k8s'
 import { getCurrentUser, canManageNamespace } from '@/lib/auth'
 import { isNamespaceWatched } from '@/lib/config'
-import { apiError, parseBody } from '@/lib/api-helpers'
+import { apiError, parseBody, invalidPortsMessage } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { saveManagedPolicy } from '@/lib/autosync'
 import { emit } from '@/lib/sse'
@@ -18,6 +18,8 @@ export async function POST(req: NextRequest) {
   if (!body.dst_namespace || !body.src_namespace || !body.dst_service) {
     return NextResponse.json({ detail: 'dst_namespace, src_namespace e dst_service são obrigatórios' }, { status: 400 })
   }
+  const portsError = invalidPortsMessage(body.dst_ports)
+  if (portsError) return NextResponse.json({ detail: portsError }, { status: 400 })
   // Egress policy is created in src_namespace
   if (!isNamespaceWatched(body.src_namespace as string)) {
     return NextResponse.json({ detail: 'Namespace fora do escopo gerenciado pelo floodgate' }, { status: 400 })

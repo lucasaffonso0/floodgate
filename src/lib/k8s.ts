@@ -37,7 +37,7 @@ const networking = kc.makeApiClient(k8s.NetworkingV1Api)
 
 // @kubernetes/client-node models V1NetworkPolicyIngressRule.from as `_from`
 // (its JS identifier), since it's serialized back to `from` only through the
-// client's own ObjectSerializer — never when we hand the raw object to
+// client's own ObjectSerializer: never when we hand the raw object to
 // yaml.dump directly. Rename before dumping any spec read from the API.
 function yamlSafeSpec(spec: k8s.V1NetworkPolicySpec | undefined): unknown {
   if (!spec) return spec
@@ -96,10 +96,10 @@ export async function listServices(): Promise<ServiceInfo[]> {
 
 function selectorOf(svc: k8s.V1Service, name: string, namespace: string): Record<string, string> {
   const sel = svc.spec?.selector
-  // An empty matchLabels selects ALL pods in the namespace — a policy meant
+  // An empty matchLabels selects ALL pods in the namespace: a policy meant
   // for one service would silently become namespace-wide.
   if (!sel || Object.keys(sel).length === 0) {
-    throw new UserFacingError(`Service ${namespace}/${name} não possui selector — não é possível criar política restrita a ele`)
+    throw new UserFacingError(`Service ${namespace}/${name} não possui selector: não é possível criar política restrita a ele`)
   }
   return sel as Record<string, string>
 }
@@ -133,10 +133,10 @@ async function resolveTargetPortFromService(svc: k8s.V1Service, namespace: strin
         }
       }
     } catch (e) {
-      throw new UserFacingError(`Não foi possível listar pods para resolver a targetPort nomeada "${target}" de ${namespace}/${svcName} — verifique se o RBAC inclui "pods" (${getK8sStatus(e) ?? 'erro'})`, 500)
+      throw new UserFacingError(`Não foi possível listar pods para resolver a targetPort nomeada "${target}" de ${namespace}/${svcName}: verifique se o RBAC inclui "pods" (${getK8sStatus(e) ?? 'erro'})`, 500)
     }
   }
-  throw new UserFacingError(`Não foi possível resolver a targetPort nomeada "${target}" do service ${namespace}/${svcName} — nenhum pod com containerPort correspondente`)
+  throw new UserFacingError(`Não foi possível resolver a targetPort nomeada "${target}" do service ${namespace}/${svcName}: nenhum pod com containerPort correspondente`)
 }
 
 async function resolveTargetPort(svcName: string, namespace: string, servicePort: number): Promise<number> {
@@ -198,12 +198,15 @@ export async function listNetworkPolicies(allPolicies = false): Promise<NetworkP
 
     if (managed) {
       const policyType = (labels['floodgate-policy-type'] ?? 'allow') as NetworkPolicyInfo['policy_type']
-      const rawPorts = policyType === 'allow-egress'
+      const rawPorts = policyType === 'allow-egress' || policyType === 'cidr-egress'
         ? (spec.egress?.find((r: k8s.V1NetworkPolicyEgressRule) => r.to && r.to.length > 0)?.ports ?? [])
         : (spec.ingress?.[0]?.ports ?? [])
       const specPorts: PortSpec[] = (rawPorts as k8s.V1NetworkPolicyPort[])
         .filter(pp => pp.port !== undefined && pp.port !== 53)
-        .map(pp => ({ port: Number(pp.port), protocol: (pp.protocol ?? 'TCP') as 'TCP' | 'UDP' | 'SCTP' }))
+        .map(pp => ({
+          port: Number(pp.port), protocol: (pp.protocol ?? 'TCP') as 'TCP' | 'UDP' | 'SCTP',
+          ...(pp.endPort !== undefined ? { endPort: Number(pp.endPort) } : {}),
+        }))
       const firstPort = parseInt(labels['target-port'] ?? '0') || 0
       const dst_ports = specPorts.length > 0 ? specPorts : (firstPort ? [{ port: firstPort, protocol: 'TCP' as const }] : [])
       return {
@@ -251,11 +254,13 @@ export async function createNetworkPolicy(req: CreatePolicyRequest): Promise<Net
   ])
   const dstSelector = selectorOf(dstSvc, req.dst_service, req.dst_namespace)
 
+  // A ranged port (endPort) has no single Service port to resolve against —
+  // skip resolution for it and match the raw range directly on the pod.
   const resolvedPorts = await Promise.all(
-    req.dst_ports.map(async ps => ({
-      port: await resolveTargetPortFromService(dstSvc, req.dst_namespace, ps.port),
-      protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP',
-    }))
+    req.dst_ports.map(async ps => ps.endPort !== undefined
+      ? { port: ps.port, endPort: ps.endPort, protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP' }
+      : { port: await resolveTargetPortFromService(dstSvc, req.dst_namespace, ps.port), protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP' }
+    )
   )
 
   const firstPort = req.dst_ports[0]?.port ?? 0
@@ -322,10 +327,10 @@ export async function createEgressNetworkPolicy(req: CreatePolicyRequest): Promi
   const dstSelector = selectorOf(dstSvc, req.dst_service, req.dst_namespace)
 
   const resolvedPorts = await Promise.all(
-    req.dst_ports.map(async ps => ({
-      port: await resolveTargetPortFromService(dstSvc, req.dst_namespace, ps.port),
-      protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP',
-    }))
+    req.dst_ports.map(async ps => ps.endPort !== undefined
+      ? { port: ps.port, endPort: ps.endPort, protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP' }
+      : { port: await resolveTargetPortFromService(dstSvc, req.dst_namespace, ps.port), protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP' }
+    )
   )
   const firstPort = req.dst_ports[0]?.port ?? 0
 
@@ -445,7 +450,7 @@ export async function deleteNetworkPolicy(namespace: string, name: string): Prom
 }
 
 export async function patchNetworkPolicyPort(
-  namespace: string, name: string, newPorts: Array<{ port: number; protocol: 'TCP' | 'UDP' | 'SCTP' }>,
+  namespace: string, name: string, newPorts: Array<{ port: number; protocol: 'TCP' | 'UDP' | 'SCTP'; endPort?: number }>,
 ): Promise<NetworkPolicyInfo> {
   const existing = await networking.readNamespacedNetworkPolicy({ name, namespace })
   const labels = existing.metadata?.labels ?? {}
@@ -456,7 +461,7 @@ export async function patchNetworkPolicyPort(
   }
 
   // Create/replace the new policy FIRST, then remove the old one only if the
-  // name changed (adopted policies) — deleting first would leave the workload
+  // name changed (adopted policies): deleting first would leave the workload
   // unprotected if the recreate fails midway.
   let result: NetworkPolicyInfo
   if (policyType === 'allow') {
@@ -573,7 +578,7 @@ export async function isolateNamespace(req: IsolateNamespaceRequest): Promise<{ 
       await networking.createNamespacedNetworkPolicy({ namespace: req.namespace, body })
       created++
     } catch (e) {
-      // Only "already exists" counts as skipped — RBAC/validation failures must surface
+      // Only "already exists" counts as skipped: RBAC/validation failures must surface
       if (getK8sStatus(e) === 409) skipped++
       else throw e
     }
@@ -659,7 +664,7 @@ export async function isolateNamespace(req: IsolateNamespaceRequest): Promise<{ 
       await networking.createNamespacedNetworkPolicy({ namespace: req.namespace, body })
       created++
     } catch (e) {
-      // Only "already exists" counts as skipped — RBAC/validation failures must surface
+      // Only "already exists" counts as skipped: RBAC/validation failures must surface
       if (getK8sStatus(e) === 409) skipped++
       else throw e
     }
@@ -674,7 +679,10 @@ export async function createCidrPolicy(req: CidrPolicyRequest): Promise<NetworkP
   const podSelector = service_name ? await getServiceSelector(service_name, namespace) : {}
 
   const kPorts = (dst_ports?.length ?? 0) > 0
-    ? dst_ports!.map(p => ({ protocol: p.protocol as string, port: p.port as unknown as number }))
+    ? dst_ports!.map(p => ({
+        protocol: p.protocol as string, port: p.port as unknown as number,
+        ...(p.endPort !== undefined ? { endPort: p.endPort as unknown as number } : {}),
+      }))
     : undefined
 
   const ipBlock: k8s.V1IPBlock = { cidr, ...(except?.length ? { except } : {}) }
@@ -728,10 +736,10 @@ export async function previewPolicyYAML(
   const dstSelector = selectorOf(dstSvc, req.dst_service, req.dst_namespace)
 
   const resolvedPorts = await Promise.all(
-    req.dst_ports.map(async ps => ({
-      port: await resolveTargetPortFromService(dstSvc, req.dst_namespace, ps.port),
-      protocol: ps.protocol,
-    }))
+    req.dst_ports.map(async ps => ps.endPort !== undefined
+      ? { port: ps.port, endPort: ps.endPort, protocol: ps.protocol }
+      : { port: await resolveTargetPortFromService(dstSvc, req.dst_namespace, ps.port), protocol: ps.protocol }
+    )
   )
 
   const docs: object[] = []

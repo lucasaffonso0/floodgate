@@ -8,7 +8,7 @@ import '@/lib/scheduler'
 const SELF_NAMESPACE = 'floodgate'
 
 export async function GET() {
-  // getCurrentUser revalidates token_version against the DB — the middleware
+  // getCurrentUser revalidates token_version against the DB: the middleware
   // only verifies the JWT signature, so revoked sessions would pass it.
   const user = await getCurrentUser()
   if (!user) return NextResponse.json({ detail: 'Unauthorized' }, { status: 401 })

@@ -195,7 +195,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
 
     logAudit({ user_id: user.sub, username: user.username, action: 'approve_vote', resource_type: 'ApprovalRequest', resource_name: id })
 
-    // Auto-apply when quorum is reached — the approval workflow is the authorization mechanism,
+    // Auto-apply when quorum is reached: the approval workflow is the authorization mechanism,
     // so the policy is applied regardless of the individual voter's namespace permissions.
     const updated = getRequest(id)!
     let autoApplyError: string | null = null

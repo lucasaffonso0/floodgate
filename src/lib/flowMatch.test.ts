@@ -78,7 +78,7 @@ describe('flowHasPolicy', () => {
     expect(flowHasPolicy(flow, policies)).toBe(true)
   })
 
-  it('ignores a restrict-ingress/egress policy anywhere in the namespace — it is why traffic is dropped, not proof it is covered', () => {
+  it('ignores a restrict-ingress/egress policy anywhere in the namespace: it is why traffic is dropped, not proof it is covered', () => {
     const policies = [
       policy({ policy_type: 'restrict-ingress', namespace: 'backend', dst_service: '' }),
       policy({ policy_type: 'restrict-ingress', namespace: 'backend', dst_service: 'worker' }),

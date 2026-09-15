@@ -16,7 +16,7 @@ const IP_MAX_ATTEMPTS  = 30          // stricter limit per IP (covers credential
 
 const SWEEP_INTERVAL_MS = 5 * 60_000
 
-// Opportunistic sweep of expired buckets — the map is otherwise only cleaned
+// Opportunistic sweep of expired buckets: the map is otherwise only cleaned
 // on successful login, so failed attempts with random usernames/IPs would
 // grow it without bound (memory-exhaustion DoS).
 function sweepExpired(now: number) {

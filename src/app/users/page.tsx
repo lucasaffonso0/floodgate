@@ -319,10 +319,10 @@ export default function UsersPage() {
             </div>
 
             <div style={{ background: '#f8fafc', borderRadius: 8, padding: '10px 14px', marginBottom: 14, fontSize: 12, color: '#64748b' }}>
-              <strong>Viewer</strong> — visualiza o painel, não pode criar nem remover nada.<br/>
-              <strong>Audit</strong> — visualiza policies e logs de auditoria, somente leitura.<br/>
-              <strong>NS Admin</strong> — gerencia policies em namespaces específicos (atribua namespaces após criar).<br/>
-              <strong>Admin</strong> — acesso total: policies, usuários e configurações.
+              <strong>Viewer</strong>: visualiza o painel, não pode criar nem remover nada.<br/>
+              <strong>Audit</strong>: visualiza policies e logs de auditoria, somente leitura.<br/>
+              <strong>NS Admin</strong>: gerencia policies em namespaces específicos (atribua namespaces após criar).<br/>
+              <strong>Admin</strong>: acesso total: policies, usuários e configurações.
             </div>
 
             {formError && (
@@ -339,7 +339,7 @@ export default function UsersPage() {
         </div>
       </div>
 
-      {/* Password modal — admin resets, no current_password required */}
+      {/* Password modal: admin resets, no current_password required */}
       <PasswordModal
         open={passwordModal !== null}
         username={passwordModal?.username ?? ''}

@@ -9,7 +9,7 @@ export function normalizeWorkload(workload: string): string {
 }
 
 // Only an ALLOW-type policy that covers this exact src → dst:port means
-// "nothing to create here" — a restrict-ingress/egress anywhere in the
+// "nothing to create here": a restrict-ingress/egress anywhere in the
 // namespace is why traffic gets dropped in the first place, and an allow
 // that covers a *different* source doesn't cover this one.
 export function flowHasPolicy(

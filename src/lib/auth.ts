@@ -92,7 +92,7 @@ export async function canManageNamespace(userId: string, role: string, namespace
   return !!perm
 }
 
-// Pre-computed hash used only when the username doesn't exist — ensures bcrypt always runs
+// Pre-computed hash used only when the username doesn't exist: ensures bcrypt always runs
 // to prevent user enumeration via response timing differences.
 const DUMMY_HASH = '$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy'
 

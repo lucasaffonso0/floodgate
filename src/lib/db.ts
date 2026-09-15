@@ -21,7 +21,7 @@ function initDb(): DbType {
 
   // ── Migration: widen users.role CHECK constraint (ns_admin, audit) ────────
   // Recreates the table with the full current schema and copies only the
-  // columns both versions share — SELECT * would break if the old table has
+  // columns both versions share: SELECT * would break if the old table has
   // extra columns, and OR IGNORE would silently drop rows.
   const usersSchema = (db.prepare(
     "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"

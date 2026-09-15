@@ -36,7 +36,7 @@ export async function middleware(req: NextRequest) {
           { status: 403 }
         )
       }
-      // Page requests pass through — frontend shows the forced modal
+      // Page requests pass through: frontend shows the forced modal
     }
 
     return NextResponse.next()

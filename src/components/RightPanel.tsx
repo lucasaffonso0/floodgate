@@ -22,7 +22,7 @@ function generateYAML(draft: Draft, services: ServiceInfo[]): string {
       ? `\n        except:\n${draft.cidr_except.map(e => `        - ${e}`).join('\n')}`
       : ''
     const portsYaml = draft.dst_ports.length
-      ? `\n      ports:\n${draft.dst_ports.map(p => `      - protocol: ${p.protocol}\n        port: ${p.port}`).join('\n')}`
+      ? `\n      ports:\n${draft.dst_ports.map(p => `      - protocol: ${p.protocol}\n        port: ${p.port}${p.endPort ? `\n        endPort: ${p.endPort}` : ''}`).join('\n')}`
       : ''
     const svcTarget = draft.dst_service ? `\n    matchLabels:\n      app: ${draft.dst_service}` : ': {}'
     return `apiVersion: networking.k8s.io/v1
@@ -47,10 +47,12 @@ spec:
   const srcSel = Object.entries(src?.selector ?? {}).map(([k, v]) => `              ${k}: "${v}"`).join('\n') || '              {}'
   const dstSel = Object.entries(dst?.selector ?? {}).map(([k, v]) => `      ${k}: "${v}"`).join('\n') || '      {}'
   const name = `floodgate-allow-${draft.src_workload}-${draft.src_namespace}-to-${draft.dst_service}`.slice(0, 63)
-  const portsYaml = draft.dst_ports.map(p => `        - protocol: ${p.protocol}\n          port: ${p.port}`).join('\n')
-  const ingressYaml = `apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: ${name}\n  namespace: ${draft.dst_namespace}\n  labels:\n    managed-by: floodgate\nspec:\n  podSelector:\n    matchLabels:\n${dstSel}\n  policyTypes:\n    - Ingress\n  ingress:\n    - from:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: ${draft.src_namespace}\n          podSelector:\n            matchLabels:\n${srcSel}\n      ports:\n${portsYaml}`
+  const portsYaml = draft.dst_ports.length
+    ? `\n      ports:\n${draft.dst_ports.map(p => `        - protocol: ${p.protocol}\n          port: ${p.port}${p.endPort ? `\n          endPort: ${p.endPort}` : ''}`).join('\n')}`
+    : ''
+  const ingressYaml = `apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: ${name}\n  namespace: ${draft.dst_namespace}\n  labels:\n    managed-by: floodgate\nspec:\n  podSelector:\n    matchLabels:\n${dstSel}\n  policyTypes:\n    - Ingress\n  ingress:\n    - from:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: ${draft.src_namespace}\n          podSelector:\n            matchLabels:\n${srcSel}${portsYaml}`
   const egressName = `floodgate-egress-${draft.src_workload}-to-${draft.dst_service}`.slice(0, 63)
-  const egressYaml = `apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: ${egressName}\n  namespace: ${draft.src_namespace}\n  labels:\n    managed-by: floodgate\nspec:\n  podSelector:\n    matchLabels:\n${srcSel}\n  policyTypes:\n    - Egress\n  egress:\n    - to:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: ${draft.dst_namespace}\n          podSelector:\n            matchLabels:\n${dstSel}\n      ports:\n${portsYaml}`
+  const egressYaml = `apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: ${egressName}\n  namespace: ${draft.src_namespace}\n  labels:\n    managed-by: floodgate\nspec:\n  podSelector:\n    matchLabels:\n${srcSel}\n  policyTypes:\n    - Egress\n  egress:\n    - to:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: ${draft.dst_namespace}\n          podSelector:\n            matchLabels:\n${dstSel}${portsYaml}`
   if (draft.policy_direction === 'egress') return egressYaml
   if (draft.policy_direction === 'both') return `${ingressYaml}\n---\n${egressYaml}`
   return ingressYaml
@@ -269,9 +271,10 @@ function NewDraftModal({ services, ciliumFlows, onAdd, onClose }: {
 
   const cidrValid = /^[\d.a-fA-F:]+\/\d{1,3}$/.test(cidrValue.trim())
   const isCidr = srcCidr || dstCidr
+  const portsValid = ports.every(p => p.port >= 1 && p.port <= 65535 && (!p.endPort || (p.endPort >= p.port && p.endPort <= 65535)))
   const canSubmit = isCidr
-    ? (cidrValid && (dstCidr ? !!dstNs : !!srcNs))
-    : (!!srcNs.trim() && !!srcSvc.trim() && !!dstNs.trim() && !!dstSvc.trim() && ports.length > 0 && ports.every(p => p.port >= 1 && p.port <= 65535))
+    ? (cidrValid && (dstCidr ? !!dstNs : !!srcNs) && portsValid)
+    : (!!srcNs.trim() && !!srcSvc.trim() && !!dstNs.trim() && !!dstSvc.trim() && portsValid)
 
   function handleDirChange(d: 'ingress' | 'egress' | 'both') {
     setDir(d)
@@ -319,7 +322,7 @@ function NewDraftModal({ services, ciliumFlows, onAdd, onClose }: {
         <div style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0', padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div>
             <div style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>Nova política</div>
-            <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1 }}>Cria um rascunho — aplique depois</div>
+            <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1 }}>Cria um rascunho: aplique depois</div>
           </div>
           <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#94a3b8', fontSize: 18, lineHeight: 1, padding: 2 }}>✕</button>
         </div>
@@ -435,7 +438,7 @@ function NewDraftModal({ services, ciliumFlows, onAdd, onClose }: {
 
           {/* Ports */}
           <div>
-            <label style={labelStyle}>Portas {isCidr && <span style={{ color: '#94a3b8', fontWeight: 400 }}>(vazio = todas)</span>}</label>
+            <label style={labelStyle}>Portas <span style={{ color: '#94a3b8', fontWeight: 400 }}>(vazio = todas)</span></label>
             {ports.map((ps, i) => (
               <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center' }}>
                 <select value={ps.protocol} onChange={e => setPorts(prev => prev.map((p, j) => j === i ? { ...p, protocol: e.target.value as PortSpec['protocol'] } : p))}
@@ -445,8 +448,16 @@ function NewDraftModal({ services, ciliumFlows, onAdd, onClose }: {
                   <option value="SCTP">SCTP</option>
                 </select>
                 <input type="number" value={ps.port} min={1} max={65535}
-                  onChange={e => setPorts(prev => prev.map((p, j) => j === i ? { ...p, port: parseInt(e.target.value) || 1 } : p))}
-                  style={{ ...inputStyle, width: 80 }} />
+                  onChange={e => setPorts(prev => prev.map((p, j) => j === i ? { ...p, port: Math.min(65535, Math.max(1, parseInt(e.target.value) || 1)) } : p))}
+                  style={{ ...inputStyle, width: 70 }} />
+                <span style={{ fontSize: 10, color: '#94a3b8' }}>até</span>
+                <input type="number" value={ps.endPort ?? ''} min={1} max={65535} placeholder="—"
+                  title="Faixa de portas opcional: deixe em branco pra porta única"
+                  onChange={e => {
+                    const v = e.target.value === '' ? undefined : Math.min(65535, Math.max(1, parseInt(e.target.value) || 1))
+                    setPorts(prev => prev.map((p, j) => j === i ? { ...p, endPort: v } : p))
+                  }}
+                  style={{ ...inputStyle, width: 70 }} />
                 <button onClick={() => setPorts(prev => prev.filter((_, j) => j !== i))}
                   style={{ background: '#fee2e2', color: '#dc2626', border: 'none', borderRadius: 5, cursor: 'pointer', padding: '4px 7px', fontSize: 11 }}>✕</button>
               </div>
@@ -455,7 +466,7 @@ function NewDraftModal({ services, ciliumFlows, onAdd, onClose }: {
               style={{ ...inputStyle, width: 'auto', background: '#f1f5f9', color: '#475569', cursor: 'pointer', border: '1px dashed #cbd5e1', fontSize: 10, fontWeight: 600, padding: '4px 10px' }}>
               + Adicionar porta
             </button>
-            {isCidr && ports.length > 0 && (
+            {ports.length > 0 && (
               <button onClick={() => setPorts([])}
                 style={{ ...inputStyle, width: 'auto', background: 'transparent', color: '#94a3b8', cursor: 'pointer', border: 'none', fontSize: 10, padding: '4px 10px' }}>
                 Limpar (todas as portas)
@@ -572,6 +583,7 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
                   <span style={{ fontSize: 11, fontWeight: 600, color: '#16a34a', background: '#f0fdf4', borderRadius: 4, padding: '1px 6px' }}>{draft.dst_namespace}/{draft.dst_service}</span>
                 </div>
                 <div style={{ marginBottom: 8 }}>
+                  <div style={{ fontSize: 9, color: '#94a3b8', marginBottom: 3 }}>Portas (vazio = todas)</div>
                   {draft.dst_ports.map((ps, i) => (
                     <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
                       <select value={ps.protocol} onChange={e => {
@@ -583,15 +595,23 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
                         <option value="SCTP">SCTP</option>
                       </select>
                       <input type="number" value={ps.port} min={1} max={65535} onChange={e => {
-                        const next = draft.dst_ports.map((p, j) => j === i ? { ...p, port: parseInt(e.target.value) || 80 } : p)
+                        const next = draft.dst_ports.map((p, j) => j === i ? { ...p, port: Math.min(65535, Math.max(1, parseInt(e.target.value) || 1)) } : p)
                         onUpdatePort(draft.id, next)
-                      }} style={{ width: 60, border: '1px solid #cbd5e1', borderRadius: 5, padding: '3px 6px', fontSize: 11 }} />
-                      {draft.dst_ports.length > 1 && (
-                        <button onClick={() => onUpdatePort(draft.id, draft.dst_ports.filter((_, j) => j !== i))}
-                          style={{ ...btn.base, ...btn.red, padding: '2px 6px' }}><Icon.Trash /></button>
-                      )}
+                      }} style={{ width: 55, border: '1px solid #cbd5e1', borderRadius: 5, padding: '3px 6px', fontSize: 11 }} />
+                      <span style={{ fontSize: 9, color: '#94a3b8' }}>até</span>
+                      <input type="number" value={ps.endPort ?? ''} min={1} max={65535} placeholder="—" onChange={e => {
+                        const v = e.target.value === '' ? undefined : Math.min(65535, Math.max(1, parseInt(e.target.value) || 1))
+                        const next = draft.dst_ports.map((p, j) => j === i ? { ...p, endPort: v } : p)
+                        onUpdatePort(draft.id, next)
+                      }} style={{ width: 55, border: '1px solid #cbd5e1', borderRadius: 5, padding: '3px 6px', fontSize: 11 }} />
+                      <button onClick={() => onUpdatePort(draft.id, draft.dst_ports.filter((_, j) => j !== i))}
+                        title={draft.dst_ports.length === 1 ? 'Remover: vai liberar todas as portas' : 'Remover porta'}
+                        style={{ ...btn.base, ...btn.red, padding: '2px 6px' }}><Icon.Trash /></button>
                     </div>
                   ))}
+                  {draft.dst_ports.length === 0 && (
+                    <div style={{ fontSize: 10, color: '#94a3b8', marginBottom: 4 }}>Sem portas: libera todas</div>
+                  )}
                   <button onClick={() => onUpdatePort(draft.id, [...draft.dst_ports, { port: 80, protocol: 'TCP' as const }])}
                     style={{ ...btn.base, ...btn.gray, fontSize: 10, padding: '2px 8px', marginTop: 2 }}>
                     <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -607,7 +627,7 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
                 </div>
               </div>
 
-              {/* Approver picker — shown when approval is enabled and user clicked the button */}
+              {/* Approver picker: shown when approval is enabled and user clicked the button */}
               {isPicker && (
                 <div style={{ margin: '0 14px 10px', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 12px' }}>
                   <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 8 }}>
@@ -704,7 +724,7 @@ function PolicyEditModal({ policy, onClose, onSaved }: {
             <code style={{ background: '#f0fdf4', color: '#16a34a', padding: '2px 5px', borderRadius: 4, fontSize: 10 }}>{policy.namespace}/{policy.dst_service}</code>
           </div>
           <div style={{ marginBottom: 14 }}>
-            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 6 }}>Portas</label>
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 6 }}>Portas <span style={{ color: '#94a3b8', fontWeight: 400 }}>(vazio = todas)</span></label>
             {ports.map((ps, i) => (
               <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center' }}>
                 <select value={ps.protocol} onChange={e => setPorts(prev => prev.map((p, j) => j === i ? { ...p, protocol: e.target.value as PortSpec['protocol'] } : p))}
@@ -714,12 +734,17 @@ function PolicyEditModal({ policy, onClose, onSaved }: {
                   <option value="SCTP">SCTP</option>
                 </select>
                 <input type="number" value={ps.port} min={1} max={65535}
-                  onChange={e => setPorts(prev => prev.map((p, j) => j === i ? { ...p, port: parseInt(e.target.value) || 1 } : p))}
+                  onChange={e => setPorts(prev => prev.map((p, j) => j === i ? { ...p, port: Math.min(65535, Math.max(1, parseInt(e.target.value) || 1)) } : p))}
                   style={{ ...inputStyle, flex: 1 }} />
-                {ports.length > 1 && (
-                  <button onClick={() => setPorts(prev => prev.filter((_, j) => j !== i))}
-                    style={{ background: '#fee2e2', color: '#dc2626', border: 'none', borderRadius: 5, cursor: 'pointer', padding: '5px 8px', fontSize: 12 }}>✕</button>
-                )}
+                <span style={{ fontSize: 9, color: '#94a3b8', flexShrink: 0 }}>até</span>
+                <input type="number" value={ps.endPort ?? ''} min={1} max={65535} placeholder="—"
+                  onChange={e => {
+                    const v = e.target.value === '' ? undefined : Math.min(65535, Math.max(1, parseInt(e.target.value) || 1))
+                    setPorts(prev => prev.map((p, j) => j === i ? { ...p, endPort: v } : p))
+                  }}
+                  style={{ ...inputStyle, flex: 1 }} />
+                <button onClick={() => setPorts(prev => prev.filter((_, j) => j !== i))}
+                  style={{ background: '#fee2e2', color: '#dc2626', border: 'none', borderRadius: 5, cursor: 'pointer', padding: '5px 8px', fontSize: 12 }}>✕</button>
               </div>
             ))}
             <button onClick={() => setPorts(prev => [...prev, { port: 80, protocol: 'TCP' as const }])}
@@ -729,7 +754,7 @@ function PolicyEditModal({ policy, onClose, onSaved }: {
             <div style={{ fontSize: 10, color: '#f59e0b', marginTop: 6 }}>A policy será recriada ao salvar.</div>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
-            <button onClick={handleSave} disabled={saving}
+            <button onClick={handleSave} disabled={saving || !ports.every(p => !p.endPort || p.endPort >= p.port)}
               style={{ flex: 1, background: saving ? '#93c5fd' : '#2563eb', color: 'white', border: 'none', borderRadius: 7, padding: '9px', fontSize: 12, fontWeight: 600, cursor: saving ? 'not-allowed' : 'pointer' }}>
               {saving ? 'Salvando…' : 'Salvar'}
             </button>
@@ -876,7 +901,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   useEffect(() => { loadOrphanedManaged() }, [loadOrphanedManaged, policies])
 
   async function handleRemoveOrphanManaged(ns: string, name: string) {
-    if (!confirm(`Remover "${name}" do rastreamento? O namespace "${ns}" não existe mais — esta policy nunca será restaurada.`)) return
+    if (!confirm(`Remover "${name}" do rastreamento? O namespace "${ns}" não existe mais: esta policy nunca será restaurada.`)) return
     setRemovingOrphan(`${ns}/${name}`)
     try {
       await removeOrphanedManagedPolicy(ns, name)
@@ -889,7 +914,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   }
 
   async function handleRemoveAllOrphanManaged() {
-    if (!confirm(`Remover ${orphanedManaged.length} policy(s) órfã(s) do rastreamento? Os namespaces não existem mais — elas nunca serão restauradas.`)) return
+    if (!confirm(`Remover ${orphanedManaged.length} policy(s) órfã(s) do rastreamento? Os namespaces não existem mais: elas nunca serão restauradas.`)) return
     setRemovingOrphan('*')
     try {
       await Promise.all(orphanedManaged.map(p => removeOrphanedManagedPolicy(p.namespace, p.name).catch(() => {})))
@@ -926,7 +951,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
     onRefresh(); await loadPaused()
   }
 
-  // Active policy keys (used to deduplicate paused list — if a policy survived pause deletion it appears in both)
+  // Active policy keys (used to deduplicate paused list: if a policy survived pause deletion it appears in both)
   const activePolicyKeys = new Set(policies.map(p => `${p.namespace}/${p.name}`))
 
   // Filter helpers
@@ -943,7 +968,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
     grouped.get(p.namespace)!.push(p)
   }
 
-  // Group filtered paused policies by namespace (exclude any that also appear as active — pause deletion failed)
+  // Group filtered paused policies by namespace (exclude any that also appear as active: pause deletion failed)
   const pausedByNs = new Map<string, PausedPolicy[]>()
   for (const p of paused.filter(matchPaused).filter(p => !activePolicyKeys.has(`${p.namespace}/${p.name}`))) {
     if (!pausedByNs.has(p.namespace)) pausedByNs.set(p.namespace, [])
@@ -1000,7 +1025,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
         {orphaned.length > 0 && (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fff1f2', border: '1px solid #fecdd3', borderRadius: 6, padding: '5px 8px', marginBottom: 6 }}>
             <span style={{ fontSize: 10, color: '#dc2626', fontWeight: 600 }}>
-              {orphaned.length} obsoleta(s) — serviço removido do cluster
+              {orphaned.length} obsoleta(s): serviço removido do cluster
             </span>
             {isAdmin && (
               <button style={{ ...btn.base, ...btn.red, padding: '2px 7px', fontSize: 9 }} onClick={handleCleanupOrphaned}>
@@ -1038,7 +1063,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
           </div>
         )}
 
-        {/* Policies grouped by namespace — active + paused inline */}
+        {/* Policies grouped by namespace: active + paused inline */}
         {allNs.map(ns => {
           const nsPolicies = grouped.get(ns) ?? []
           const nsPaused   = pausedByNs.get(ns) ?? []
@@ -1083,10 +1108,10 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
                                   <button style={{ ...btn.base, ...btn.gray, padding: '3px 7px', fontSize: 10 }} title="Editar portas" onClick={() => setEditingPolicy(p)}><Icon.Edit /></button>
                                 )}
                                 {p.adopted && (
-                                  <button style={{ ...btn.base, ...btn.orange, padding: '3px 7px', fontSize: 10 }} title="Desadotar — remove do Floodgate mas mantém no cluster" onClick={() => handleUnadopt(p)}>↩ Desadotar</button>
+                                  <button style={{ ...btn.base, ...btn.orange, padding: '3px 7px', fontSize: 10 }} title="Desadotar: remove do Floodgate mas mantém no cluster" onClick={() => handleUnadopt(p)}>↩ Desadotar</button>
                                 )}
                                 {isAdmin && (
-                                  <button style={{ ...btn.base, ...btn.orange, padding: '3px 7px', fontSize: 10 }} title="Pausar — salva no DB e remove do cluster" onClick={() => handlePauseOne(p.namespace, p.name)}>⏸</button>
+                                  <button style={{ ...btn.base, ...btn.orange, padding: '3px 7px', fontSize: 10 }} title="Pausar: salva no DB e remove do cluster" onClick={() => handlePauseOne(p.namespace, p.name)}>⏸</button>
                                 )}
                                 <button style={{ ...btn.base, ...btn.red, padding: '3px 7px' }} onClick={() => handleDelete(p.namespace, p.name)}><Icon.Trash /></button>
                               </>
@@ -1114,7 +1139,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
                           <span style={{ fontSize: 8, fontWeight: 700, color: '#9ca3af', background: '#f3f4f6', border: '1px solid #d1d5db', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>INATIVA</span>
                           <button style={{ ...btn.base, ...btn.gray, padding: '3px 7px', fontSize: 10, flexShrink: 0 }} onClick={() => toggleYAML(key)}><Icon.Eye /></button>
                           {isAdmin && (
-                            <button style={{ ...btn.base, ...btn.green, padding: '3px 7px', fontSize: 10, flexShrink: 0 }} title="Reativar — aplica novamente no cluster" onClick={() => handleResumeOne(p.id)}>▶</button>
+                            <button style={{ ...btn.base, ...btn.green, padding: '3px 7px', fontSize: 10, flexShrink: 0 }} title="Reativar: aplica novamente no cluster" onClick={() => handleResumeOne(p.id)}>▶</button>
                           )}
                         </div>
                         {expandedYAML === key && <StaticYAMLViewer yamlStr={p.policy_yaml} />}
@@ -1161,7 +1186,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
                   {isAdopting && (
                     <div style={{ margin: '0 12px 10px', background: '#fff', border: '1px solid #bae6fd', borderRadius: 8, padding: 12 }}>
                       <div style={{ fontSize: 10, fontWeight: 700, color: '#0369a1', marginBottom: 8 }}>Adotar policy no Floodgate</div>
-                      <div style={{ fontSize: 10, color: '#475569', marginBottom: 6 }}>Tipo de policy (detectado automaticamente — ajuste se necessário):</div>
+                      <div style={{ fontSize: 10, color: '#475569', marginBottom: 6 }}>Tipo de policy (detectado automaticamente: ajuste se necessário):</div>
                       <select
                         value={adoptType}
                         onChange={e => setAdoptType(e.target.value)}
@@ -1176,7 +1201,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
                       </select>
                       <LiveYAMLViewer namespace={p.namespace} name={p.name} />
                       <div style={{ fontSize: 9, color: '#64748b', background: '#f0f9ff', border: '1px solid #e0f2fe', borderRadius: 5, padding: '5px 8px', marginTop: 8, marginBottom: 10 }}>
-                        A policy será adicionada ao Floodgate com o label <code>managed-by: floodgate</code>. Ela <strong>não será recriada</strong> — apenas recebe as labels de gerenciamento. A partir daí aparecerá na lista de policies ativas e será monitorada pelo autosync.
+                        A policy será adicionada ao Floodgate com o label <code>managed-by: floodgate</code>. Ela <strong>não será recriada</strong>: apenas recebe as labels de gerenciamento. A partir daí aparecerá na lista de policies ativas e será monitorada pelo autosync.
                       </div>
                       <div style={{ display: 'flex', gap: 6 }}>
                         <button
@@ -1196,7 +1221,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
           </div>
         )}
 
-        {/* Orphaned managed_policies — tracked for autosync but the namespace was deleted, so they can never be restored */}
+        {/* Orphaned managed_policies: tracked for autosync but the namespace was deleted, so they can never be restored */}
         {orphanedManaged.length > 0 && (
           <div style={{ borderTop: '2px solid #f1f5f9' }}>
             <div style={{ padding: '8px 14px', display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#64748b' }}>
@@ -1242,7 +1267,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   )
 }
 
-// ─── Security tab — per-service posture ────────────────────────────────────
+// ─── Security tab: per-service posture ────────────────────────────────────
 type ServicePosture = {
   name: string; namespace: string
   hasDenyIngress: boolean; hasDenyEgress: boolean; allowCount: number
@@ -1312,7 +1337,7 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
       `floodgate-egress-internet-${ns}`.slice(0, 63),
     ])
     // Remove policies criadas pelo isolateNamespace (namespace-wide) + restrict por serviço do mesmo namespace
-    // (restrict por serviço cobertos pela regra namespace-wide — remover junto para consistência)
+    // (restrict por serviço cobertos pela regra namespace-wide: remover junto para consistência)
     const toDelete = policies.filter(p =>
       p.namespace === ns && (
         isolationNames.has(p.name) ||
@@ -1613,7 +1638,7 @@ function ApprovacoesTab({ currentUser, config, onRefresh, pendingApprovals }: { 
         {isViewer && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 6, padding: '5px 8px', marginBottom: 6 }}>
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#185FA5" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-            <span style={{ fontSize: 10, color: '#185FA5', fontWeight: 600 }}>Você é viewer — pode aprovar pedidos nos quais estiver listado como aprovador.</span>
+            <span style={{ fontSize: 10, color: '#185FA5', fontWeight: 600 }}>Você é viewer: pode aprovar pedidos nos quais estiver listado como aprovador.</span>
           </div>
         )}
         {/* Approver filter */}
@@ -1652,7 +1677,7 @@ function ApprovacoesTab({ currentUser, config, onRefresh, pendingApprovals }: { 
               <div style={{ fontSize: 11, marginBottom: 3 }}>
                 <span style={{ fontWeight: 600, color: '#2563eb' }}>{d.src_namespace}/{d.src_workload}</span>
                 <span style={{ color: '#94a3b8', margin: '0 5px' }}>→</span>
-                <span style={{ fontWeight: 600, color: '#16a34a' }}>{d.dst_namespace}/{d.dst_service}:{d.dst_ports.map(p => p.port).join(',')}</span>
+                <span style={{ fontWeight: 600, color: '#16a34a' }}>{d.dst_namespace}/{d.dst_service}:{d.dst_ports.length === 0 ? 'todas as portas' : d.dst_ports.map(p => `${p.port}${p.endPort ? `-${p.endPort}` : ''}`).join(',')}</span>
               </div>
               <div style={{ fontSize: 10, color: '#94a3b8', marginBottom: 6 }}>
                 Por {req.created_by_username} · {new Date(req.created_at).toLocaleDateString('pt-BR')}
@@ -1967,7 +1992,7 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
           </div>
         )}
 
-        {/* Status card — always visible, refreshes every 15 s */}
+        {/* Status card: always visible, refreshes every 15 s */}
         {(() => {
           const missing = autosyncStatus?.drift?.missing ?? []
           const total = autosyncStatus?.desired_count ?? 0
@@ -2014,7 +2039,7 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
                         </div>
                         {p.namespace_missing && (
                           <div style={{ fontSize: 9, color: '#b91c1c', marginTop: 3 }}>
-                            ⚠ Namespace <strong>{p.namespace}</strong> não existe mais no cluster — a policy fica rastreada, mas não pode ser restaurada até o namespace voltar a existir.
+                            ⚠ Namespace <strong>{p.namespace}</strong> não existe mais no cluster: a policy fica rastreada, mas não pode ser restaurada até o namespace voltar a existir.
                           </div>
                         )}
                         {expandedPolicy === key && p.policy_yaml && (
@@ -2274,7 +2299,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
         {/* Streaming ativo mas ainda sem flows */}
         {isOn && streaming && visibleFlows.length === 0 && (
           <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 10, fontSize: 11, color: '#166534' }}>
-            Stream ativo — aguardando tráfego nos namespaces monitorados…
+            Stream ativo: aguardando tráfego nos namespaces monitorados…
           </div>
         )}
 
@@ -2613,7 +2638,7 @@ export default function RightPanel({
         {/* Page links at bottom */}
         <div style={{ marginTop: 'auto', borderTop: '1px solid #e2e8f0', position: 'relative' }}>
 
-          {/* User chip — opens full-screen password modal */}
+          {/* User chip: opens full-screen password modal */}
           <button
             onClick={() => setShowPwModal(true)}
             title={showLabels ? undefined : `${currentUser?.username} · Trocar senha`}

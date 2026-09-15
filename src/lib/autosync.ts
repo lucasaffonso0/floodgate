@@ -2,7 +2,7 @@ import 'server-only'
 import { getDb } from './db'
 import { listNetworkPolicies, applyPolicyYAML, getPolicyYAML, listNamespaceNames } from './k8s'
 
-// The target namespace itself (not just the policy) is gone — restoring will
+// The target namespace itself (not just the policy) is gone: restoring will
 // keep failing until someone recreates it. Kept apart from a transient error
 // so callers can surface it distinctly instead of a generic "sync failed".
 function isNamespaceGoneError(e: unknown): boolean {
@@ -57,7 +57,7 @@ export function getLastDriftResult(): DriftResult | null {
 export async function checkDrift(): Promise<DriftResult> {
   const db = getDb()
 
-  // Skip if paused — intentionally empty
+  // Skip if paused: intentionally empty
   const paused = (db.prepare('SELECT COUNT(*) as n FROM saved_policies').get() as { n: number }).n > 0
   if (paused) {
     const r: DriftResult = { missing: [], timestamp: new Date().toISOString() }
@@ -146,10 +146,10 @@ export async function runAutosync(): Promise<SyncResult> {
         drifted.push({ namespace: row.namespace, name: row.name })
       } catch (e) {
         if (isNamespaceGoneError(e)) {
-          // Namespace itself is gone — kept in managed_policies so it
+          // Namespace itself is gone: kept in managed_policies so it
           // auto-restores if the namespace comes back, but logged once as a
           // warning instead of an error dump repeated every cycle.
-          console.warn(`[autosync] Namespace ${row.namespace} does not exist — ${row.name} stays tracked but cannot be restored`)
+          console.warn(`[autosync] Namespace ${row.namespace} does not exist: ${row.name} stays tracked but cannot be restored`)
           unrecoverable.push({ namespace: row.namespace, name: row.name, namespace_missing: true })
         } else {
           console.error(`[autosync] Failed to restore ${row.namespace}/${row.name}:`, e)
