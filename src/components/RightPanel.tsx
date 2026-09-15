@@ -2141,7 +2141,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   const [policyYaml, setPolicyYaml] = useState<{ name: string; content: string } | null>(null)
   const [loadingYaml, setLoadingYaml] = useState<string | null>(null)
   const [previewYamlMap, setPreviewYamlMap] = useState<Map<string, string>>(new Map())
-  const [collapsedNs, setCollapsedNs] = useState<Set<string>>(new Set())
+  const [collapsedNs, setCollapsedNs] = useState<Set<string>>(new Set(savedFilters.collapsedNs ?? []))
   function toggleDiscNs(ns: string) {
     setCollapsedNs(prev => { const n = new Set(prev); n.has(ns) ? n.delete(ns) : n.add(ns); return n })
   }
@@ -2152,8 +2152,8 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
 
   // Persiste filtros no localStorage
   React.useEffect(() => {
-    try { localStorage.setItem(DISC_FILTER_KEY, JSON.stringify({ nsFilter, verdictFilter, searchText })) } catch { }
-  }, [nsFilter, verdictFilter, searchText])
+    try { localStorage.setItem(DISC_FILTER_KEY, JSON.stringify({ nsFilter, verdictFilter, searchText, collapsedNs: [...collapsedNs] })) } catch { }
+  }, [nsFilter, verdictFilter, searchText, collapsedNs])
 
   const visibleFlows = flows.filter(f =>
     !config.ignored_namespaces.includes(f.src_namespace) &&
@@ -2323,6 +2323,18 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                 <option value="DROPPED">DROPPED</option>
               </select>
               <span style={{ fontSize: 10, color: '#94a3b8', whiteSpace: 'nowrap' }}>{filtered.length} flows</span>
+              {(() => {
+                const groupNs = Object.keys(grouped)
+                const allCollapsed = groupNs.length > 0 && groupNs.every(ns => collapsedNs.has(ns))
+                return groupNs.length > 0 && (
+                  <button
+                    onClick={() => setCollapsedNs(allCollapsed ? new Set() : new Set(groupNs))}
+                    style={{ ...btn.base, ...btn.gray, fontSize: 9.5, padding: '3px 8px', whiteSpace: 'nowrap' }}
+                  >
+                    {allCollapsed ? 'Expandir todos' : 'Recolher todos'}
+                  </button>
+                )
+              })()}
             </div>
             {unprotected.length > 0 && (
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
