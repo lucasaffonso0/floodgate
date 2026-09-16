@@ -470,8 +470,13 @@ export default function App() {
   const canManageNamespace = useCallback((namespace: string) => {
     if (!currentUser) return false
     if (currentUser.role === 'admin') return true
-    if (currentUser.role === 'ns_admin') return currentUser.allowed_namespaces.includes(namespace)
-    return false
+    if (currentUser.role === 'audit') return false
+    // Checking allowed_namespaces directly (not requiring role === 'ns_admin')
+    // matches the server-side canManageNamespace() in lib/auth.ts and stays
+    // correct even if role and namespace_permissions ever drift out of sync
+    // (e.g. an admin setting a user's role back to 'viewer' without first
+    // clearing their granted namespaces).
+    return currentUser.allowed_namespaces.includes(namespace)
   }, [currentUser])
 
   async function handleServiceMove(req: { namespace: string; service_name: string; x: number; y: number }) {
@@ -895,7 +900,7 @@ export default function App() {
             nsPositionsFromDB={savedNsPositions}
             layoutResetKey={layoutResetKey}
             globalLocked={globalLayoutLocked}
-            isViewer={currentUser?.role === 'viewer' || currentUser?.role === 'audit'}
+            isViewer={currentUser?.role === 'audit' || (currentUser?.role === 'viewer' && (currentUser?.allowed_namespaces.length ?? 0) === 0)}
             isAdmin={currentUser?.role === 'admin'}
             canManageNamespace={canManageNamespace}
             onServiceMove={handleServiceMove}

@@ -28,8 +28,14 @@ export async function POST(req: NextRequest) {
   if (!user_id || !namespace) return NextResponse.json({ detail: 'user_id e namespace obrigatórios' }, { status: 400 })
 
   const db = getDb()
-  const target = db.prepare('SELECT id FROM users WHERE id = ?').get(user_id)
+  const target = db.prepare('SELECT id, role FROM users WHERE id = ?').get(user_id) as { id: string; role: string } | undefined
   if (!target) return NextResponse.json({ detail: 'Usuário não encontrado' }, { status: 404 })
+  // admin already has universal access; audit's canManageNamespace() always
+  // returns false regardless of namespace_permissions (see lib/auth.ts) — a
+  // grant would sit there looking functional but never actually do anything.
+  if (target.role === 'admin' || target.role === 'audit') {
+    return NextResponse.json({ detail: `Usuários com cargo "${target.role}" não podem receber permissão de namespace` }, { status: 400 })
+  }
   try {
     db.prepare('INSERT OR IGNORE INTO namespace_permissions (user_id, namespace) VALUES (?, ?)').run(user_id, namespace)
     // Upgrade viewer to ns_admin

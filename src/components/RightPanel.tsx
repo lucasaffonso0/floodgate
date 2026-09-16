@@ -540,6 +540,14 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
     .filter(u => u.id !== currentUser?.id)
     .filter(u => !approverSearch || u.username.toLowerCase().includes(approverSearch.toLowerCase()))
 
+  // Restrict which namespaces show up as options in the "Nova política" modal
+  // to ones this user can actually manage — otherwise a draft could be built
+  // for a namespace that will only ever fail at "Aplicar" (or worse, get
+  // submitted into an approval request for a namespace outside their scope).
+  const manageableServices = currentUser?.role === 'admin'
+    ? services
+    : services.filter(s => (currentUser?.allowed_namespaces ?? []).includes(s.namespace))
+
   if (drafts.length === 0) {
     return (
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#94a3b8', fontSize: 12, gap: 10, padding: 24, textAlign: 'center' }}>
@@ -552,7 +560,7 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
           <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           Nova política
         </button>
-        {showNewModal && <NewDraftModal services={services} ciliumFlows={ciliumFlows} onAdd={onAddDraft} onClose={() => setShowNewModal(false)} />}
+        {showNewModal && <NewDraftModal services={manageableServices} ciliumFlows={ciliumFlows} onAdd={onAddDraft} onClose={() => setShowNewModal(false)} />}
       </div>
     )
   }
@@ -570,7 +578,7 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
           <button style={{ ...btn.base, ...btn.green }} onClick={onApplyAll}><Icon.Check /> Aplicar todos</button>
         </div>
       </div>
-      {showNewModal && <NewDraftModal services={services} ciliumFlows={ciliumFlows} onAdd={onAddDraft} onClose={() => setShowNewModal(false)} />}
+      {showNewModal && <NewDraftModal services={manageableServices} ciliumFlows={ciliumFlows} onAdd={onAddDraft} onClose={() => setShowNewModal(false)} />}
       <div style={{ flex: 1, overflowY: 'auto' }}>
         {drafts.map(draft => {
           const isExpanded = expanded === draft.id
@@ -2709,23 +2717,28 @@ export default function RightPanel({
   // Allow parent (header avatar) to open the modal
   React.useEffect(() => { if (openPasswordModal) setShowPwModal(true) }, [openPasswordModal])
 
-  const isViewer = currentUser?.role === 'viewer' || currentUser?.role === 'audit'
-  const isAdmin  = currentUser?.role === 'admin'
   const allowedNamespaces = new Set(currentUser?.allowed_namespaces ?? [])
+  // Granted namespaces (has_ns_permissions) make someone ns_admin-equivalent
+  // regardless of the literal role string — role and namespace_permissions
+  // can drift out of sync (e.g. an admin setting a user's role dropdown back
+  // to 'viewer' without first clearing their granted namespaces), and these
+  // checks should stay correct either way, matching the server-side
+  // canManageNamespace() in lib/auth.ts.
+  const isViewer = currentUser?.role === 'audit' || (currentUser?.role === 'viewer' && allowedNamespaces.size === 0)
+  const isAdmin  = currentUser?.role === 'admin'
   const canManageNamespace = (namespace: string) => {
     if (!currentUser) return false
     if (currentUser.role === 'admin') return true
-    if (currentUser.role === 'ns_admin') return allowedNamespaces.has(namespace)
-    return false
+    if (currentUser.role === 'audit') return false
+    return allowedNamespaces.has(namespace)
   }
 
   const canSeeApprovals = config.approval_enabled && (() => {
     if (!currentUser) return false
-    if (currentUser.role === 'admin' || currentUser.role === 'ns_admin') return true
-    if (currentUser.role === 'viewer') {
-      return pendingApprovals.some(r => r.allowed_approvers.some(a => a.id === currentUser.id))
-    }
-    return false
+    if (currentUser.role === 'admin') return true
+    if (currentUser.role === 'audit') return false
+    if (allowedNamespaces.size > 0) return true
+    return pendingApprovals.some(r => r.allowed_approvers.some(a => a.id === currentUser.id))
   })()
 
   const unprotectedFlowCount = ciliumFlows.filter(f => !f.has_policy && f.verdict === 'DROPPED').length

@@ -226,7 +226,7 @@ export default function UsersPage() {
                       </tr>
 
                       {/* Expanded panel: namespace permissions only */}
-                      {isExpanded && u.role !== 'admin' && (
+                      {isExpanded && u.role !== 'admin' && u.role !== 'audit' && (
                         <tr key={`${u.id}-ns`}>
                           <td colSpan={5} style={{ padding: 0, background: '#fafbff', borderBottom: '1px solid #e2e8f0' }}>
                             <div style={{ padding: '14px 24px' }}>
