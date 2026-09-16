@@ -2150,7 +2150,11 @@ export default function NetworkGraph({
     const src = connection.source?.split('::')
     const dst = connection.target?.split('::')
     if (!src || !dst || src.length < 3 || dst.length < 3) return
-    if (typeof canManageNamespace === 'function' && !canManageNamespace(dst[1])) return
+    // A graph connection always creates a 'both'-direction draft, so both
+    // ends need to be manageable — not just the destination — otherwise
+    // the egress half silently fails to apply later (createEgressNetworkPolicy
+    // checks src_namespace server-side) with no warning at draft-creation time.
+    if (typeof canManageNamespace === 'function' && (!canManageNamespace(dst[1]) || !canManageNamespace(src[1]))) return
     const dstSvc = services.find(s => s.name === dst[2] && s.namespace === dst[1])
     const dstPort = dstSvc?.ports[0]?.port ?? 80
     onAddDraft({ src_workload: src[2], src_namespace: src[1], dst_service: dst[2], dst_namespace: dst[1], dst_ports: [{ port: dstPort, protocol: 'TCP' }], policy_direction: 'both' })

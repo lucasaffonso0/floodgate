@@ -44,19 +44,16 @@ type ApproverDraft = {
   dst_cidr?: string
 }
 
-// The namespace(s) an approver actually needs permission in, depending on
-// where the policy will really be created: ingress and CIDR policies go in
-// dst_namespace, egress goes in src_namespace (see createEgressNetworkPolicy's
-// auth check), and 'both' creates one of each — so it needs both.
+// The namespace(s) an approver actually needs permission in. Only 'ingress'
+// (and CIDR) touch a single namespace (dst_namespace); 'egress' and 'both'
+// require both — same rule POST /api/approval-requests already enforces at
+// creation time (egress needs src_namespace in addition to dst_namespace,
+// since createEgressNetworkPolicy writes there), kept consistent here so
+// create/vote/apply agree on who's actually authorized for a given request.
 function relevantNamespaces(draft: ApproverDraft): string[] {
   const isCidr = !!(draft.src_cidr || draft.dst_cidr)
-  if (!isCidr && draft.policy_direction === 'egress') {
-    return [draft.src_namespace ?? draft.dst_namespace]
-  }
-  if (!isCidr && draft.policy_direction === 'both' && draft.src_namespace) {
-    return [...new Set([draft.dst_namespace, draft.src_namespace])]
-  }
-  return [draft.dst_namespace]
+  if (isCidr || draft.policy_direction === 'ingress') return [draft.dst_namespace]
+  return draft.src_namespace ? [...new Set([draft.dst_namespace, draft.src_namespace])] : [draft.dst_namespace]
 }
 
 function resolveEffectiveApprovers(
@@ -128,9 +125,17 @@ export async function GET(httpReq: NextRequest, { params }: Params) {
   const user = await getCurrentUser()
   if (!user) return NextResponse.json({ detail: 'Unauthorized' }, { status: 401 })
 
+  const req = getRequest(id)
+  if (!req) return NextResponse.json({ detail: 'Not found' }, { status: 404 })
+
+  if (user.role === 'viewer' || user.role === 'ns_admin') {
+    const approvers: Array<{ id: string }> = req.allowed_approvers
+    if (req.created_by !== user.sub && approvers.length > 0 && !approvers.some(a => a.id === user.sub)) {
+      return NextResponse.json({ detail: 'Not found' }, { status: 404 })
+    }
+  }
+
   if (httpReq.nextUrl.searchParams.get('yaml') === '1') {
-    const req = getRequest(id)
-    if (!req) return NextResponse.json({ detail: 'Not found' }, { status: 404 })
     const draft = normalizeDraft(req.draft_data as Draft & { dst_port?: number })
     try {
       const yamlStr = await previewPolicyYAML(
@@ -141,16 +146,6 @@ export async function GET(httpReq: NextRequest, { params }: Params) {
     } catch (e) {
       console.error('[floodgate] preview YAML failed:', e)
       return NextResponse.json({ detail: 'Falha ao gerar preview do YAML' }, { status: 500 })
-    }
-  }
-
-  const req = getRequest(id)
-  if (!req) return NextResponse.json({ detail: 'Not found' }, { status: 404 })
-
-  if (user.role === 'viewer' || user.role === 'ns_admin') {
-    const approvers: Array<{ id: string }> = req.allowed_approvers
-    if (req.created_by !== user.sub && approvers.length > 0 && !approvers.some(a => a.id === user.sub)) {
-      return NextResponse.json({ detail: 'Not found' }, { status: 404 })
     }
   }
 
@@ -273,7 +268,8 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     if (request.reject_count > 0) return NextResponse.json({ detail: 'Request rejeitado' }, { status: 400 })
 
     const draft = normalizeDraft(request.draft_data as Draft & { dst_port?: number })
-    const canManage = await canManageNamespace(user.sub, user.role, draft.dst_namespace)
+    const relevant = relevantNamespaces(draft)
+    const canManage = (await Promise.all(relevant.map(ns => canManageNamespace(user.sub, user.role, ns)))).every(Boolean)
     if (!canManage) return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
 
     // Atomic claim (see auto-apply above): prevents two concurrent applies

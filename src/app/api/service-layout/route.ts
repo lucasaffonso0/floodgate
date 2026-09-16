@@ -106,6 +106,14 @@ export async function PATCH(req: NextRequest) {
   const db = getDb()
 
   if (scope === 'save-all') {
+    // The UI only ever calls this for admins (autosave requires role ===
+    // 'admin', and the "Salvar" button is admin-only) — ns_admin/others
+    // always save to a local sessionStorage draft instead. Enforce that
+    // same rule server-side instead of relying on the UI to hide it: this
+    // writes layout data for whatever namespaces the caller sends, with no
+    // per-namespace check, so a non-admin calling it directly could
+    // overwrite the shared saved layout for namespaces they don't manage.
+    if (user.role !== 'admin') return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
     const { services, namespaces } = body as {
       services: Array<{ namespace: string; service_name: string; x: number; y: number }>
       namespaces: Array<{ namespace: string; x: number; y: number }>

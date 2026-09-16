@@ -15,19 +15,16 @@ type ApproverDraft = {
   dst_cidr?: string
 }
 
-// The namespace(s) an approver actually needs permission in, depending on
-// where the policy will really be created: ingress and CIDR policies go in
-// dst_namespace, egress goes in src_namespace (see createEgressNetworkPolicy's
-// auth check), and 'both' creates one of each — so it needs both.
+// The namespace(s) an approver actually needs permission in. Only 'ingress'
+// (and CIDR) touch a single namespace (dst_namespace); 'egress' and 'both'
+// require both — same rule the POST handler below already enforces at
+// creation time (egress needs src_namespace in addition to dst_namespace,
+// since createEgressNetworkPolicy writes there), kept consistent here so
+// create/vote/apply agree on who's actually authorized for a given request.
 function relevantNamespaces(draft: ApproverDraft): string[] {
   const isCidr = !!(draft.src_cidr || draft.dst_cidr)
-  if (!isCidr && draft.policy_direction === 'egress') {
-    return [draft.src_namespace ?? draft.dst_namespace]
-  }
-  if (!isCidr && draft.policy_direction === 'both' && draft.src_namespace) {
-    return [...new Set([draft.dst_namespace, draft.src_namespace])]
-  }
-  return [draft.dst_namespace]
+  if (isCidr || draft.policy_direction === 'ingress') return [draft.dst_namespace]
+  return draft.src_namespace ? [...new Set([draft.dst_namespace, draft.src_namespace])] : [draft.dst_namespace]
 }
 
 function resolveEffectiveApprovers(
