@@ -31,8 +31,8 @@ Kubernetes NetworkPolicy manager with an interactive drag-and-drop graph UI. Vis
 **1. Build and push the image**
 
 ```bash
-docker build -t your-registry/floodgate:1.0.0 .
-docker push your-registry/floodgate:1.0.0
+docker build -t your-registry/floodgate:2.0.0 .
+docker push your-registry/floodgate:2.0.0
 ```
 
 **2. Update `helm-app-template/helmvalues/values.yaml`**
@@ -40,7 +40,7 @@ docker push your-registry/floodgate:1.0.0
 ```yaml
 image:
   repository: your-registry/floodgate
-  tag: "1.0.0"
+  tag: "2.0.0"
 ```
 
 **3. Create namespace and JWT secret (once)**
