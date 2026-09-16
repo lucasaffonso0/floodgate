@@ -3,6 +3,7 @@ import { getCurrentUser } from '@/lib/auth'
 import { getConfig, setConfig } from '@/lib/config'
 import { apiError, parseBody } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
+import { CronExpressionParser } from 'cron-parser'
 import type { AppConfig } from '@/types'
 
 export async function GET() {
@@ -19,7 +20,7 @@ export async function PUT(req: NextRequest) {
     const body = await parseBody<Partial<AppConfig>>(req)
     if (!body) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
 
-    for (const key of ['approval_enabled', 'auto_default_deny_enabled', 'autosync_enabled', 'hubble_discovery_enabled'] as const) {
+    for (const key of ['approval_enabled', 'auto_default_deny_enabled', 'autosync_enabled', 'hubble_discovery_enabled', 'backup_enabled'] as const) {
       if (body[key] !== undefined && typeof body[key] !== 'boolean') {
         return NextResponse.json({ detail: `${key} deve ser booleano` }, { status: 400 })
       }
@@ -54,6 +55,19 @@ export async function PUT(req: NextRequest) {
     }
     if (body.ignored_namespaces !== undefined && !Array.isArray(body.ignored_namespaces)) {
       return NextResponse.json({ detail: 'ignored_namespaces deve ser um array' }, { status: 400 })
+    }
+    if (body.backup_cron !== undefined) {
+      try {
+        CronExpressionParser.parse(body.backup_cron)
+      } catch (e) {
+        return NextResponse.json({ detail: `backup_cron inválido: ${e instanceof Error ? e.message : String(e)}` }, { status: 400 })
+      }
+    }
+    if (body.backup_s3_bucket !== undefined && typeof body.backup_s3_bucket !== 'string') {
+      return NextResponse.json({ detail: 'backup_s3_bucket deve ser uma string' }, { status: 400 })
+    }
+    if (body.backup_s3_prefix !== undefined && typeof body.backup_s3_prefix !== 'string') {
+      return NextResponse.json({ detail: 'backup_s3_prefix deve ser uma string' }, { status: 400 })
     }
 
     // Merge over the current config so partial updates don't write `undefined`

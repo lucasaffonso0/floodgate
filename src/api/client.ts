@@ -3,6 +3,7 @@ import type {
   ServiceInfo, NetworkPolicyInfo, CreatePolicyRequest, NamespaceIngressRequest,
   PortSpec, AppConfig, User, AuditLog, ApprovalRequest, SecurityCoverage, NamespacePermission,
   ServiceLayout, AutosyncStatus, CiliumFlowsResponse, CiliumFlowSummary, CidrPolicyRequest,
+  BackupStatus, BackupResult,
 } from '@/types'
 
 const api = axios.create({ baseURL: '/api' })
@@ -187,6 +188,13 @@ export const triggerAutosync = (): Promise<AutosyncStatus['last_result']> =>
 
 export const removeOrphanedManagedPolicy = (namespace: string, name: string): Promise<void> =>
   api.delete('/autosync', { params: { namespace, name } }).then(() => undefined)
+
+// ── Backup ─────────────────────────────────────────────────────────────────
+export const getBackupStatus = (): Promise<BackupStatus> =>
+  api.get('/backup').then(r => r.data)
+
+export const triggerBackup = (): Promise<BackupResult> =>
+  api.post('/backup').then(r => r.data)
 
 // ── Cilium Auto-Discover ───────────────────────────────────────────────────
 export const getCiliumFlows = (): Promise<CiliumFlowsResponse> =>

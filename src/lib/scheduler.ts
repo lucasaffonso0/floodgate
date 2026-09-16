@@ -2,6 +2,7 @@ import 'server-only'
 import { getDb } from './db'
 import { checkDrift, runAutosync } from './autosync'
 import { startHubbleStream, stopHubbleStream, isHubbleStreaming, updateFlowPolicies, runRetentionCleanup, normalizeStoredFlows } from './hubble'
+import { runBackup, nextBackupFireTime, readLastBackupRun, saveLastBackupRun } from './backup'
 
 const TICK_MS = 15_000
 // Cleanup de retenção uma vez por hora
@@ -18,6 +19,20 @@ function readConfig(): { enabled: boolean; interval_s: number } {
     }
   } catch {
     return { enabled: false, interval_s: 60 }
+  }
+}
+
+function readBackupConfig(): { enabled: boolean; cron: string } {
+  try {
+    const db = getDb()
+    const get = (key: string) =>
+      (db.prepare('SELECT value FROM app_config WHERE key = ?').get(key) as { value: string } | undefined)?.value
+    return {
+      enabled: JSON.parse(get('backup_enabled') ?? 'false'),
+      cron:    get('backup_cron') ?? '0 3 * * *',
+    }
+  } catch {
+    return { enabled: false, cron: '0 3 * * *' }
   }
 }
 
@@ -46,6 +61,7 @@ function saveLastRun(ts: number): void {
 const g = global as typeof global & {
   _floodgateSchedulerStarted?: boolean
   _floodgateLastAutosync?: number
+  _floodgateLastBackup?: number
 }
 
 async function tick() {
@@ -60,6 +76,24 @@ async function tick() {
         g._floodgateLastAutosync = Date.now()
         saveLastRun(g._floodgateLastAutosync)
         await runAutosync()
+      }
+    }
+
+    // Backup: positional (cron), not "every N seconds since last run" like
+    // autosync — the next fire time is recomputed from the persisted last
+    // run every tick, which is cheap and survives pod restarts.
+    const { enabled: backupEnabled, cron: backupCron } = readBackupConfig()
+    if (backupEnabled) {
+      try {
+        const lastBackup = g._floodgateLastBackup ?? readLastBackupRun()
+        const nextFire = nextBackupFireTime(backupCron, lastBackup)
+        if (Date.now() >= nextFire) {
+          g._floodgateLastBackup = Date.now()
+          saveLastBackupRun(g._floodgateLastBackup)
+          await runBackup()
+        }
+      } catch (e) {
+        console.error('[backup] expressão cron inválida ou falha ao agendar:', e)
       }
     }
 
@@ -84,6 +118,7 @@ async function tick() {
 if (!g._floodgateSchedulerStarted) {
   g._floodgateSchedulerStarted = true
   g._floodgateLastAutosync = readLastRun()
+  g._floodgateLastBackup = readLastBackupRun()
   setInterval(tick, TICK_MS)
   console.log('[floodgate] background scheduler started')
 }

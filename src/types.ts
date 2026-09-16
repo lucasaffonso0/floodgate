@@ -92,6 +92,28 @@ export interface AppConfig {
   autosync_interval_s: number
   hubble_discovery_enabled: boolean
   hubble_flow_retention_days: number
+  backup_enabled: boolean
+  backup_cron: string
+  backup_s3_bucket: string
+  backup_s3_prefix: string
+}
+
+export interface BackupResult {
+  ok: boolean
+  key?: string
+  size?: number
+  error?: string
+  timestamp: string
+}
+
+export interface BackupStatus {
+  enabled: boolean
+  cron: string
+  bucket: string
+  prefix: string
+  last_result: BackupResult | null
+  next_run: string | null
+  credentials_configured: boolean
 }
 
 export interface CiliumFlowSummary {

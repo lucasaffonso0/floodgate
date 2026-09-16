@@ -64,6 +64,10 @@ const DEFAULT_CONFIG: AppConfig = {
   autosync_interval_s: 60,
   hubble_discovery_enabled: false,
   hubble_flow_retention_days: 7,
+  backup_enabled: false,
+  backup_cron: '0 3 * * *',
+  backup_s3_bucket: '',
+  backup_s3_prefix: 'floodgate-backups/',
 }
 
 function SaveSpinner({ status }: { status: 'idle' | 'saving' | 'draft' | 'saved' | 'error' }) {

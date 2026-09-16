@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react'
 import PasswordModal from '@/components/PasswordModal'
-import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, AppConfig, User, ApprovalRequest, AutosyncStatus, CiliumFlowSummary, CidrPolicyRequest } from '@/types'
+import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, AppConfig, User, ApprovalRequest, AutosyncStatus, BackupStatus, CiliumFlowSummary, CidrPolicyRequest } from '@/types'
 import {
   deleteNetworkPolicy, deleteAllPolicies, importPolicies, patchNetworkPolicyPort,
   getApprovalRequests, voteApprovalRequest, applyApprovalRequest, cancelApprovalRequest, getApprovalRequestYAML,
@@ -10,8 +10,20 @@ import {
   getPausedPolicies, pauseAllPolicies, resumeAllPolicies, pausePolicy, resumePolicy,
   getAutosyncStatus, triggerAutosync, removeOrphanedManagedPolicy, removeOrphanedPausedPolicy, updateUserPassword, listUsers,
   adoptPolicy, unadoptPolicy, checkHubble, previewDiscoveryPolicyYAML, createCidrPolicy,
+  getBackupStatus, triggerBackup,
 } from '@/api/client'
 import { normalizeWorkload } from '@/lib/flowMatch'
+import { CronExpressionParser } from 'cron-parser'
+
+function isValidCron(expr: string): boolean {
+  try { CronExpressionParser.parse(expr); return true } catch { return false }
+}
+
+const CRON_PRESETS: Array<{ label: string; value: string }> = [
+  { label: 'Todo dia às 3h', value: '0 3 * * *' },
+  { label: 'A cada hora', value: '0 * * * *' },
+  { label: 'A cada 5 min', value: '*/5 * * * *' },
+]
 
 // ─── YAML generator (rascunhos) ────────────────────────────────────────────
 function generateYAML(draft: Draft, services: ServiceInfo[]): string {
@@ -1997,6 +2009,9 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
   const [syncResult, setSyncResult] = useState<AutosyncStatus['last_result']>(null)
   const [autosyncStatus, setAutosyncStatus] = useState<AutosyncStatus | null>(null)
   const [showMissing, setShowMissing] = useState(false)
+  const [backingUp, setBackingUp] = useState(false)
+  const [backupStatus, setBackupStatus] = useState<BackupStatus | null>(null)
+  const [backupCredWarning, setBackupCredWarning] = useState(false)
   const [expandedPolicy, setExpandedPolicy] = useState<string | null>(null)
   const [allUsers, setAllUsers] = useState<User[]>([])
   const [approverSearch, setApproverSearch] = useState('')
@@ -2005,6 +2020,14 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
   useEffect(() => {
     function refresh() {
       getAutosyncStatus().then(s => { setAutosyncStatus(s); setSyncResult(s.last_result) }).catch(() => {})
+    }
+    refresh()
+    const id = setInterval(refresh, 15_000)
+    return () => clearInterval(id)
+  }, [])
+  useEffect(() => {
+    function refresh() {
+      getBackupStatus().then(setBackupStatus).catch(() => {})
     }
     refresh()
     const id = setInterval(refresh, 15_000)
@@ -2026,6 +2049,12 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
     }
     if (local.autosync_enabled && local.autosync_interval_s < 30)
       errs.push('Intervalo do autosync deve ser de pelo menos 30 segundos.')
+    if (local.backup_enabled) {
+      if (!local.backup_s3_bucket.trim())
+        errs.push('Backup: bucket S3 é obrigatório.')
+      if (!isValidCron(local.backup_cron))
+        errs.push('Backup: expressão cron inválida.')
+    }
     return errs
   }
 
@@ -2043,6 +2072,26 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
       setAutosyncStatus(prev => prev ? { ...prev, drift: { missing: [], timestamp: result?.timestamp ?? new Date().toISOString() } } : prev)
     } finally {
       setSyncing(false)
+    }
+  }
+
+  // "Fazer backup agora" runs server-side against the SAVED config, not
+  // whatever is currently typed in these fields — if bucket/cron/prefix
+  // were just edited but not saved yet, triggering now would silently use
+  // the old (possibly empty) values. Block it until there's nothing pending.
+  const backupConfigDirty =
+    local.backup_enabled !== config.backup_enabled ||
+    local.backup_cron !== config.backup_cron ||
+    local.backup_s3_bucket !== config.backup_s3_bucket ||
+    local.backup_s3_prefix !== config.backup_s3_prefix
+
+  async function handleBackup() {
+    setBackingUp(true)
+    try {
+      const result = await triggerBackup()
+      setBackupStatus(prev => prev ? { ...prev, last_result: result } : prev)
+    } finally {
+      setBackingUp(false)
     }
   }
 
@@ -2257,6 +2306,88 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
                 ? `${syncResult.fixed} restauradas · ${syncResult.checked} verificadas`
                 : `tudo em ordem · ${syncResult.checked} verificadas`}
             {' '}· {new Date(syncResult.timestamp).toLocaleTimeString()}
+          </div>
+        )}
+      </div>
+      <div style={{ marginBottom: 14, borderTop: '1px solid #f1f5f9', paddingTop: 14 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 10 }}>Backup</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+          <ToggleSwitch on={local.backup_enabled} onChange={v => {
+            if (v && backupStatus?.credentials_configured === false) {
+              setBackupCredWarning(true)
+              return
+            }
+            setBackupCredWarning(false)
+            setLocal(p => ({ ...p, backup_enabled: v }))
+          }} />
+          <span style={{ fontSize: 11, color: '#475569' }}>Backup automático do banco (S3)</span>
+        </div>
+        {backupCredWarning && (
+          <div style={{ marginBottom: 8, background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8, padding: 10, fontSize: 10.5, color: '#92400e', lineHeight: 1.5 }}>
+            ⚠ As credenciais do S3 ainda não foram configuradas no cluster (secret <code style={{ fontFamily: 'ui-monospace, monospace' }}>floodgate-secrets</code>: <code style={{ fontFamily: 'ui-monospace, monospace' }}>S3_ENDPOINT</code>, <code style={{ fontFamily: 'ui-monospace, monospace' }}>S3_REGION</code>, <code style={{ fontFamily: 'ui-monospace, monospace' }}>S3_ACCESS_KEY_ID</code>, <code style={{ fontFamily: 'ui-monospace, monospace' }}>S3_SECRET_ACCESS_KEY</code>). Configure isso primeiro antes de habilitar o backup.
+          </div>
+        )}
+        {local.backup_enabled && (
+          <div style={{ paddingLeft: 46, marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>Expressão cron (UTC)</label>
+              <input type="text" value={local.backup_cron}
+                onChange={e => setLocal(p => ({ ...p, backup_cron: e.target.value }))}
+                placeholder="0 3 * * *"
+                style={{ width: 160, border: `1px solid ${isValidCron(local.backup_cron) ? '#cbd5e1' : '#f87171'}`, borderRadius: 6, padding: '5px 8px', fontSize: 11, fontFamily: 'ui-monospace, monospace' }} />
+              <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+                {CRON_PRESETS.map(p => (
+                  <button key={p.value} type="button" onClick={() => setLocal(prev => ({ ...prev, backup_cron: p.value }))}
+                    style={{ ...btn.base, background: 'transparent', border: '1px solid #e2e8f0', color: '#475569', padding: '3px 8px', fontSize: 9.5, borderRadius: 4 }}>
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>Bucket S3</label>
+              <input type="text" value={local.backup_s3_bucket}
+                onChange={e => setLocal(p => ({ ...p, backup_s3_bucket: e.target.value }))}
+                placeholder="meu-bucket"
+                style={{ width: '100%', maxWidth: 260, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 11, boxSizing: 'border-box' }} />
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>Prefixo</label>
+              <input type="text" value={local.backup_s3_prefix}
+                onChange={e => setLocal(p => ({ ...p, backup_s3_prefix: e.target.value }))}
+                placeholder="floodgate-backups/"
+                style={{ width: '100%', maxWidth: 260, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 11, boxSizing: 'border-box' }} />
+            </div>
+
+            {backupStatus?.next_run && (
+              <div style={{ fontSize: 10, color: '#94a3b8' }}>
+                Próxima execução: {new Date(backupStatus.next_run).toLocaleString()}
+              </div>
+            )}
+
+            <button
+              onClick={handleBackup} disabled={backingUp || !local.backup_s3_bucket.trim() || backupStatus?.credentials_configured === false || backupConfigDirty}
+              title={
+                backupStatus?.credentials_configured === false ? 'Configure as credenciais S3 na secret floodgate-secrets primeiro'
+                : backupConfigDirty ? 'Salve as configurações antes de disparar um backup'
+                : undefined
+              }
+              style={{ ...btn.base, ...btn.blue, width: '100%', justifyContent: 'center', padding: '7px', fontSize: 11, opacity: (backingUp || !local.backup_s3_bucket.trim() || backupStatus?.credentials_configured === false || backupConfigDirty) ? 0.6 : 1 }}>
+              {backingUp ? 'Fazendo backup…' : '⬆ Fazer backup agora'}
+            </button>
+            {backupConfigDirty && (
+              <div style={{ fontSize: 9.5, color: '#d97706', padding: '0 8px' }}>
+                ⚠ Salve as configurações abaixo antes de disparar um backup.
+              </div>
+            )}
+            {backupStatus?.last_result && (
+              <div style={{ fontSize: 9.5, color: backupStatus.last_result.ok ? '#94a3b8' : '#b91c1c', padding: '0 8px' }}>
+                {backupStatus.last_result.ok
+                  ? `Última execução: ok · ${((backupStatus.last_result.size ?? 0) / 1024).toFixed(1)} KB`
+                  : `Última execução: falhou — ${backupStatus.last_result.error}`}
+                {' '}· {new Date(backupStatus.last_result.timestamp).toLocaleTimeString()}
+              </div>
+            )}
           </div>
         )}
       </div>
