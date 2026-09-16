@@ -1101,9 +1101,11 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
                 </button>
               </>
             )}
-            <a href="/api/networkpolicies/export" download="floodgate-policies.yaml" style={{ ...btn.base, ...btn.blue, textDecoration: 'none', fontSize: 10 }}>
-              <Icon.Download /> Export
-            </a>
+            {isAdmin && (
+              <a href="/api/networkpolicies/export" download="floodgate-policies.yaml" style={{ ...btn.base, ...btn.blue, textDecoration: 'none', fontSize: 10 }}>
+                <Icon.Download /> Export
+              </a>
+            )}
           </div>
         </div>
         {isAdmin && (totalPaused > 0 || policies.length > 0) && (

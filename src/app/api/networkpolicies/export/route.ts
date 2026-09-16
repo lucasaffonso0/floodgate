@@ -6,7 +6,7 @@ import { apiError } from '@/lib/api-helpers'
 export async function GET() {
   const user = await getCurrentUser()
   if (!user) return NextResponse.json({ detail: 'Unauthorized' }, { status: 401 })
-  if (user.role === 'viewer' || user.role === 'audit') {
+  if (user.role !== 'admin') {
     return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
   }
   try {
