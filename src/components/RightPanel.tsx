@@ -1769,9 +1769,17 @@ function ApprovacoesTab({ currentUser, config, onRefresh, pendingApprovals }: { 
   const canApply = (req: ApprovalRequest) => req.approve_count >= req.approvals_required && req.reject_count === 0
   const canVote  = (req: ApprovalRequest) => {
     if (!currentUser) return false
-    if (currentUser.role === 'admin') return true
     const allowed = req.allowed_approvers
-    return allowed.length === 0 || allowed.some(a => a.id === currentUser.id)
+    const eligible = currentUser.role === 'admin' || allowed.length === 0 || allowed.some(a => a.id === currentUser.id)
+    if (!eligible) return false
+    // Mirrors the server-side self-approval guard (PATCH .../route.ts): the
+    // creator can't vote on their own request unless they're the only
+    // eligible approver, in which case it's allowed to avoid a deadlock.
+    if (req.created_by === currentUser.id) {
+      const others = allowed.filter(a => a.id !== currentUser.id)
+      if (allowed.length === 0 || others.length > 0) return false
+    }
+    return true
   }
 
   if (!config.approval_enabled) {
@@ -1963,7 +1971,11 @@ function ApprovacoesTab({ currentUser, config, onRefresh, pendingApprovals }: { 
                       <button style={{ ...btn.base, ...btn.red, fontSize: 10, opacity: voted ? 0.5 : 1 }} onClick={async () => { await voteApprovalRequest(req.id, 'reject'); onRefresh() }} disabled={voted}>Rejeitar</button>
                     </>
                   ) : (
-                    <span style={{ fontSize: 10, color: '#94a3b8', fontStyle: 'italic' }}>Você não está na lista de aprovadores</span>
+                    <span style={{ fontSize: 10, color: '#94a3b8', fontStyle: 'italic' }}>
+                      {req.created_by === currentUser?.id
+                        ? 'Você criou este pedido: outro aprovador precisa votar'
+                        : 'Você não está na lista de aprovadores'}
+                    </span>
                   )}
                   {(currentUser?.username === req.created_by_username || isAdmin) && <button style={{ ...btn.base, ...btn.gray, fontSize: 10 }} onClick={() => cancelApprovalRequest(req.id).then(onRefresh)}>Cancelar</button>}
                 </div>

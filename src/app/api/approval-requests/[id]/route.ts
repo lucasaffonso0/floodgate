@@ -36,10 +36,33 @@ function normalizeDraft(draft: Draft & { dst_port?: number }): Draft {
 
 type Params = { params: Promise<{ id: string }> }
 
+type ApproverDraft = {
+  dst_namespace: string
+  src_namespace?: string
+  policy_direction?: string
+  src_cidr?: string
+  dst_cidr?: string
+}
+
+// The namespace(s) an approver actually needs permission in, depending on
+// where the policy will really be created: ingress and CIDR policies go in
+// dst_namespace, egress goes in src_namespace (see createEgressNetworkPolicy's
+// auth check), and 'both' creates one of each — so it needs both.
+function relevantNamespaces(draft: ApproverDraft): string[] {
+  const isCidr = !!(draft.src_cidr || draft.dst_cidr)
+  if (!isCidr && draft.policy_direction === 'egress') {
+    return [draft.src_namespace ?? draft.dst_namespace]
+  }
+  if (!isCidr && draft.policy_direction === 'both' && draft.src_namespace) {
+    return [...new Set([draft.dst_namespace, draft.src_namespace])]
+  }
+  return [draft.dst_namespace]
+}
+
 function resolveEffectiveApprovers(
   db: ReturnType<typeof getDb>,
   storedApprovers: Array<{ id: string; username: string }>,
-  dstNamespace: string,
+  draft: ApproverDraft,
 ): Array<{ id: string; username: string }> {
   if (storedApprovers.length > 0) return storedApprovers
 
@@ -47,11 +70,22 @@ function resolveEffectiveApprovers(
     "SELECT id, username FROM users WHERE role = 'admin'"
   ).all() as Array<{ id: string; username: string }>
 
-  const nsAdmins = db.prepare(`
-    SELECT u.id, u.username FROM users u
+  // An eligible ns_admin must have permission in every relevant namespace,
+  // not just one of them.
+  const namespaces = relevantNamespaces(draft)
+  const nsAdminRows = db.prepare(`
+    SELECT u.id, u.username, np.namespace FROM users u
     INNER JOIN namespace_permissions np ON np.user_id = u.id
-    WHERE u.role = 'ns_admin' AND np.namespace = ?
-  `).all(dstNamespace) as Array<{ id: string; username: string }>
+    WHERE u.role = 'ns_admin' AND np.namespace IN (${namespaces.map(() => '?').join(',')})
+  `).all(...namespaces) as Array<{ id: string; username: string; namespace: string }>
+  const byUser = new Map<string, { username: string; namespaces: Set<string> }>()
+  for (const r of nsAdminRows) {
+    if (!byUser.has(r.id)) byUser.set(r.id, { username: r.username, namespaces: new Set() })
+    byUser.get(r.id)!.namespaces.add(r.namespace)
+  }
+  const nsAdmins = [...byUser.entries()]
+    .filter(([, v]) => namespaces.every(ns => v.namespaces.has(ns)))
+    .map(([id, v]) => ({ id, username: v.username }))
 
   const seen = new Set<string>()
   return [...admins, ...nsAdmins].filter(u => {
@@ -82,7 +116,7 @@ function getRequest(id: string): ApprovalRequest | null {
     approvals_required: row.approvals_required as number,
     approve_count: votes.filter(v => v.decision === 'approve').length,
     reject_count:  votes.filter(v => v.decision === 'reject').length,
-    allowed_approvers: resolveEffectiveApprovers(db, storedApprovers, draftData.dst_namespace),
+    allowed_approvers: resolveEffectiveApprovers(db, storedApprovers, draftData),
     votes,
     created_at: row.created_at as string,
     applied_at: (row.applied_at as string | null) ?? null,
@@ -113,9 +147,9 @@ export async function GET(httpReq: NextRequest, { params }: Params) {
   const req = getRequest(id)
   if (!req) return NextResponse.json({ detail: 'Not found' }, { status: 404 })
 
-  if (user.role === 'viewer') {
+  if (user.role === 'viewer' || user.role === 'ns_admin') {
     const approvers: Array<{ id: string }> = req.allowed_approvers
-    if (approvers.length > 0 && !approvers.some(a => a.id === user.sub)) {
+    if (req.created_by !== user.sub && approvers.length > 0 && !approvers.some(a => a.id === user.sub)) {
       return NextResponse.json({ detail: 'Not found' }, { status: 404 })
     }
   }
