@@ -11,6 +11,7 @@ Kubernetes NetworkPolicy manager with an interactive drag-and-drop graph UI. Vis
 - **Role-based access** — admin, ns_admin, viewer, audit
 - **Approval workflow** — require N approvals before a policy is applied
 - **Autosync** — drift detection re-applies policies removed externally
+- **Backup** — scheduled (cron) or on-demand snapshot of the whole database uploaded to any S3-compatible bucket
 - **Real-time updates** — Server-Sent Events push changes to all connected users in < 100 ms
 - **Audit log** — every action recorded with user, timestamp, and details
 - **Namespace isolation** — one-click default-deny (ingress, egress, or both)
@@ -49,6 +50,19 @@ kubectl create namespace floodgate
 kubectl create secret generic floodgate-secrets \
   --from-literal=JWT_SECRET="$(openssl rand -base64 32)" \
   -n floodgate
+```
+
+Optional — add S3-compatible credentials to the same secret if you plan to use Backup (Config tab):
+
+```bash
+kubectl patch secret floodgate-secrets -n floodgate --type merge -p '{
+  "stringData": {
+    "S3_ENDPOINT": "https://<your-endpoint>",
+    "S3_REGION": "<your-region>",
+    "S3_ACCESS_KEY_ID": "<access-key>",
+    "S3_SECRET_ACCESS_KEY": "<secret-key>"
+  }
+}'
 ```
 
 **4. Install**
@@ -154,6 +168,10 @@ kubectl apply -f test-apps/
 |----------|---------|-------------|
 | `JWT_SECRET` | `floodgate-secret-change-me` | HS256 signing key — **required in production** |
 | `DB_PATH` | `floodgate-dev.db` (dev) / `/data/floodgate.db` (prod) | SQLite file path |
+| `S3_ENDPOINT` | — | S3-compatible endpoint URL — only needed if you enable Backup in the Config tab |
+| `S3_REGION` | — | Bucket region (any S3-compatible target accepts a region string) |
+| `S3_ACCESS_KEY_ID` | — | Access key with write access to the backup bucket |
+| `S3_SECRET_ACCESS_KEY` | — | Secret for the access key above |
 
 ---
 
