@@ -1,10 +1,10 @@
 'use client'
 
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import PasswordModal from '@/components/PasswordModal'
 import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, AppConfig, User, ApprovalRequest, AutosyncStatus, CiliumFlowSummary, CidrPolicyRequest } from '@/types'
 import {
-  deleteNetworkPolicy, deleteAllPolicies, patchNetworkPolicyPort,
+  deleteNetworkPolicy, deleteAllPolicies, importPolicies, patchNetworkPolicyPort,
   getApprovalRequests, voteApprovalRequest, applyApprovalRequest, cancelApprovalRequest, getApprovalRequestYAML,
   getSecurityCoverage, applyDefaultDeny, isolateNamespace,
   getPausedPolicies, pauseAllPolicies, resumeAllPolicies, pausePolicy, resumePolicy,
@@ -72,6 +72,7 @@ const Icon = {
   Edit:      () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>,
   Check:     () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="20 6 9 17 4 12"/></svg>,
   Download:  () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>,
+  Upload:    () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>,
   Eye:       () => <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>,
   Shield:    () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>,
   Clock:     () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>,
@@ -820,6 +821,8 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   const [paused, setPaused] = useState<PausedPolicy[]>([])
   const [pausing, setPausing] = useState(false)
   const [deletingAll, setDeletingAll] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const importFileRef = useRef<HTMLInputElement>(null)
   const [resuming, setResuming] = useState(false)
   const [filter, setFilter] = useState('')
   const [adoptingPolicy, setAdoptingPolicy] = useState<NetworkPolicyInfo | null>(null)
@@ -999,6 +1002,28 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
     }
   }
 
+  function handleImportClick() {
+    importFileRef.current?.click()
+  }
+
+  async function handleImportFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    e.target.value = '' // allow re-selecting the same file next time
+    if (!file) return
+    if (!confirm(`Importar policies de "${file.name}"? Isso cria ou substitui policies no cluster.`)) return
+    setImporting(true)
+    // Failures are logged server-side (console.error), not popped up here.
+    try {
+      const text = await file.text()
+      await importPolicies(text)
+      onRefresh()
+    } catch {
+      /* server-side log has the detail */
+    } finally {
+      setImporting(false)
+    }
+  }
+
   async function handleDelete(ns: string, name: string) {
     if (!confirm('Remover esta NetworkPolicy?')) return
     await deleteNetworkPolicy(ns, name); onDelete()
@@ -1067,9 +1092,19 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
             {totalPaused > 0 && <span style={{ marginLeft: 6, color: '#94a3b8', fontWeight: 600 }}>· {totalPaused} pausadas</span>}
             {external.length > 0 && <span style={{ marginLeft: 6 }}>· {external.length} ext.</span>}
           </div>
-          <a href="/api/networkpolicies/export" download="floodgate-policies.yaml" style={{ ...btn.base, ...btn.blue, textDecoration: 'none', fontSize: 10 }}>
-            <Icon.Download /> Export
-          </a>
+          <div style={{ display: 'flex', gap: 5 }}>
+            {!isViewer && (
+              <>
+                <input ref={importFileRef} type="file" accept=".yaml,.yml,text/yaml" onChange={handleImportFile} style={{ display: 'none' }} />
+                <button onClick={handleImportClick} disabled={importing} style={{ ...btn.base, ...btn.blue, fontSize: 10 }}>
+                  <Icon.Upload /> {importing ? 'Importando…' : 'Import'}
+                </button>
+              </>
+            )}
+            <a href="/api/networkpolicies/export" download="floodgate-policies.yaml" style={{ ...btn.base, ...btn.blue, textDecoration: 'none', fontSize: 10 }}>
+              <Icon.Download /> Export
+            </a>
+          </div>
         </div>
         {isAdmin && (totalPaused > 0 || policies.length > 0) && (
           <div style={{ display: 'flex', gap: 5, marginBottom: 6 }}>

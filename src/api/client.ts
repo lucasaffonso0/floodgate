@@ -42,6 +42,9 @@ export const deleteNetworkPolicy = (namespace: string, name: string): Promise<vo
 export const deleteAllPolicies = (): Promise<{ deleted: number; failed: number; failures: string[] }> =>
   api.delete('/networkpolicies').then(r => r.data)
 
+export const importPolicies = (yamlText: string): Promise<{ imported: number; failed: number; failures: string[] }> =>
+  api.post('/networkpolicies/import', { yaml: yamlText }).then(r => r.data)
+
 export const patchNetworkPolicyPort = (namespace: string, name: string, dst_ports: PortSpec[]): Promise<NetworkPolicyInfo> =>
   api.patch(`/networkpolicies/${namespace}/${name}`, { dst_ports }).then(r => r.data)
 
