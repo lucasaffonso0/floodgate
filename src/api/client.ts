@@ -39,6 +39,9 @@ export const createNamespaceIngressPolicy = (req: NamespaceIngressRequest): Prom
 export const deleteNetworkPolicy = (namespace: string, name: string): Promise<void> =>
   api.delete(`/networkpolicies/${namespace}/${name}`)
 
+export const deleteAllPolicies = (): Promise<{ deleted: number; failed: number; failures: string[] }> =>
+  api.delete('/networkpolicies').then(r => r.data)
+
 export const patchNetworkPolicyPort = (namespace: string, name: string, dst_ports: PortSpec[]): Promise<NetworkPolicyInfo> =>
   api.patch(`/networkpolicies/${namespace}/${name}`, { dst_ports }).then(r => r.data)
 
@@ -127,8 +130,11 @@ export const revokeNamespacePermission = (id: string): Promise<void> =>
   api.delete(`/namespace-permissions/${id}`)
 
 // ── Pause / Resume all policies ────────────────────────────────────────────
-export const getPausedPolicies = (): Promise<{ id: string; name: string; namespace: string; policy_yaml: string; saved_at: string }[]> =>
+export const getPausedPolicies = (): Promise<{ id: string; name: string; namespace: string; policy_yaml: string; saved_at: string; namespace_missing: boolean }[]> =>
   api.get('/networkpolicies/pause').then(r => r.data)
+
+export const removeOrphanedPausedPolicy = (id: string): Promise<void> =>
+  api.delete('/networkpolicies/pause', { params: { id } }).then(() => undefined)
 
 export const pauseAllPolicies = (): Promise<{ paused: number }> =>
   api.post('/networkpolicies/pause').then(r => r.data)
@@ -136,7 +142,7 @@ export const pauseAllPolicies = (): Promise<{ paused: number }> =>
 export const pausePolicy = (namespace: string, name: string): Promise<{ paused: number }> =>
   api.post('/networkpolicies/pause', { namespace, name }).then(r => r.data)
 
-export const resumeAllPolicies = (): Promise<{ resumed: number }> =>
+export const resumeAllPolicies = (): Promise<{ resumed: number; failed: number; failures: string[] }> =>
   api.post('/networkpolicies/resume').then(r => r.data)
 
 export const resumePolicy = (id: string): Promise<{ resumed: number }> =>

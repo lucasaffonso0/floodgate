@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
-import { applyPolicyYAML } from '@/lib/k8s'
+import { applyPolicyYAML, listNamespaceNames } from '@/lib/k8s'
 import { getDb } from '@/lib/db'
 import { apiError } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
@@ -36,17 +36,27 @@ export async function POST(req: NextRequest) {
   const saved = db.prepare('SELECT * FROM saved_policies').all() as {
     id: string; name: string; namespace: string; policy_yaml: string
   }[]
+  const namespaces = await listNamespaceNames()
 
   let resumed = 0
+  const failures: string[] = []
   for (const s of saved) {
+    // Namespace itself is gone: this can never succeed, and it's surfaced
+    // separately as an orphan for the admin to clean up (GET .../pause,
+    // DELETE .../pause?id=), so skip it instead of failing every time.
+    if (!namespaces.has(s.namespace)) continue
     try {
       await applyPolicyYAML(s.namespace, s.policy_yaml)
       db.prepare('DELETE FROM saved_policies WHERE id = ?').run(s.id)
       resumed++
-    } catch { /* best-effort */ }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      console.error(`[floodgate] failed to resume policy ${s.namespace}/${s.name}:`, msg)
+      failures.push(`${s.namespace}/${s.name}: ${msg}`)
+    }
   }
 
-  logAudit({ user_id: user.sub, username: user.username, action: 'resume_all_policies', details: `${resumed} policies resumed` })
+  logAudit({ user_id: user.sub, username: user.username, action: 'resume_all_policies', details: `${resumed} policies resumed, ${failures.length} failed` })
   emit({ type: 'policies_resumed' })
-  return NextResponse.json({ resumed })
+  return NextResponse.json({ resumed, failed: failures.length, failures })
 }

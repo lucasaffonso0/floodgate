@@ -4,11 +4,11 @@ import React, { useState, useEffect, useCallback } from 'react'
 import PasswordModal from '@/components/PasswordModal'
 import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, AppConfig, User, ApprovalRequest, AutosyncStatus, CiliumFlowSummary, CidrPolicyRequest } from '@/types'
 import {
-  deleteNetworkPolicy, patchNetworkPolicyPort,
+  deleteNetworkPolicy, deleteAllPolicies, patchNetworkPolicyPort,
   getApprovalRequests, voteApprovalRequest, applyApprovalRequest, cancelApprovalRequest, getApprovalRequestYAML,
   getSecurityCoverage, applyDefaultDeny, isolateNamespace,
   getPausedPolicies, pauseAllPolicies, resumeAllPolicies, pausePolicy, resumePolicy,
-  getAutosyncStatus, triggerAutosync, removeOrphanedManagedPolicy, updateUserPassword, listUsers,
+  getAutosyncStatus, triggerAutosync, removeOrphanedManagedPolicy, removeOrphanedPausedPolicy, updateUserPassword, listUsers,
   adoptPolicy, unadoptPolicy, checkHubble, previewDiscoveryPolicyYAML, createCidrPolicy,
 } from '@/api/client'
 import { normalizeWorkload } from '@/lib/flowMatch'
@@ -60,7 +60,7 @@ spec:
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 type Tab = 'namespaces' | 'drafts' | 'policies' | 'aprovacoes' | 'seguranca' | 'descoberta' | 'config'
-type PausedPolicy = { id: string; name: string; namespace: string; policy_yaml: string; saved_at: string }
+type PausedPolicy = { id: string; name: string; namespace: string; policy_yaml: string; saved_at: string; namespace_missing?: boolean }
 
 // ─── Icons ─────────────────────────────────────────────────────────────────
 const Icon = {
@@ -800,14 +800,26 @@ function policyDescription(p: NetworkPolicyInfo): string {
   return p.name
 }
 
+const POLICIES_COLLAPSED_KEY = 'floodgate-policies-collapsed-ns'
+// Sentinel keys reusing the same collapsedNs Set/persistence for the two
+// orphan sections, which aren't real namespaces.
+const ORPHANED_MANAGED_KEY = '__orphaned-managed__'
+const ORPHANED_PAUSED_KEY = '__orphaned-paused__'
+
 function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canManageNamespace, onDelete, onRefresh }: {
   policies: NetworkPolicyInfo[]; allPolicies: NetworkPolicyInfo[]; services: ServiceInfo[]; isAdmin?: boolean; isViewer?: boolean; canManageNamespace?: (namespace: string) => boolean; onDelete: () => void; onRefresh: () => void
 }) {
   const [expandedYAML, setExpandedYAML] = useState<string | null>(null)
-  const [expandedNs, setExpandedNs] = useState<Set<string>>(new Set())
+  // Empty set = nothing collapsed = everything open (same as the old default),
+  // so no separate "expand all on first load" effect is needed.
+  const [collapsedNs, setCollapsedNs] = useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(localStorage.getItem(POLICIES_COLLAPSED_KEY) ?? '[]')) }
+    catch { return new Set() }
+  })
   const [showExternal, setShowExternal] = useState(false)
   const [paused, setPaused] = useState<PausedPolicy[]>([])
   const [pausing, setPausing] = useState(false)
+  const [deletingAll, setDeletingAll] = useState(false)
   const [resuming, setResuming] = useState(false)
   const [filter, setFilter] = useState('')
   const [adoptingPolicy, setAdoptingPolicy] = useState<NetworkPolicyInfo | null>(null)
@@ -816,6 +828,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   const [editingPolicy, setEditingPolicy] = useState<NetworkPolicyInfo | null>(null)
   const [orphanedManaged, setOrphanedManaged] = useState<Array<{ namespace: string; name: string; policy_yaml?: string }>>([])
   const [removingOrphan, setRemovingOrphan] = useState<string | null>(null)
+  const [removingOrphanPaused, setRemovingOrphanPaused] = useState<string | null>(null)
 
   function toggleYAML(key: string) { setExpandedYAML(prev => prev === key ? null : key) }
 
@@ -859,7 +872,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
       alert((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? String(e))
     }
   }
-  function toggleNs(ns: string) { setExpandedNs(prev => { const n = new Set(prev); n.has(ns) ? n.delete(ns) : n.add(ns); return n }) }
+  function toggleNs(ns: string) { setCollapsedNs(prev => { const n = new Set(prev); n.has(ns) ? n.delete(ns) : n.add(ns); return n }) }
 
   // Orphan detection: managed policies whose src/dst service no longer exists
   const serviceSet = new Set(services.map(s => `${s.namespace}/${s.name}`))
@@ -924,6 +937,32 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
     }
   }
 
+  const orphanedPaused = paused.filter(p => p.namespace_missing)
+
+  async function handleRemoveOrphanPaused(id: string, ns: string, name: string) {
+    if (!confirm(`Remover "${name}" da lista de pausadas? O namespace "${ns}" não existe mais: esta policy nunca poderá ser restaurada.`)) return
+    setRemovingOrphanPaused(id)
+    try {
+      await removeOrphanedPausedPolicy(id)
+      await loadPaused()
+    } catch (e: unknown) {
+      alert((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? String(e))
+    } finally {
+      setRemovingOrphanPaused(null)
+    }
+  }
+
+  async function handleRemoveAllOrphanPaused() {
+    if (!confirm(`Remover ${orphanedPaused.length} policy(s) órfã(s) da lista de pausadas? Os namespaces não existem mais: elas nunca poderão ser restauradas.`)) return
+    setRemovingOrphanPaused('*')
+    try {
+      await Promise.all(orphanedPaused.map(p => removeOrphanedPausedPolicy(p.id).catch(() => {})))
+      await loadPaused()
+    } finally {
+      setRemovingOrphanPaused(null)
+    }
+  }
+
   async function handlePause() {
     if (!confirm(`Pausar ${policies.length} policies? Elas serão removidas do cluster mas salvas para restauração.`)) return
     setPausing(true)
@@ -932,7 +971,32 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
 
   async function handleResume() {
     setResuming(true)
-    try { await resumeAllPolicies(); onRefresh(); await loadPaused() } finally { setResuming(false) }
+    // Failures are logged server-side (console.error in the resume route,
+    // visible via `kubectl logs`) instead of surfaced here as a popup.
+    try {
+      await resumeAllPolicies()
+      onRefresh(); await loadPaused()
+    } catch {
+      /* server-side log has the detail */
+    } finally {
+      setResuming(false)
+    }
+  }
+
+  async function handleDeleteAll() {
+    if (!confirm(
+      `Apagar ${policies.length} policies definitivamente? Isso remove TODAS do cluster agora — diferente de pausar, não há como desfazer nem restaurar depois.`
+    )) return
+    setDeletingAll(true)
+    // Failures are logged server-side (console.error), not popped up here.
+    try {
+      await deleteAllPolicies()
+      onDelete()
+    } catch {
+      /* server-side log has the detail */
+    } finally {
+      setDeletingAll(false)
+    }
   }
 
   async function handleDelete(ns: string, name: string) {
@@ -968,9 +1032,10 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
     grouped.get(p.namespace)!.push(p)
   }
 
-  // Group filtered paused policies by namespace (exclude any that also appear as active: pause deletion failed)
+  // Group filtered paused policies by namespace (exclude any that also appear as active: pause deletion
+  // failed — and exclude orphans, which get their own section below since their namespace doesn't exist)
   const pausedByNs = new Map<string, PausedPolicy[]>()
-  for (const p of paused.filter(matchPaused).filter(p => !activePolicyKeys.has(`${p.namespace}/${p.name}`))) {
+  for (const p of paused.filter(matchPaused).filter(p => !activePolicyKeys.has(`${p.namespace}/${p.name}`)).filter(p => !p.namespace_missing)) {
     if (!pausedByNs.has(p.namespace)) pausedByNs.set(p.namespace, [])
     pausedByNs.get(p.namespace)!.push(p)
   }
@@ -978,14 +1043,12 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   // All namespaces that have active or paused policies
   const allNs = [...new Set([...grouped.keys(), ...pausedByNs.keys()])].sort()
 
-  // Default: expand all namespaces
   useEffect(() => {
-    if (allNs.length > 0 && expandedNs.size === 0) setExpandedNs(new Set(allNs))
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [policies.length, paused.length])
+    try { localStorage.setItem(POLICIES_COLLAPSED_KEY, JSON.stringify([...collapsedNs])) } catch {}
+  }, [collapsedNs])
 
   const external = allPolicies.filter(p => !p.managed)
-  const totalPaused = paused.filter(p => !activePolicyKeys.has(`${p.namespace}/${p.name}`)).length
+  const totalPaused = paused.filter(p => !activePolicyKeys.has(`${p.namespace}/${p.name}`) && !p.namespace_missing).length
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
@@ -1008,15 +1071,20 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
             <Icon.Download /> Export
           </a>
         </div>
-        {isAdmin && (
+        {isAdmin && (totalPaused > 0 || policies.length > 0) && (
           <div style={{ display: 'flex', gap: 5, marginBottom: 6 }}>
             {totalPaused > 0 ? (
               <button style={{ ...btn.base, ...btn.green, fontSize: 10 }} onClick={handleResume} disabled={resuming}>
                 <Icon.Play /> {resuming ? 'Restaurando…' : `Restaurar ${totalPaused} pausadas`}
               </button>
             ) : (
-              <button style={{ ...btn.base, ...btn.orange, fontSize: 10 }} onClick={handlePause} disabled={pausing || policies.length === 0}>
+              <button style={{ ...btn.base, ...btn.orange, fontSize: 10 }} onClick={handlePause} disabled={pausing}>
                 <Icon.Pause /> {pausing ? 'Pausando…' : 'Pausar todas'}
+              </button>
+            )}
+            {policies.length > 0 && (
+              <button style={{ ...btn.base, ...btn.red, fontSize: 10 }} onClick={handleDeleteAll} disabled={deletingAll}>
+                <Icon.Trash /> {deletingAll ? 'Apagando…' : 'Apagar todas'}
               </button>
             )}
           </div>
@@ -1042,6 +1110,19 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
           onChange={e => setFilter(e.target.value)}
           style={{ width: '100%', border: '1px solid #e2e8f0', borderRadius: 6, padding: '5px 8px', fontSize: 11, outline: 'none', boxSizing: 'border-box' }}
         />
+        {allNs.length > 0 && (() => {
+          const allCollapsed = allNs.every(ns => collapsedNs.has(ns))
+          return (
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 5 }}>
+              <button
+                onClick={() => setCollapsedNs(allCollapsed ? new Set() : new Set(allNs))}
+                style={{ ...btn.base, ...btn.gray, fontSize: 9.5, padding: '3px 8px', whiteSpace: 'nowrap' }}
+              >
+                {allCollapsed ? 'Expandir todos' : 'Recolher todos'}
+              </button>
+            </div>
+          )
+        })()}
         {filter && (
           <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 3 }}>
             {[...grouped.values()].reduce((s, a) => s + a.length, 0) + [...pausedByNs.values()].reduce((s, a) => s + a.length, 0)} resultado(s)
@@ -1067,7 +1148,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
         {allNs.map(ns => {
           const nsPolicies = grouped.get(ns) ?? []
           const nsPaused   = pausedByNs.get(ns) ?? []
-          const isOpen     = expandedNs.has(ns)
+          const isOpen     = !collapsedNs.has(ns)
           const total      = nsPolicies.length + nsPaused.length
           return (
             <div key={ns}>
@@ -1224,20 +1305,22 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
         {/* Orphaned managed_policies: tracked for autosync but the namespace was deleted, so they can never be restored */}
         {orphanedManaged.length > 0 && (
           <div style={{ borderTop: '2px solid #f1f5f9' }}>
-            <div style={{ padding: '8px 14px', display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#64748b' }}>
-              <span style={{ fontWeight: 600 }}>Órfãs (namespace removido)</span>
+            <button onClick={() => toggleNs(ORPHANED_MANAGED_KEY)}
+              style={{ width: '100%', padding: '8px 14px', background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, textAlign: 'left' }}>
+              {!collapsedNs.has(ORPHANED_MANAGED_KEY) ? <Icon.ChevronDown /> : <Icon.ChevronRight />}
+              <span style={{ fontSize: 11, fontWeight: 600, color: '#64748b' }}>Órfãs (namespace removido)</span>
               <span style={{ fontSize: 10, color: '#94a3b8', background: '#f1f5f9', borderRadius: 10, padding: '1px 7px' }}>{orphanedManaged.length}</span>
               {isAdmin && (
-                <button
-                  style={{ ...btn.base, ...btn.red, padding: '2px 7px', fontSize: 9, marginLeft: 'auto' }}
-                  disabled={removingOrphan === '*'}
-                  onClick={handleRemoveAllOrphanManaged}
+                <span
+                  role="button"
+                  style={{ ...btn.base, ...btn.red, padding: '2px 7px', fontSize: 9, marginLeft: 'auto', opacity: removingOrphan === '*' ? 0.6 : 1, pointerEvents: removingOrphan === '*' ? 'none' : undefined }}
+                  onClick={e => { e.stopPropagation(); handleRemoveAllOrphanManaged() }}
                 >
                   <Icon.Trash /> {removingOrphan === '*' ? 'Removendo…' : 'Remover todas'}
-                </button>
+                </span>
               )}
-            </div>
-            {orphanedManaged.map(p => {
+            </button>
+            {!collapsedNs.has(ORPHANED_MANAGED_KEY) && orphanedManaged.map(p => {
               const key = `${p.namespace}/${p.name}`
               return (
                 <div key={key} style={{ borderBottom: '1px solid #f0f4f8', background: '#fff7ed' }}>
@@ -1260,6 +1343,47 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
                 </div>
               )
             })}
+          </div>
+        )}
+
+        {/* Orphaned saved_policies: paused but the namespace was deleted since, so resume can never restore them */}
+        {orphanedPaused.length > 0 && (
+          <div style={{ borderTop: '2px solid #f1f5f9' }}>
+            <button onClick={() => toggleNs(ORPHANED_PAUSED_KEY)}
+              style={{ width: '100%', padding: '8px 14px', background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, textAlign: 'left' }}>
+              {!collapsedNs.has(ORPHANED_PAUSED_KEY) ? <Icon.ChevronDown /> : <Icon.ChevronRight />}
+              <span style={{ fontSize: 11, fontWeight: 600, color: '#64748b' }}>Órfãs (pausadas, namespace removido)</span>
+              <span style={{ fontSize: 10, color: '#94a3b8', background: '#f1f5f9', borderRadius: 10, padding: '1px 7px' }}>{orphanedPaused.length}</span>
+              {isAdmin && (
+                <span
+                  role="button"
+                  style={{ ...btn.base, ...btn.red, padding: '2px 7px', fontSize: 9, marginLeft: 'auto', opacity: removingOrphanPaused === '*' ? 0.6 : 1, pointerEvents: removingOrphanPaused === '*' ? 'none' : undefined }}
+                  onClick={e => { e.stopPropagation(); handleRemoveAllOrphanPaused() }}
+                >
+                  <Icon.Trash /> {removingOrphanPaused === '*' ? 'Removendo…' : 'Remover todas'}
+                </span>
+              )}
+            </button>
+            {!collapsedNs.has(ORPHANED_PAUSED_KEY) && orphanedPaused.map(p => (
+              <div key={p.id} style={{ borderBottom: '1px solid #f0f4f8', background: '#fff7ed' }}>
+                <div style={{ padding: '7px 14px 7px 20px', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#f97316', flexShrink: 0 }} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 11, color: '#7c2d12', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</div>
+                    <div style={{ fontSize: 9, color: '#9a3412' }}>namespace &quot;{p.namespace}&quot; não existe mais no cluster</div>
+                  </div>
+                  {isAdmin && (
+                    <button
+                      style={{ ...btn.base, ...btn.red, padding: '3px 7px', fontSize: 10, flexShrink: 0 }}
+                      disabled={removingOrphanPaused === p.id || removingOrphanPaused === '*'}
+                      onClick={() => handleRemoveOrphanPaused(p.id, p.namespace, p.name)}
+                    >
+                      <Icon.Trash /> {removingOrphanPaused === p.id ? 'Removendo…' : 'Remover'}
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </div>
