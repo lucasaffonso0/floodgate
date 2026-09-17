@@ -2363,6 +2363,10 @@ function Forbidden() {
 // ─── DescobertaTab ───────────────────────────────────────────────────────────
 const DISC_FILTER_KEY = 'floodgate-disc-filters'
 
+function gapDirectionOf(gap: { missingIngress: boolean; missingEgress: boolean } | null): 'ingress' | 'egress' | 'both' {
+  return gap?.missingIngress && gap?.missingEgress ? 'both' : gap?.missingEgress ? 'egress' : 'ingress'
+}
+
 function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDraft, onSaveConfig, onSwitchTab, focusFlow }: {
   flows: CiliumFlowSummary[]
   config: AppConfig
@@ -2479,12 +2483,19 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   }
 
   function createSelectedDrafts() {
-    unprotected.filter(f => selected.has(f.id)).forEach(f => onAddDraft({
-      src_workload: f.src_workload, src_namespace: f.src_namespace,
-      dst_service: f.dst_workload, dst_namespace: f.dst_namespace,
-      dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }],
-      policy_direction: 'ingress',
-    }))
+    unprotected.filter(f => selected.has(f.id)).forEach(f => {
+      const gap = classifyFlowGap({
+        src_workload: f.src_workload, src_namespace: f.src_namespace,
+        dst_workload: f.dst_workload, dst_namespace: f.dst_namespace, dst_port: f.dst_port,
+      }, allPolicies)
+      const direction = gapDirectionOf(gap)
+      onAddDraft({
+        src_workload: f.src_workload, src_namespace: f.src_namespace,
+        dst_service: f.dst_workload, dst_namespace: f.dst_namespace,
+        dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }],
+        policy_direction: direction,
+      })
+    })
     setSelected(new Set())
     onSwitchTab('drafts')
   }
@@ -2636,7 +2647,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                   src_workload: f.src_workload, src_namespace: f.src_namespace,
                   dst_workload: f.dst_workload, dst_namespace: f.dst_namespace, dst_port: f.dst_port,
                 }, allPolicies) : null
-                const gapDirection: 'ingress' | 'egress' | 'both' = gap?.missingIngress && gap?.missingEgress ? 'both' : gap?.missingEgress ? 'egress' : 'ingress'
+                const gapDirection = gapDirectionOf(gap)
                 const gapLabel = gapDirection === 'both' ? 'Criar política de ingress e egress' : gapDirection === 'egress' ? 'Criar política de egress' : 'Criar política de ingress'
                 const vc = f.verdict === 'DROPPED'
                   ? { bg: '#fff1f2', border: '#fecdd3', badge: '#fee2e2', text: '#dc2626' }
@@ -2706,7 +2717,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                           }
                           setLoadingYaml(f.id)
                           try {
-                            const yaml = await previewDiscoveryPolicyYAML(f)
+                            const yaml = await previewDiscoveryPolicyYAML(f, gapDirection)
                             setPreviewYamlMap(prev => new Map(prev).set(f.id, yaml))
                             setPolicyYaml({ name: title, content: yaml })
                           } catch {
