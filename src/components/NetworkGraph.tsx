@@ -190,24 +190,29 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
 }
 
 // ─── Service node ──────────────────────────────────────────────────────────
-type DotStatus = 'open' | 'implicit' | 'isolated'
+type DotStatus = 'open' | 'implicit' | 'isolated-exc' | 'isolated'
 
-const DOT_STYLE: Record<DotStatus, { bg: string; border: string; symbol: string }> = {
-  open:     { bg: '#dcfce7', border: '#22c55e', symbol: '✓' },
-  implicit: { bg: '#fef3c7', border: '#f59e0b', symbol: '!' },
-  isolated: { bg: '#fee2e2', border: '#ef4444', symbol: '✕' },
+// 'isolated-exc' has no fixed symbol: it reuses the same ↙/↗ glyphs the
+// Inbound/Outbound labels already use elsewhere (AccessSection), picked per
+// direction in TrafficIndicator.
+const DOT_STYLE: Record<DotStatus, { bg: string; border: string; symbol?: string }> = {
+  open:         { bg: '#dcfce7', border: '#22c55e', symbol: '✓' },
+  implicit:     { bg: '#fef3c7', border: '#f59e0b', symbol: '!' },
+  'isolated-exc': { bg: '#dbeafe', border: '#3b82f6' },
+  isolated:     { bg: '#fee2e2', border: '#ef4444', symbol: '✕' },
 }
 
-function TrafficIndicator({ status, title }: { status: DotStatus; title: string }) {
+function TrafficIndicator({ status, direction, title }: { status: DotStatus; direction: 'ingress' | 'egress'; title: string }) {
   const s = DOT_STYLE[status]
+  const symbol = s.symbol ?? (direction === 'ingress' ? '↙' : '↗')
   return (
     <div title={title} style={{
       width: 14, height: 14, borderRadius: '50%', flexShrink: 0,
       background: s.bg, border: `1.5px solid ${s.border}`,
       display: 'flex', alignItems: 'center', justifyContent: 'center',
-      fontSize: 8, color: s.border, fontWeight: 900,
+      fontSize: status === 'isolated-exc' ? 10 : 8, lineHeight: 1, color: s.border, fontWeight: 900,
     }}>
-      {s.symbol}
+      {symbol}
     </div>
   )
 }
@@ -215,7 +220,8 @@ function TrafficIndicator({ status, title }: { status: DotStatus; title: string 
 const DOT_TITLE: Record<DotStatus, { in: string; out: string }> = {
   open:     { in: 'Inbound: aberto', out: 'Outbound: aberto' },
   implicit: { in: 'Inbound: bloqueado implicitamente (allow existente sem isolamento)', out: 'Outbound: bloqueado implicitamente (allow existente sem isolamento)' },
-  isolated: { in: 'Inbound: default-deny ativo', out: 'Outbound: default-deny ativo' },
+  'isolated-exc': { in: 'Inbound: isolado, mas com exceção (alguém tem acesso)', out: 'Outbound: isolado, mas com exceção (alguém tem acesso)' },
+  isolated: { in: 'Inbound: default-deny ativo, sem exceção', out: 'Outbound: default-deny ativo, sem exceção' },
 }
 
 function ServiceNodeComponent({ data, selected }: NodeProps) {
@@ -234,8 +240,8 @@ function ServiceNodeComponent({ data, selected }: NodeProps) {
       <div style={{ fontSize: 12, fontWeight: 700, color: '#1e293b', whiteSpace: 'nowrap' }}>{d.name}</div>
       {portList && <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1 }}>:{portList}</div>}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
-        <TrafficIndicator status={d.ingressStatus} title={DOT_TITLE[d.ingressStatus].in} />
-        <TrafficIndicator status={d.egressStatus}  title={DOT_TITLE[d.egressStatus].out} />
+        <TrafficIndicator status={d.ingressStatus} direction="ingress" title={DOT_TITLE[d.ingressStatus].in} />
+        <TrafficIndicator status={d.egressStatus}  direction="egress"  title={DOT_TITLE[d.egressStatus].out} />
       </div>
       <Handle type="source" position={Position.Right} style={{ background: handleColor(d.egressStatus) ?? '#3b82f6', width: 10, height: 10 }} />
     </div>
@@ -527,14 +533,17 @@ function buildGraph(
   let autoIdx = 0
 
   // Per-service node dot: reuses explainAccess() so it agrees with the "?"
-  // explain panel — 'isolated' (an actual restrict-ingress/egress applies,
-  // service- or namespace-scoped), 'implicit' (no restrict at all, but some
-  // allow-type policy selects this service, so Kubernetes default-denies
-  // everyone else), or 'open' (nothing restricts this direction).
-  function serviceDotStatus(name: string, ns: string, direction: 'ingress' | 'egress'): 'open' | 'implicit' | 'isolated' {
+  // explain panel — 'isolated'/'isolated-exc' (an actual restrict-ingress/
+  // egress applies, service- or namespace-scoped; -exc when some exception
+  // still lets a specific source through), 'implicit' (no restrict at all,
+  // but some allow-type policy selects this service, so Kubernetes
+  // default-denies everyone else), or 'open' (nothing restricts this
+  // direction).
+  function serviceDotStatus(name: string, ns: string, direction: 'ingress' | 'egress'): DotStatus {
     const r = explainAccess(name, ns, direction, policies)
     if (!r.blocked) return 'open'
-    return r.scope === 'none' ? 'implicit' : 'isolated'
+    if (r.scope === 'none') return 'implicit'
+    return r.exceptions.length > 0 ? 'isolated-exc' : 'isolated'
   }
   // Namespace-wide isolation: restrict policy with empty dst_service (podSelector: {})
   const nsIsolatedIngress = new Set(
