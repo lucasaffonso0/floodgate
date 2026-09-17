@@ -122,8 +122,6 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
     exceptionCount: number
     virtual?: boolean
   }
-  const fullyIsolated = d.isolatedIn && d.isolatedEg
-  const partiallyIsolated = d.isolatedIn || d.isolatedEg
   return (
     <div style={{
       width: '100%', height: '100%', borderRadius: 10, boxSizing: 'border-box',
@@ -131,13 +129,7 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
       backgroundColor: d.color,
       opacity: d.virtual ? 0.75 : 1,
       cursor: 'pointer',
-      boxShadow: selected
-        ? `0 0 0 3px ${d.borderColor}33`
-        : fullyIsolated
-          ? '0 0 0 3px #fca5a566, 0 2px 8px rgba(185,28,28,0.15)'
-          : partiallyIsolated
-            ? '0 0 0 2px #fca5a555'
-            : 'none',
+      boxShadow: selected ? `0 0 0 3px ${d.borderColor}33` : 'none',
       transition: 'box-shadow 0.15s',
     }}>
       <Handle type="target" position={Position.Left}
