@@ -88,6 +88,9 @@ export interface AppConfig {
   approval_default_approvers: Array<{ id: string; username: string }>
   auto_default_deny_enabled: boolean
   auto_default_deny_direction: 'ingress' | 'egress' | 'both'
+  auto_default_deny_allow_intra: boolean
+  auto_default_deny_allow_internet: boolean
+  auto_default_deny_scope: 'all' | 'future_only'
   autosync_enabled: boolean
   autosync_interval_s: number
   hubble_discovery_enabled: boolean

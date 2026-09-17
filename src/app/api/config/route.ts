@@ -1,10 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
-import { getConfig, setConfig } from '@/lib/config'
+import { getConfig, setConfig, isNamespaceWatched, setAutoDefaultDenyBaseline } from '@/lib/config'
+import { listServices } from '@/lib/k8s'
 import { apiError, parseBody } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { CronExpressionParser } from 'cron-parser'
 import type { AppConfig } from '@/types'
+
+const SELF_NAMESPACE = 'floodgate'
 
 export async function GET() {
   const user = await getCurrentUser()
@@ -20,7 +23,7 @@ export async function PUT(req: NextRequest) {
     const body = await parseBody<Partial<AppConfig>>(req)
     if (!body) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
 
-    for (const key of ['approval_enabled', 'auto_default_deny_enabled', 'autosync_enabled', 'hubble_discovery_enabled', 'backup_enabled'] as const) {
+    for (const key of ['approval_enabled', 'auto_default_deny_enabled', 'autosync_enabled', 'hubble_discovery_enabled', 'backup_enabled', 'auto_default_deny_allow_intra', 'auto_default_deny_allow_internet'] as const) {
       if (body[key] !== undefined && typeof body[key] !== 'boolean') {
         return NextResponse.json({ detail: `${key} deve ser booleano` }, { status: 400 })
       }
@@ -50,6 +53,11 @@ export async function PUT(req: NextRequest) {
         return NextResponse.json({ detail: "auto_default_deny_direction deve ser 'ingress', 'egress' ou 'both'" }, { status: 400 })
       }
     }
+    if (body.auto_default_deny_scope !== undefined) {
+      if (!['all', 'future_only'].includes(body.auto_default_deny_scope)) {
+        return NextResponse.json({ detail: "auto_default_deny_scope deve ser 'all' ou 'future_only'" }, { status: 400 })
+      }
+    }
     if (body.watched_namespaces !== undefined && !Array.isArray(body.watched_namespaces)) {
       return NextResponse.json({ detail: 'watched_namespaces deve ser um array' }, { status: 400 })
     }
@@ -70,8 +78,22 @@ export async function PUT(req: NextRequest) {
       return NextResponse.json({ detail: 'backup_s3_prefix deve ser uma string' }, { status: 400 })
     }
 
+    const previous = getConfig()
+
+    // Transitioning INTO future_only (not just re-saving while already in
+    // it) snapshots the namespaces that exist right now as "pre-existing" —
+    // only namespaces that show up after this point are in scope for
+    // auto-deny. Re-flip it off and on later and the snapshot is retaken.
+    if (body.auto_default_deny_scope === 'future_only' && previous.auto_default_deny_scope !== 'future_only') {
+      const services = await listServices()
+      const baseline = [...new Set(
+        services.map(s => s.namespace).filter(ns => ns !== SELF_NAMESPACE && isNamespaceWatched(ns))
+      )]
+      setAutoDefaultDenyBaseline(baseline)
+    }
+
     // Merge over the current config so partial updates don't write `undefined`
-    setConfig({ ...getConfig(), ...body })
+    setConfig({ ...previous, ...body })
     logAudit({ user_id: user.sub, username: user.username, action: 'update_config', resource_type: 'Config', resource_name: 'app_config' })
     return NextResponse.json(getConfig())
   } catch (e) {

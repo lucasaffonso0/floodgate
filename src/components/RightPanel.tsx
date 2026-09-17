@@ -2193,14 +2193,37 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
           <span style={{ fontSize: 11, color: '#475569' }}>Aplicar em namespaces sem cobertura</span>
         </div>
         {local.auto_default_deny_enabled && (
-          <div style={{ paddingLeft: 46, marginBottom: 8 }}>
-            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>Direção</label>
-            <select value={local.auto_default_deny_direction} onChange={e => setLocal(p => ({ ...p, auto_default_deny_direction: e.target.value as AppConfig['auto_default_deny_direction'] }))}
-              style={{ border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 11 }}>
-              <option value="ingress">Ingress only</option>
-              <option value="egress">Egress only</option>
-              <option value="both">Ambos</option>
-            </select>
+          <div style={{ paddingLeft: 46, marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>Direção</label>
+              <select value={local.auto_default_deny_direction} onChange={e => setLocal(p => ({ ...p, auto_default_deny_direction: e.target.value as AppConfig['auto_default_deny_direction'] }))}
+                style={{ border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 11 }}>
+                <option value="ingress">Ingress only</option>
+                <option value="egress">Egress only</option>
+                <option value="both">Ambos</option>
+              </select>
+            </div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 11, fontWeight: 600, color: '#475569' }}>
+              <input type="checkbox" checked={local.auto_default_deny_allow_intra} onChange={e => setLocal(p => ({ ...p, auto_default_deny_allow_intra: e.target.checked }))} style={{ accentColor: '#3b82f6' }} />
+              Permitir tráfego interno ao namespace
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 11, fontWeight: 600, color: '#475569' }}>
+              <input type="checkbox" checked={local.auto_default_deny_allow_internet} onChange={e => setLocal(p => ({ ...p, auto_default_deny_allow_internet: e.target.checked }))} style={{ accentColor: '#3b82f6' }} />
+              Permitir egress para internet
+            </label>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>Escopo</label>
+              <select value={local.auto_default_deny_scope} onChange={e => setLocal(p => ({ ...p, auto_default_deny_scope: e.target.value as AppConfig['auto_default_deny_scope'] }))}
+                style={{ border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 11 }}>
+                <option value="all">Namespaces existentes e futuras</option>
+                <option value="future_only">Somente futuras (a partir de agora)</option>
+              </select>
+              {local.auto_default_deny_scope === 'future_only' && (
+                <div style={{ fontSize: 9.5, color: '#94a3b8', marginTop: 4, lineHeight: 1.4 }}>
+                  Ao salvar, os namespaces que existem agora ficam de fora pra sempre — só as criadas depois entram na regra. Desligar e ligar essa opção de novo atualiza esse corte.
+                </div>
+              )}
+            </div>
           </div>
         )}
         <div style={{ fontSize: 10, color: '#94a3b8', background: '#f8fafc', borderRadius: 6, padding: '8px 10px', lineHeight: 1.5 }}>

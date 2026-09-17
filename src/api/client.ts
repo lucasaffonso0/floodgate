@@ -111,7 +111,7 @@ export const getApprovalRequestYAML = (id: string): Promise<string> =>
 export const getSecurityCoverage = (): Promise<SecurityCoverage[]> =>
   api.get('/security-coverage').then(r => r.data)
 
-export const applyDefaultDeny = (namespace: string, direction: 'ingress' | 'egress' | 'both'): Promise<NetworkPolicyInfo[]> =>
+export const applyDefaultDeny = (namespace: string, direction: 'ingress' | 'egress' | 'both'): Promise<Array<{ name: string; namespace: string; created: boolean }>> =>
   api.post('/security-coverage', { namespace, direction }).then(r => r.data)
 
 export const isolateNamespace = (req: { namespace: string; direction: 'ingress' | 'egress' | 'both'; allow_intra_namespace: boolean; allow_egress_internet: boolean }): Promise<{ created: number; skipped: number }> =>

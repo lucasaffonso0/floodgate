@@ -543,6 +543,48 @@ export async function createNamespaceIngressPolicy(req: {
   }
 }
 
+// One namespace-wide restrict policy (podSelector: {} = all pods, including
+// ones with no Service in front of them — broader than createRestrictPolicy,
+// which is scoped to a single service's selector). Deterministic name, fixed
+// empty-deny spec, so re-creating it is always a no-op: a 409 just means the
+// desired state already exists, not a conflict to resolve via replace.
+export async function createNamespaceRestrictPolicy(
+  namespace: string, direction: 'ingress' | 'egress'
+): Promise<{ name: string; namespace: string; created: boolean }> {
+  const policyName = sanitizeK8sName(`floodgate-ns-deny-${direction}-${namespace}`)
+  const policyType = `restrict-${direction}` as 'restrict-ingress' | 'restrict-egress'
+  const spec: k8s.V1NetworkPolicySpec = {
+    podSelector: {},
+    policyTypes: [direction === 'ingress' ? 'Ingress' : 'Egress'],
+  }
+  if (direction === 'ingress') spec.ingress = []
+  else spec.egress = []
+
+  const body: k8s.V1NetworkPolicy = {
+    metadata: {
+      name: policyName,
+      namespace,
+      labels: {
+        'managed-by': MANAGED_BY,
+        'floodgate-policy-type': policyType,
+        'source-workload': '',
+        'source-namespace': '',
+        'target-service': '',
+        'target-port': '0',
+      },
+    },
+    spec,
+  }
+  try {
+    await networking.createNamespacedNetworkPolicy({ namespace, body })
+    return { name: policyName, namespace, created: true }
+  } catch (e) {
+    // Only "already exists" is a no-op: RBAC/validation failures must surface
+    if (getK8sStatus(e) === 409) return { name: policyName, namespace, created: false }
+    throw e
+  }
+}
+
 export async function isolateNamespace(req: IsolateNamespaceRequest): Promise<{ created: number; skipped: number }> {
   let created = 0, skipped = 0
   const directions: ('ingress' | 'egress')[] = req.direction === 'both' ? ['ingress', 'egress'] : [req.direction]
@@ -550,38 +592,9 @@ export async function isolateNamespace(req: IsolateNamespaceRequest): Promise<{ 
   // One namespace-wide deny policy per direction (podSelector: {} = all pods).
   // Existing per-service allow rules continue to work via K8s OR semantics.
   for (const dir of directions) {
-    const policyName = sanitizeK8sName(`floodgate-ns-deny-${dir}-${req.namespace}`)
-    const policyType = `restrict-${dir}` as 'restrict-ingress' | 'restrict-egress'
-    const spec: k8s.V1NetworkPolicySpec = {
-      podSelector: {},
-      policyTypes: [dir === 'ingress' ? 'Ingress' : 'Egress'],
-    }
-    if (dir === 'ingress') spec.ingress = []
-    else spec.egress = []
-
-    const body: k8s.V1NetworkPolicy = {
-      metadata: {
-        name: policyName,
-        namespace: req.namespace,
-        labels: {
-          'managed-by': MANAGED_BY,
-          'floodgate-policy-type': policyType,
-          'source-workload': '',
-          'source-namespace': '',
-          'target-service': '',
-          'target-port': '0',
-        },
-      },
-      spec,
-    }
-    try {
-      await networking.createNamespacedNetworkPolicy({ namespace: req.namespace, body })
-      created++
-    } catch (e) {
-      // Only "already exists" counts as skipped: RBAC/validation failures must surface
-      if (getK8sStatus(e) === 409) skipped++
-      else throw e
-    }
+    const r = await createNamespaceRestrictPolicy(req.namespace, dir)
+    if (r.created) created++
+    else skipped++
   }
 
   if (req.allow_intra_namespace) {

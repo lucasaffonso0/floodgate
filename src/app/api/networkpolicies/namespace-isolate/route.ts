@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser, canManageNamespace } from '@/lib/auth'
-import { isolateNamespace, getPolicyYAML, sanitizeK8sName } from '@/lib/k8s'
+import { isolateNamespace } from '@/lib/k8s'
 import { isNamespaceWatched } from '@/lib/config'
 import { apiError, parseBody } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
-import { saveManagedPolicy } from '@/lib/autosync'
+import { trackIsolatedPolicies } from '@/lib/autosync'
 import { emit } from '@/lib/sse'
 
 export async function POST(req: NextRequest) {
@@ -38,18 +38,9 @@ export async function POST(req: NextRequest) {
     })
 
     // Save each created policy to managed_policies for autosync tracking.
-    // Names must be built exactly like isolateNamespace does (sanitizeK8sName).
     const dirs: ('ingress' | 'egress')[] = direction === 'both' ? ['ingress', 'egress'] : [direction as 'ingress' | 'egress']
     for (const dir of dirs) {
-      const names = [sanitizeK8sName(`floodgate-ns-deny-${dir}-${namespace}`)]
-      if (allow_intra_namespace) names.push(sanitizeK8sName(`floodgate-intra-${dir}-${namespace}`))
-      for (const n of names) {
-        getPolicyYAML(namespace, n).then(y => saveManagedPolicy(namespace, n, y)).catch(() => {})
-      }
-    }
-    if (allow_egress_internet && (direction === 'egress' || direction === 'both')) {
-      const n = sanitizeK8sName(`floodgate-egress-internet-${namespace}`)
-      getPolicyYAML(namespace, n).then(y => saveManagedPolicy(namespace, n, y)).catch(() => {})
+      trackIsolatedPolicies(namespace, dir, !!allow_intra_namespace, !!allow_egress_internet)
     }
 
     logAudit({

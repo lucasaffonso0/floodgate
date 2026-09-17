@@ -10,6 +10,9 @@ const DEFAULTS: AppConfig = {
   approval_default_approvers: [],
   auto_default_deny_enabled: false,
   auto_default_deny_direction: 'ingress',
+  auto_default_deny_allow_intra: true,
+  auto_default_deny_allow_internet: false,
+  auto_default_deny_scope: 'all',
   autosync_enabled: false,
   autosync_interval_s: 60,
   hubble_discovery_enabled: false,
@@ -45,6 +48,9 @@ export function getConfig(): AppConfig {
     approval_default_approvers:   parseJson(getRow('approval_default_approvers'), DEFAULTS.approval_default_approvers),
     auto_default_deny_enabled:    parseJson(getRow('auto_default_deny_enabled'), DEFAULTS.auto_default_deny_enabled),
     auto_default_deny_direction:  (getRow('auto_default_deny_direction') ?? 'ingress') as AppConfig['auto_default_deny_direction'],
+    auto_default_deny_allow_intra:    parseJson(getRow('auto_default_deny_allow_intra'), DEFAULTS.auto_default_deny_allow_intra),
+    auto_default_deny_allow_internet: parseJson(getRow('auto_default_deny_allow_internet'), DEFAULTS.auto_default_deny_allow_internet),
+    auto_default_deny_scope:          (getRow('auto_default_deny_scope') ?? 'all') as AppConfig['auto_default_deny_scope'],
     autosync_enabled:             parseJson(getRow('autosync_enabled'), DEFAULTS.autosync_enabled),
     autosync_interval_s:          parseJson(getRow('autosync_interval_s'), DEFAULTS.autosync_interval_s),
     hubble_discovery_enabled:     parseJson(getRow('hubble_discovery_enabled'), DEFAULTS.hubble_discovery_enabled),
@@ -67,6 +73,9 @@ export function setConfig(c: AppConfig): void {
     upsert.run('approval_default_approvers', JSON.stringify(c.approval_default_approvers ?? []))
     upsert.run('auto_default_deny_enabled',  JSON.stringify(c.auto_default_deny_enabled))
     upsert.run('auto_default_deny_direction', c.auto_default_deny_direction)
+    upsert.run('auto_default_deny_allow_intra',    JSON.stringify(c.auto_default_deny_allow_intra ?? true))
+    upsert.run('auto_default_deny_allow_internet', JSON.stringify(c.auto_default_deny_allow_internet ?? false))
+    upsert.run('auto_default_deny_scope', c.auto_default_deny_scope ?? 'all')
     upsert.run('autosync_enabled',    JSON.stringify(c.autosync_enabled))
     upsert.run('autosync_interval_s', JSON.stringify(c.autosync_interval_s))
     upsert.run('hubble_discovery_enabled',   JSON.stringify(c.hubble_discovery_enabled ?? false))
@@ -76,6 +85,19 @@ export function setConfig(c: AppConfig): void {
     upsert.run('backup_s3_bucket',  c.backup_s3_bucket ?? '')
     upsert.run('backup_s3_prefix',  c.backup_s3_prefix ?? DEFAULTS.backup_s3_prefix)
   })()
+}
+
+// Snapshot of namespaces considered "already existing" when auto-deny's
+// scope is switched to future_only — not part of AppConfig (never returned
+// to the client as a normal setting), same treatment as autosync_last_run.
+const BASELINE_KEY = 'auto_default_deny_baseline_namespaces'
+
+export function getAutoDefaultDenyBaseline(): string[] {
+  return parseJson(getRow(BASELINE_KEY), [])
+}
+
+export function setAutoDefaultDenyBaseline(namespaces: string[]): void {
+  getDb().prepare('INSERT OR REPLACE INTO app_config (key, value) VALUES (?, ?)').run(BASELINE_KEY, JSON.stringify(namespaces))
 }
 
 export function isNamespaceWatched(namespace: string): boolean {

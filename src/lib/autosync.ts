@@ -1,6 +1,6 @@
 import 'server-only'
 import { getDb } from './db'
-import { listNetworkPolicies, applyPolicyYAML, getPolicyYAML, listNamespaceNames } from './k8s'
+import { listNetworkPolicies, applyPolicyYAML, getPolicyYAML, listNamespaceNames, sanitizeK8sName } from './k8s'
 
 // The target namespace itself (not just the policy) is gone: restoring will
 // keep failing until someone recreates it. Kept apart from a transient error
@@ -25,6 +25,19 @@ export function saveManagedPolicy(namespace: string, name: string, policyYaml: s
 
 export function removeManagedPolicy(namespace: string, name: string): void {
   getDb().prepare('DELETE FROM managed_policies WHERE namespace = ? AND name = ?').run(namespace, name)
+}
+
+// Registers the policies isolateNamespace() creates for one direction into
+// managed_policies, reconstructing their deterministic names the same way
+// isolateNamespace() builds them — used by both the manual "Isolar
+// namespace" route and the auto-default-deny path so the two stay in sync.
+export function trackIsolatedPolicies(namespace: string, direction: 'ingress' | 'egress', allowIntra: boolean, allowInternet: boolean): void {
+  const names = [sanitizeK8sName(`floodgate-ns-deny-${direction}-${namespace}`)]
+  if (allowIntra) names.push(sanitizeK8sName(`floodgate-intra-${direction}-${namespace}`))
+  if (allowInternet && direction === 'egress') names.push(sanitizeK8sName(`floodgate-egress-internet-${namespace}`))
+  for (const n of names) {
+    getPolicyYAML(namespace, n).then(y => saveManagedPolicy(namespace, n, y)).catch(() => {})
+  }
 }
 
 export function getManagedPolicyCount(): number {
