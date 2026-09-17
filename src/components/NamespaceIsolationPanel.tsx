@@ -3,7 +3,7 @@
 import React from 'react'
 import { ServiceInfo, NetworkPolicyInfo } from '@/types'
 import { deleteNetworkPolicy, isolateNamespace } from '@/api/client'
-import { getNamespaceIsolation } from '@/lib/nsIsolation'
+import { getNamespaceIsolation, getOtherPoliciesInNamespace } from '@/lib/nsIsolation'
 
 function NsDirRow({
   label, nsIsolated, nsPolicy, applying, isViewer, onApply, onRemove,
@@ -94,23 +94,37 @@ export function NamespaceIsolationPanel({
   }
 
   async function removePolicy(p: NetworkPolicyInfo) {
+    // Se não sobrar nenhuma restrict namespace-wide, os companions da
+    // isolação (intra, internet) ficam sem função e são limpos junto.
+    const otherRestrict = policies.find(op =>
+      op.namespace === namespace &&
+      op.name !== p.name &&
+      (op.policy_type === 'restrict-ingress' || op.policy_type === 'restrict-egress') &&
+      op.dst_service === ''
+    )
+    const companions = otherRestrict ? [] : policies.filter(op =>
+      op.namespace === namespace &&
+      (op.policy_type === 'allow-intranamespace' ||
+       (op.policy_type === 'allow-egress' && op.dst_service === 'internet'))
+    )
+
+    // Qualquer outra policy que sobrar continua restringindo implicitamente
+    // o que ela seleciona, mesmo sem o restrict — avisa antes de deixar o
+    // namespace "parecendo aberto" sem estar de verdade.
+    const others = getOtherPoliciesInNamespace(namespace, [p.name, ...companions.map(c => c.name)], policies)
+    let removeOthers = false
+    if (others.length > 0) {
+      removeOthers = confirm(
+        `Remover o isolamento não deixa "${namespace}" totalmente aberto: ainda ${others.length === 1 ? 'existe 1 outra regra' : `existem ${others.length} outras regras`} nesse namespace (${others.map(o => o.name).join(', ')}) que vão continuar restringindo o que elas selecionam.\n\nRemover essa(s) regra(s) também?`
+      )
+    }
+
     setApplying(true); setResult(null)
     try {
       await deleteNetworkPolicy(p.namespace, p.name)
-      // Se não sobrou nenhuma restrict namespace-wide, limpa companions
-      const otherRestrict = policies.find(op =>
-        op.namespace === namespace &&
-        op.name !== p.name &&
-        (op.policy_type === 'restrict-ingress' || op.policy_type === 'restrict-egress') &&
-        op.dst_service === ''
-      )
-      if (!otherRestrict) {
-        const companions = policies.filter(op =>
-          op.namespace === namespace &&
-          (op.policy_type === 'allow-intranamespace' ||
-           (op.policy_type === 'allow-egress' && op.dst_service === 'internet'))
-        )
-        await Promise.all(companions.map(op => deleteNetworkPolicy(op.namespace, op.name).catch(() => {})))
+      await Promise.all(companions.map(op => deleteNetworkPolicy(op.namespace, op.name).catch(() => {})))
+      if (removeOthers) {
+        await Promise.all(others.map(op => deleteNetworkPolicy(op.namespace, op.name).catch(() => {})))
       }
       onPolicyChanged()
     } catch {

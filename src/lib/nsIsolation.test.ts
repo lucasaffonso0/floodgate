@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { getNamespaceIsolation } from './nsIsolation'
+import { getNamespaceIsolation, getOtherPoliciesInNamespace } from './nsIsolation'
 import { NetworkPolicyInfo } from '@/types'
 
 function policy(overrides: Partial<NetworkPolicyInfo>): NetworkPolicyInfo {
@@ -60,5 +60,31 @@ describe('getNamespaceIsolation', () => {
     const policies = [policy({ name: 'other-ns-deny', policy_type: 'restrict-ingress', namespace: 'other', dst_service: '' })]
     const r = getNamespaceIsolation('ns', policies)
     expect(r.anyIsolated).toBe(false)
+  })
+})
+
+describe('getOtherPoliciesInNamespace', () => {
+  it('returns policies in that namespace not in the exclude list', () => {
+    const policies = [
+      policy({ name: 'ns-deny-in', policy_type: 'restrict-ingress', namespace: 'ns', dst_service: '' }),
+      policy({ name: 'allow-svc', policy_type: 'allow', namespace: 'ns', dst_service: 'svc' }),
+    ]
+    const r = getOtherPoliciesInNamespace('ns', ['ns-deny-in'], policies)
+    expect(r.map(p => p.name)).toEqual(['allow-svc'])
+  })
+
+  it('is empty when nothing else is left besides the excluded names', () => {
+    const policies = [
+      policy({ name: 'ns-deny-in', policy_type: 'restrict-ingress', namespace: 'ns', dst_service: '' }),
+      policy({ name: 'intra-in', policy_type: 'allow-intranamespace', namespace: 'ns' }),
+    ]
+    const r = getOtherPoliciesInNamespace('ns', ['ns-deny-in', 'intra-in'], policies)
+    expect(r).toEqual([])
+  })
+
+  it('ignores policies from other namespaces', () => {
+    const policies = [policy({ name: 'other-ns-allow', policy_type: 'allow', namespace: 'other', dst_service: 'svc' })]
+    const r = getOtherPoliciesInNamespace('ns', [], policies)
+    expect(r).toEqual([])
   })
 })

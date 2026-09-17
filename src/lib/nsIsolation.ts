@@ -26,3 +26,18 @@ export function getNamespaceIsolation(namespace: string, policies: NetworkPolicy
     fullyIsolated: !!ingressPolicy && !!egressPolicy,
   }
 }
+
+// Removing the namespace-wide restrict doesn't necessarily reopen the
+// namespace: any other policy still there (e.g. a per-service allow) still
+// makes Kubernetes default-deny whatever it selects, independent of the
+// restrict policy that was just removed. `excludeNames` is the restrict
+// policy itself plus its isolation companions (allow-intranamespace, the
+// internet allow-egress) — those are already handled by the caller, not
+// "other" policies to warn about here.
+export function getOtherPoliciesInNamespace(
+  namespace: string,
+  excludeNames: string[],
+  policies: NetworkPolicyInfo[],
+): NetworkPolicyInfo[] {
+  return policies.filter(p => p.namespace === namespace && !excludeNames.includes(p.name))
+}
