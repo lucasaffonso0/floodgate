@@ -139,6 +139,9 @@ export default function App() {
   const [showApprovalToast, setShowApprovalToast] = useState(false)
   const [openPasswordModal, setOpenPasswordModal] = useState(false)
   const [requestTab, setRequestTab] = useState<'aprovacoes' | 'drafts' | null>(null)
+  // Controlled so the Segurança tab's "Isolar" button can open this same
+  // floating panel on the graph, instead of duplicating its UI inline.
+  const [selectedNamespace, setSelectedNamespace] = useState<string | null>(null)
   const [ciliumFlows, setCiliumFlows] = useState<CiliumFlowSummary[]>([])
   const [ciliumStreaming, setCiliumStreaming] = useState(false)
   const currentUserRef = useRef<User | null>(null)
@@ -867,6 +870,7 @@ export default function App() {
           ciliumFlows={ciliumFlows}
           ciliumStreaming={ciliumStreaming}
           onClearCiliumFlows={() => clearCiliumFlows().then(() => setCiliumFlows([])).catch(() => {})}
+          onViewNamespace={setSelectedNamespace}
         />
         <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
           {visibleNamespaces.size > 0 && visibleNamespaces.size < allNamespaces.length && (
@@ -925,6 +929,8 @@ export default function App() {
             ciliumStreaming={ciliumStreaming}
             ignoredNamespaces={config.ignored_namespaces}
             visibleNamespaces={visibleNamespaces}
+            selectedNamespace={selectedNamespace}
+            onSelectNamespace={setSelectedNamespace}
           />
         </div>
       </div>

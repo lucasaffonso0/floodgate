@@ -6,13 +6,14 @@ import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, AppConfig, User, Appro
 import {
   deleteNetworkPolicy, deleteAllPolicies, importPolicies, patchNetworkPolicyPort,
   getApprovalRequests, voteApprovalRequest, applyApprovalRequest, cancelApprovalRequest, getApprovalRequestYAML,
-  getSecurityCoverage, applyDefaultDeny, isolateNamespace,
+  getSecurityCoverage, isolateNamespace,
   getPausedPolicies, pauseAllPolicies, resumeAllPolicies, pausePolicy, resumePolicy,
   getAutosyncStatus, triggerAutosync, removeOrphanedManagedPolicy, removeOrphanedPausedPolicy, updateUserPassword, listUsers,
   adoptPolicy, unadoptPolicy, checkHubble, previewDiscoveryPolicyYAML, createCidrPolicy,
   getBackupStatus, triggerBackup,
 } from '@/api/client'
 import { normalizeWorkload } from '@/lib/flowMatch'
+import { getNamespaceIsolation } from '@/lib/nsIsolation'
 import { CronExpressionParser } from 'cron-parser'
 
 function isValidCron(expr: string): boolean {
@@ -1448,126 +1449,75 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   )
 }
 
-// ─── Security tab: per-service posture ────────────────────────────────────
-type ServicePosture = {
-  name: string; namespace: string
-  hasDenyIngress: boolean; hasDenyEgress: boolean; allowCount: number
-}
-
-function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace, onRefresh }: {
+// ─── Security tab ──────────────────────────────────────────────────────────
+function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace, onRefresh, onViewNamespace }: {
   services: ServiceInfo[]; policies: NetworkPolicyInfo[]; config: AppConfig; isAdmin: boolean; canManageNamespace?: (namespace: string) => boolean; onRefresh: () => void
+  onViewNamespace?: (ns: string) => void
 }) {
   const [coverageLoaded, setCoverageLoaded] = useState(false)
-  const [applyingNs, setApplyingNs] = useState<string | null>(null)
   const [expandedSection, setExpandedSection] = useState<'exposed' | 'partial' | 'protected' | null>('exposed')
-  const [view, setView] = useState<'services' | 'namespaces'>('services')
-  const [isoNs, setIsoNs] = useState<string | null>(null)
-  const [isoDirection, setIsoDirection] = useState<'ingress' | 'egress' | 'both'>('both')
-  const [isoAllowIntra, setIsoAllowIntra] = useState(true)
-  const [isoApplying, setIsoApplying] = useState(false)
+  const [bulkBusy, setBulkBusy] = useState<'exposed' | 'partial' | null>(null)
+  const [expShowOpts, setExpShowOpts] = useState(false)
+  const [expDirection, setExpDirection] = useState<'ingress' | 'egress' | 'both'>('both')
+  const [expAllowIntra, setExpAllowIntra] = useState(true)
+  const [expAllowInternet, setExpAllowInternet] = useState(false)
+  const [partShowOpts, setPartShowOpts] = useState(false)
+  const [partAllowIntra, setPartAllowIntra] = useState(true)
+  const [partAllowInternet, setPartAllowInternet] = useState(false)
   useEffect(() => {
     getSecurityCoverage().then(() => setCoverageLoaded(true)).catch(() => setCoverageLoaded(true))
   }, [])
 
-  const postures: ServicePosture[] = services.map(svc => {
-    const nsPols = policies.filter(p => p.namespace === svc.namespace)
-    // Inclui policies por serviço E policies namespace-wide (dst_service='') que cobrem todos os pods
-    const svcPolicies = nsPols.filter(p => p.dst_service === svc.name || p.dst_service === '')
-    return {
-      name: svc.name,
-      namespace: svc.namespace,
-      hasDenyIngress: svcPolicies.some(p => p.policy_type === 'restrict-ingress'),
-      hasDenyEgress:  svcPolicies.some(p => p.policy_type === 'restrict-egress'),
-      allowCount: nsPols.filter(p => p.dst_service === svc.name && ['allow', 'allow-egress', 'allow-namespace'].includes(p.policy_type)).length,
+  // Namespace is the only unit of isolation status/action — a single source
+  // of truth (getNamespaceIsolation) shared with the graph's namespace
+  // panel, so the two never disagree about what's covered.
+  const nsBuckets = [...new Set(services.map(s => s.namespace))].sort().map(ns => ({
+    ns,
+    count: services.filter(s => s.namespace === ns).length,
+    iso: getNamespaceIsolation(ns, policies),
+  }))
+  const exposedNs   = nsBuckets.filter(b => !b.iso.anyIsolated)
+  const partialNs   = nsBuckets.filter(b => b.iso.anyIsolated && !b.iso.fullyIsolated)
+  const protectedNs = nsBuckets.filter(b => b.iso.fullyIsolated)
+  const total = nsBuckets.length
+
+  async function handleIsolateAllExposed() {
+    const targets = exposedNs.map(b => b.ns).filter(ns => !canManageNamespace || canManageNamespace(ns))
+    if (targets.length === 0) return
+    if (!confirm(`Isolar ${targets.length} namespace(s) expostos?`)) return
+    setBulkBusy('exposed')
+    for (const ns of targets) {
+      try { await isolateNamespace({ namespace: ns, direction: expDirection, allow_intra_namespace: expAllowIntra, allow_egress_internet: expAllowInternet }) } catch { /* best-effort */ }
     }
-  })
-
-  const exposed    = postures.filter(s => !s.hasDenyIngress && !s.hasDenyEgress)
-  const partial    = postures.filter(s => (s.hasDenyIngress || s.hasDenyEgress) && !(s.hasDenyIngress && s.hasDenyEgress))
-  const protected_ = postures.filter(s => s.hasDenyIngress && s.hasDenyEgress)
-  const total = postures.length
-
-  async function handleApplyDeny(ns: string, direction: 'ingress' | 'egress' | 'both') {
-    setApplyingNs(ns)
-    try { await applyDefaultDeny(ns, direction); onRefresh() } finally { setApplyingNs(null) }
-  }
-
-  async function handleApplyAllExposed() {
-    const namespaces = [...new Set(exposed.map(s => s.namespace).filter(ns => !canManageNamespace || canManageNamespace(ns)))]
-    for (const ns of namespaces) {
-      try { await applyDefaultDeny(ns, 'ingress') } catch { /* best-effort */ }
-    }
+    setBulkBusy(null)
     onRefresh()
   }
 
-  async function handleIsolate(ns: string) {
-    setIsoApplying(true)
-    try {
-      await isolateNamespace({ namespace: ns, direction: isoDirection, allow_intra_namespace: isoAllowIntra, allow_egress_internet: false })
-      setIsoNs(null)
-      onRefresh()
-    } finally { setIsoApplying(false) }
-  }
-
-  async function handleUnisolate(ns: string) {
-    const isolationNames = new Set([
-      `floodgate-ns-deny-ingress-${ns}`.slice(0, 63),
-      `floodgate-ns-deny-egress-${ns}`.slice(0, 63),
-      `floodgate-intra-ingress-${ns}`.slice(0, 63),
-      `floodgate-intra-egress-${ns}`.slice(0, 63),
-      `floodgate-egress-internet-${ns}`.slice(0, 63),
-    ])
-    // Remove policies criadas pelo isolateNamespace (namespace-wide) + restrict por serviço do mesmo namespace
-    // (restrict por serviço cobertos pela regra namespace-wide: remover junto para consistência)
-    const toDelete = policies.filter(p =>
-      p.namespace === ns && (
-        isolationNames.has(p.name) ||
-        p.policy_type === 'restrict-ingress' ||
-        p.policy_type === 'restrict-egress' ||
-        p.policy_type === 'allow-intranamespace'
-      )
-    )
-    if (toDelete.length === 0) return
-    if (!confirm(`Remover ${toDelete.length} policies de isolamento do namespace "${ns}"?`)) return
-    for (const p of toDelete) {
-      try { await deleteNetworkPolicy(p.namespace, p.name) } catch { /* já removida */ }
+  async function handleCompletePartial() {
+    const targets = partialNs.filter(b => !canManageNamespace || canManageNamespace(b.ns))
+    if (targets.length === 0) return
+    if (!confirm(`Completar isolamento em ${targets.length} namespace(s)?`)) return
+    setBulkBusy('partial')
+    for (const { ns, iso } of targets) {
+      const missingDir = iso.isolatedIn ? 'egress' : 'ingress'
+      try { await isolateNamespace({ namespace: ns, direction: missingDir, allow_intra_namespace: partAllowIntra, allow_egress_internet: partAllowInternet }) } catch { /* best-effort */ }
     }
+    setBulkBusy(null)
     onRefresh()
   }
-
-  // Per-namespace stats for the namespace view
-  const nsList = [...new Set(services.map(s => s.namespace))].sort()
-  const nsStats = nsList.map(ns => {
-    const nsSvcs = services.filter(s => s.namespace === ns)
-    const nsPols = policies.filter(p => p.namespace === ns)
-    const withIn  = nsSvcs.filter(s => nsPols.some(p => p.dst_service === s.name && p.policy_type === 'restrict-ingress')).length
-    const withOut = nsSvcs.filter(s => nsPols.some(p => p.dst_service === s.name && p.policy_type === 'restrict-egress')).length
-    const total = nsSvcs.length
-    const fullyProtected = withIn === total && withOut === total
-    const anyProtected   = withIn > 0 || withOut > 0
-    const isolationNames = new Set([
-      `floodgate-ns-deny-ingress-${ns}`.slice(0, 63),
-      `floodgate-ns-deny-egress-${ns}`.slice(0, 63),
-      `floodgate-intra-ingress-${ns}`.slice(0, 63),
-      `floodgate-intra-egress-${ns}`.slice(0, 63),
-      `floodgate-egress-internet-${ns}`.slice(0, 63),
-    ])
-    const hasNsIsolation = nsPols.some(p => isolationNames.has(p.name))
-    return { ns, total, withIn, withOut, fullyProtected, anyProtected, hasNsIsolation }
-  })
 
   if (!coverageLoaded) {
     return <div style={{ padding: 24, textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>Analisando cobertura…</div>
   }
 
   if (total === 0) {
-    return <div style={{ padding: 24, textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>Nenhum serviço encontrado.</div>
+    return <div style={{ padding: 24, textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>Nenhum namespace encontrado.</div>
   }
 
   const sections = [
-    { id: 'exposed'    as const, label: 'Expostos',               sublabel: 'Sem nenhuma restrição',           color: '#dc2626', bg: '#fef2f2', border: '#fecaca', items: exposed },
-    { id: 'partial'    as const, label: 'Parcialmente protegidos', sublabel: 'Apenas ingress ou egress restrito', color: '#d97706', bg: '#fffbeb', border: '#fde68a', items: partial },
-    { id: 'protected'  as const, label: 'Totalmente protegidos',   sublabel: 'Ingress e egress com default-deny', color: '#16a34a', bg: '#f0fdf4', border: '#bbf7d0', items: protected_ },
+    { id: 'exposed'    as const, label: 'Expostos',               sublabel: 'Nenhum isolamento',                 color: '#dc2626', bg: '#fef2f2', border: '#fecaca', items: exposedNs },
+    { id: 'partial'    as const, label: 'Parcialmente isolados',  sublabel: 'Só ingress ou só egress',            color: '#d97706', bg: '#fffbeb', border: '#fde68a', items: partialNs },
+    { id: 'protected'  as const, label: 'Totalmente isolados',    sublabel: 'Ingress e egress com default-deny',  color: '#16a34a', bg: '#f0fdf4', border: '#bbf7d0', items: protectedNs },
   ]
 
   return (
@@ -1575,9 +1525,9 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
       <div style={{ padding: '10px 14px', borderBottom: '1px solid #f1f5f9', flexShrink: 0 }}>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6, marginBottom: 8 }}>
           {[
-            { count: exposed.length,    label: 'Expostos',   color: '#dc2626', bg: '#fef2f2', border: '#fecaca' },
-            { count: partial.length,    label: 'Parciais',   color: '#d97706', bg: '#fffbeb', border: '#fde68a' },
-            { count: protected_.length, label: 'Protegidos', color: '#16a34a', bg: '#f0fdf4', border: '#bbf7d0' },
+            { count: exposedNs.length,   label: 'Expostos',   color: '#dc2626', bg: '#fef2f2', border: '#fecaca' },
+            { count: partialNs.length,   label: 'Parciais',   color: '#d97706', bg: '#fffbeb', border: '#fde68a' },
+            { count: protectedNs.length, label: 'Protegidos', color: '#16a34a', bg: '#f0fdf4', border: '#bbf7d0' },
           ].map(card => (
             <div key={card.label} style={{ background: card.bg, border: `1px solid ${card.border}`, borderRadius: 8, padding: '8px 10px', textAlign: 'center' }}>
               <div style={{ fontSize: 22, fontWeight: 800, color: card.color, lineHeight: 1 }}>{card.count}</div>
@@ -1587,96 +1537,15 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
           ))}
         </div>
         {config.auto_default_deny_enabled && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10, color: '#10b981', background: '#f0fdf4', borderRadius: 6, padding: '5px 8px', marginBottom: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10, color: '#10b981', background: '#f0fdf4', borderRadius: 6, padding: '5px 8px' }}>
             <Icon.Shield />
             Auto default-deny ativo ({config.auto_default_deny_direction})
           </div>
         )}
-        {/* View toggle */}
-        <div style={{ display: 'flex', background: '#f1f5f9', borderRadius: 6, padding: 2, gap: 2 }}>
-          {(['services', 'namespaces'] as const).map(v => (
-            <button key={v} onClick={() => setView(v)}
-              style={{ flex: 1, border: 'none', borderRadius: 5, padding: '4px 0', fontSize: 10, fontWeight: 600, cursor: 'pointer',
-                background: view === v ? 'white' : 'transparent',
-                color: view === v ? '#2563eb' : '#64748b',
-                boxShadow: view === v ? '0 1px 3px rgba(0,0,0,0.08)' : 'none',
-              }}>
-              {v === 'services' ? 'Por serviço' : 'Por namespace'}
-            </button>
-          ))}
-        </div>
       </div>
 
       <div style={{ flex: 1, overflowY: 'auto' }}>
-
-        {/* ── Namespace isolation view ── */}
-        {view === 'namespaces' && nsStats.map(({ ns, total, withIn, withOut, fullyProtected, anyProtected, hasNsIsolation }) => {
-          const color  = fullyProtected || hasNsIsolation ? '#16a34a' : anyProtected ? '#d97706' : '#dc2626'
-          const bg     = fullyProtected || hasNsIsolation ? '#f0fdf4'  : anyProtected ? '#fffbeb'  : '#fef2f2'
-          const border = fullyProtected || hasNsIsolation ? '#bbf7d0'  : anyProtected ? '#fde68a'  : '#fecaca'
-          const isOpen = isoNs === ns
-          return (
-            <div key={ns} style={{ borderBottom: `1px solid ${border}` }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 14px', background: bg }}>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ns}</div>
-                  <div style={{ fontSize: 9, color: '#94a3b8', marginTop: 2 }}>
-                    {total} svc · {withIn}/{total} IN · {withOut}/{total} OUT
-                    {hasNsIsolation && <span style={{ color: '#16a34a', fontWeight: 600 }}> · isolamento ativo</span>}
-                  </div>
-                </div>
-                {isAdmin && (!canManageNamespace || canManageNamespace(ns)) && (
-                  <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
-                    {hasNsIsolation && (
-                      <button
-                        style={{ ...btn.base, ...btn.gray, fontSize: 9, padding: '3px 8px' }}
-                        onClick={() => handleUnisolate(ns)}>
-                        Remover isolamento
-                      </button>
-                    )}
-                    <button
-                      style={{ ...btn.base, ...(isOpen ? btn.gray : btn.red), fontSize: 9, padding: '3px 8px' }}
-                      onClick={() => { setIsoNs(isOpen ? null : ns); setIsoDirection('both'); setIsoAllowIntra(true) }}>
-                      {isOpen ? 'Cancelar' : 'Isolar'}
-                    </button>
-                  </div>
-                )}
-              </div>
-              {isOpen && (
-                <div style={{ padding: '10px 14px', background: '#fafafa', borderTop: '1px solid #f1f5f9' }}>
-                  <div style={{ marginBottom: 8 }}>
-                    <label style={{ display: 'block', fontSize: 10, fontWeight: 600, color: '#475569', marginBottom: 3 }}>Direção do bloqueio</label>
-                    <select value={isoDirection} onChange={e => setIsoDirection(e.target.value as typeof isoDirection)}
-                      style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 5, padding: '5px 8px', fontSize: 11 }}>
-                      <option value="ingress">Ingress only</option>
-                      <option value="egress">Egress only</option>
-                      <option value="both">Ingress + Egress</option>
-                    </select>
-                  </div>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, cursor: 'pointer', fontSize: 10, fontWeight: 600, color: '#475569' }}>
-                    <input type="checkbox" checked={isoAllowIntra} onChange={e => setIsoAllowIntra(e.target.checked)} style={{ accentColor: '#3b82f6' }} />
-                    Permitir tráfego interno ao namespace
-                  </label>
-                  <div style={{ fontSize: 10, color: '#c2410c', background: '#fff7ed', borderRadius: 5, padding: '5px 8px', marginBottom: 8 }}>
-                    ⚠ Aplica default-deny em {total} serviço(s). Serviços sem allow explícito ficarão inacessíveis.
-                  </div>
-                  <button
-                    style={{ ...btn.base, ...btn.red, width: '100%', justifyContent: 'center', opacity: isoApplying ? 0.6 : 1 }}
-                    disabled={isoApplying}
-                    onClick={() => handleIsolate(ns)}>
-                    <Icon.Shield /> {isoApplying ? 'Aplicando…' : `Isolar namespace ${ns}`}
-                  </button>
-                </div>
-              )}
-            </div>
-          )
-        })}
-        {view === 'namespaces' && nsStats.length === 0 && (
-          <div style={{ padding: 24, textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>Nenhum namespace encontrado.</div>
-        )}
-
-        {/* ── Per-service view ── */}
-        {view === 'services' && sections.map(sec => (
+        {sections.map(sec => (
           <div key={sec.id}>
             <button onClick={() => setExpandedSection(prev => prev === sec.id ? null : sec.id)}
               style={{ width: '100%', padding: '8px 14px', background: sec.bg, border: 'none', borderBottom: `1px solid ${sec.border}`, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8, textAlign: 'left' }}>
@@ -1690,46 +1559,84 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
 
             {expandedSection === sec.id && (
               <>
-                {sec.id === 'exposed' && isAdmin && sec.items.some(s => !canManageNamespace || canManageNamespace(s.namespace)) && (
-                  <div style={{ padding: '8px 14px', background: '#fff5f5', borderBottom: '1px solid #fecaca' }}>
-                    <button style={{ ...btn.base, ...btn.red, fontSize: 10, width: '100%', justifyContent: 'center' }} onClick={handleApplyAllExposed}>
-                      <Icon.Shield /> Aplicar default-deny ingress em todos expostos
-                    </button>
+                {sec.id === 'exposed' && isAdmin && sec.items.length > 0 && sec.items.some(b => !canManageNamespace || canManageNamespace(b.ns)) && (
+                  <div style={{ padding: '8px 14px', background: '#fff5f5', borderBottom: '1px solid #fecaca', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                      <button style={{ ...btn.base, ...btn.red, fontSize: 10, flex: 1, justifyContent: 'center' }} disabled={bulkBusy === 'exposed'} onClick={handleIsolateAllExposed}>
+                        <Icon.Shield /> {bulkBusy === 'exposed' ? 'Isolando…' : `Isolar ${exposedNs.length} namespace(s) expostos`}
+                      </button>
+                      <button onClick={() => setExpShowOpts(v => !v)} style={{ ...btn.base, ...btn.gray, fontSize: 9, padding: '4px 8px', flexShrink: 0 }}>Opções</button>
+                    </div>
+                    {expShowOpts && (
+                      <div style={{ background: 'white', border: '1px solid #fecaca', borderRadius: 6, padding: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        <select value={expDirection} onChange={e => setExpDirection(e.target.value as typeof expDirection)}
+                          style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 5, padding: '5px 8px', fontSize: 11 }}>
+                          <option value="both">Ingress + egress</option>
+                          <option value="ingress">Somente ingress</option>
+                          <option value="egress">Somente egress</option>
+                        </select>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 10, fontWeight: 600, color: '#475569' }}>
+                          <input type="checkbox" checked={expAllowIntra} onChange={e => setExpAllowIntra(e.target.checked)} style={{ accentColor: '#3b82f6' }} />
+                          Permitir tráfego interno ao namespace
+                        </label>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 10, fontWeight: 600, color: '#475569' }}>
+                          <input type="checkbox" checked={expAllowInternet} onChange={e => setExpAllowInternet(e.target.checked)} style={{ accentColor: '#3b82f6' }} />
+                          Permitir egress para internet
+                        </label>
+                      </div>
+                    )}
                   </div>
                 )}
-                {sec.items.map(svc => {
-                  const isApplying = applyingNs === svc.namespace
-                  const missingIn = !svc.hasDenyIngress
-                  const missingEg = !svc.hasDenyEgress
-                  return (
-                    <div key={`${svc.namespace}/${svc.name}`} style={{ padding: '8px 14px 8px 22px', borderBottom: '1px solid #f9fafb', display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 11, fontWeight: 600, color: '#1e293b' }}>{svc.name}</div>
-                        <div style={{ display: 'flex', gap: 8, marginTop: 2 }}>
-                          <span style={{ fontSize: 9, fontWeight: 600, color: svc.hasDenyIngress ? '#16a34a' : '#dc2626' }}>{svc.hasDenyIngress ? '✓' : '✗'} IN</span>
-                          <span style={{ fontSize: 9, fontWeight: 600, color: svc.hasDenyEgress ? '#16a34a' : '#dc2626' }}>{svc.hasDenyEgress ? '✓' : '✗'} OUT</span>
-                          {svc.allowCount > 0 && <span style={{ fontSize: 9, color: '#94a3b8' }}>{svc.allowCount} allow</span>}
-                        </div>
-                      </div>
-                      {isAdmin && (!canManageNamespace || canManageNamespace(svc.namespace)) && (missingIn || missingEg) && (
-                        <div style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
-                          {missingIn && <button style={{ ...btn.base, ...btn.red, padding: '2px 6px', fontSize: 9, opacity: isApplying ? 0.6 : 1 }} onClick={() => handleApplyDeny(svc.namespace, 'ingress')} disabled={isApplying}>+IN</button>}
-                          {missingEg && <button style={{ ...btn.base, ...btn.orange, padding: '2px 6px', fontSize: 9, opacity: isApplying ? 0.6 : 1 }} onClick={() => handleApplyDeny(svc.namespace, 'egress')} disabled={isApplying}>+OUT</button>}
-                        </div>
-                      )}
+                {sec.id === 'partial' && isAdmin && sec.items.length > 0 && sec.items.some(b => !canManageNamespace || canManageNamespace(b.ns)) && (
+                  <div style={{ padding: '8px 14px', background: '#fffbeb', borderBottom: '1px solid #fde68a', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                      <button style={{ ...btn.base, ...btn.orange, fontSize: 10, flex: 1, justifyContent: 'center' }} disabled={bulkBusy === 'partial'} onClick={handleCompletePartial}>
+                        <Icon.Shield /> {bulkBusy === 'partial' ? 'Completando…' : `Completar isolamento (${partialNs.length})`}
+                      </button>
+                      <button onClick={() => setPartShowOpts(v => !v)} style={{ ...btn.base, ...btn.gray, fontSize: 9, padding: '4px 8px', flexShrink: 0 }}>Opções</button>
                     </div>
-                  )
-                })}
+                    {partShowOpts && (
+                      <div style={{ background: 'white', border: '1px solid #fde68a', borderRadius: 6, padding: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 10, fontWeight: 600, color: '#475569' }}>
+                          <input type="checkbox" checked={partAllowIntra} onChange={e => setPartAllowIntra(e.target.checked)} style={{ accentColor: '#3b82f6' }} />
+                          Permitir tráfego interno ao namespace
+                        </label>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 10, fontWeight: 600, color: '#475569' }}>
+                          <input type="checkbox" checked={partAllowInternet} onChange={e => setPartAllowInternet(e.target.checked)} style={{ accentColor: '#3b82f6' }} />
+                          Permitir egress para internet
+                        </label>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {sec.items.map(({ ns, count, iso }) => (
+                  <div key={ns}
+                    onClick={() => onViewNamespace?.(ns)}
+                    style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 14px 9px 22px', borderBottom: `1px solid ${sec.border}`, cursor: onViewNamespace ? 'pointer' : 'default' }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: '#1e293b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ns}</div>
+                      <div style={{ fontSize: 9, color: '#94a3b8', marginTop: 2 }}>
+                        {count} serviço(s) · IN {iso.isolatedIn ? '✓' : '✗'} · OUT {iso.isolatedEg ? '✓' : '✗'}
+                        {iso.anyIsolated && <span style={{ color: '#16a34a', fontWeight: 600 }}> · isolamento ativo</span>}
+                      </div>
+                    </div>
+                    {onViewNamespace && (
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#cbd5e1" strokeWidth="2.5" style={{ flexShrink: 0 }}>
+                        <path d="M9 6l6 6-6 6"/>
+                      </svg>
+                    )}
+                  </div>
+                ))}
                 {sec.items.length === 0 && (
                   <div style={{ padding: '12px 14px', textAlign: 'center', fontSize: 11, color: '#94a3b8' }}>
-                    {sec.id === 'protected' ? 'Nenhum serviço totalmente protegido ainda.' : 'Nenhum.'}
+                    {sec.id === 'protected' ? 'Nenhum namespace totalmente isolado ainda.' : 'Nenhum.'}
                   </div>
                 )}
               </>
             )}
           </div>
         ))}
-
       </div>
     </div>
   )
@@ -2850,6 +2757,7 @@ interface Props {
   ciliumFlows?: CiliumFlowSummary[]
   ciliumStreaming?: boolean
   onClearCiliumFlows?: () => void
+  onViewNamespace?: (ns: string) => void
 }
 
 export default function RightPanel({
@@ -2859,6 +2767,7 @@ export default function RightPanel({
   onUpdateDraftPort, onPoliciesChanged, onSaveConfig,
   ciliumFlows = [], ciliumStreaming = false,
   onClearCiliumFlows,
+  onViewNamespace,
 }: Props) {
   // Defaults here must match what the server renders (no localStorage access
   // during the initial render) — reading it happens in the mount effect
@@ -3121,7 +3030,7 @@ export default function RightPanel({
             {activeTab === 'drafts' && !isViewer && <DraftsTab drafts={drafts} services={services} ciliumFlows={ciliumFlows} config={config} currentUser={currentUser} onRemove={onRemoveDraft} onApply={onApplyDraft} onApplyAll={onApplyAllDrafts} onDiscardAll={onDiscardAllDrafts} onUpdatePort={onUpdateDraftPort} onAddDraft={onAddDraft} />}
             {activeTab === 'policies' && <PoliciesTab policies={policies} allPolicies={allPolicies} services={services} isAdmin={isAdmin} isViewer={isViewer} canManageNamespace={canManageNamespace} onDelete={onPoliciesChanged} onRefresh={onPoliciesChanged} />}
             {activeTab === 'aprovacoes' && <ApprovacoesTab key={approvalTabKey} currentUser={currentUser} config={config} onRefresh={onPoliciesChanged} pendingApprovals={pendingApprovals} />}
-            {activeTab === 'seguranca' && <SegurancaTab services={services} policies={policies} config={config} isAdmin={isAdmin} canManageNamespace={canManageNamespace} onRefresh={onPoliciesChanged} />}
+            {activeTab === 'seguranca' && <SegurancaTab services={services} policies={policies} config={config} isAdmin={isAdmin} canManageNamespace={canManageNamespace} onRefresh={onPoliciesChanged} onViewNamespace={onViewNamespace} />}
             {activeTab === 'descoberta' && isAdmin && <DescobertaTab flows={ciliumFlows} config={config} streaming={ciliumStreaming} allPolicies={allPolicies} onClear={onClearCiliumFlows} onAddDraft={onAddDraft} onSaveConfig={onSaveConfig} onSwitchTab={(tab) => setActiveTab(tab)} />}
             {activeTab === 'descoberta' && !isAdmin && <Forbidden />}
             {activeTab === 'config' && isAdmin && <ConfigTab config={config} onSave={onSaveConfig} />}

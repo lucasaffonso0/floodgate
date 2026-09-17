@@ -1,11 +1,11 @@
-import { NextRequest, NextResponse } from 'next/server'
+import { NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
-import { listServices, listNetworkPolicies, createNamespaceRestrictPolicy, isolateNamespace, getPolicyYAML } from '@/lib/k8s'
+import { listServices, listNetworkPolicies, isolateNamespace } from '@/lib/k8s'
 import { getConfig, isNamespaceWatched, getAutoDefaultDenyBaseline } from '@/lib/config'
-import { parseBody } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { getDb } from '@/lib/db'
-import { saveManagedPolicy, trackIsolatedPolicies } from '@/lib/autosync'
+import { trackIsolatedPolicies } from '@/lib/autosync'
+import { getNamespaceIsolation } from '@/lib/nsIsolation'
 import type { SecurityCoverage } from '@/types'
 
 const SELF_NAMESPACE = 'floodgate'
@@ -34,12 +34,14 @@ export async function GET() {
   const coverage: SecurityCoverage[] = []
   for (const [ns, svcs] of byNamespace) {
     const nsPolicies = policies.filter(p => p.namespace === ns)
-    const has_deny_ingress = nsPolicies.some(p => p.policy_type === 'restrict-ingress')
-    const has_deny_egress  = nsPolicies.some(p => p.policy_type === 'restrict-egress')
+    const managed_policy_count = nsPolicies.length
+
+    // Namespace isolation, not per-service: same source of truth as the
+    // graph's namespace panel and the Segurança tab, so all three agree.
+    const { isolatedIn: has_deny_ingress, isolatedEg: has_deny_egress } = getNamespaceIsolation(ns, policies)
     const has_intra_ingress = nsPolicies.some(p => p.policy_type === 'allow-intranamespace' && p.policy_types.includes('Ingress'))
     const has_intra_egress  = nsPolicies.some(p => p.policy_type === 'allow-intranamespace' && p.policy_types.includes('Egress'))
     const has_internet_egress = nsPolicies.some(p => p.policy_type === 'allow-egress' && p.dst_service === 'internet')
-    const managed_policy_count = nsPolicies.length
 
     let applied_ingress = has_deny_ingress
     let applied_egress = has_deny_egress
@@ -82,33 +84,4 @@ export async function GET() {
   }
 
   return NextResponse.json(coverage)
-}
-
-export async function POST(req: NextRequest) {
-  const user = await getCurrentUser()
-  if (!user || user.role !== 'admin') return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
-
-  const body = await parseBody<{ namespace?: string; direction?: string }>(req)
-  if (!body) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
-  const { namespace, direction } = body
-  if (!namespace || !direction) return NextResponse.json({ detail: 'namespace e direction são obrigatórios' }, { status: 400 })
-  if (!['ingress', 'egress', 'both'].includes(direction)) return NextResponse.json({ detail: "direction deve ser 'ingress', 'egress' ou 'both'" }, { status: 400 })
-  const results = []
-  const errors: string[] = []
-  const dirs = direction === 'both' ? ['ingress', 'egress'] as const : [direction as 'ingress' | 'egress']
-  for (const dir of dirs) {
-    try {
-      const p = await createNamespaceRestrictPolicy(namespace, dir)
-      results.push(p)
-      logAudit({ user_id: user.sub, username: user.username, action: `apply_default_deny_${dir}`, resource_type: 'NetworkPolicy', resource_name: p.name, namespace })
-      getPolicyYAML(p.namespace, p.name).then(y => saveManagedPolicy(p.namespace, p.name, y)).catch(() => {})
-    } catch (e) {
-      console.error(`[floodgate] default-deny ${dir} falhou para ${namespace}:`, e)
-      errors.push(dir)
-    }
-  }
-  if (errors.length > 0) {
-    return NextResponse.json({ detail: `Falha ao aplicar default-deny (${errors.join(', ')})` }, { status: 500 })
-  }
-  return NextResponse.json(results, { status: 201 })
 }
