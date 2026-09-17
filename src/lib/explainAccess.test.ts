@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { explainAccess } from './explainAccess'
+import { explainAccess, sourceIsExempt, isDestinationExempt } from './explainAccess'
 import { NetworkPolicyInfo } from '@/types'
 
 function policy(overrides: Partial<NetworkPolicyInfo>): NetworkPolicyInfo {
@@ -120,5 +120,62 @@ describe('explainAccess', () => {
     const nsScoped = r.exceptions.find(e => e.label === 'internet')
     expect(svcScoped?.scope).toBe('service')
     expect(nsScoped?.scope).toBe('namespace')
+  })
+})
+
+describe('sourceIsExempt / isDestinationExempt', () => {
+  it('sourceIsExempt matches an exact per-workload ingress allow', () => {
+    const policies = [policy({ policy_type: 'allow', namespace: 'backend', dst_service: 'worker', src_workload: 'app', src_namespace: 'frontend' })]
+    const r = explainAccess('worker', 'backend', 'ingress', policies)
+    expect(sourceIsExempt(r.exceptions, 'frontend', 'app', 'backend')).toBe(true)
+    expect(sourceIsExempt(r.exceptions, 'frontend', 'other-workload', 'backend')).toBe(false)
+  })
+
+  it('sourceIsExempt matches an allow-namespace regardless of the specific workload', () => {
+    const policies = [policy({ policy_type: 'allow-namespace', namespace: 'backend', dst_service: 'worker', src_namespace: 'frontend' })]
+    const r = explainAccess('worker', 'backend', 'ingress', policies)
+    expect(sourceIsExempt(r.exceptions, 'frontend', 'anything', 'backend')).toBe(true)
+    expect(sourceIsExempt(r.exceptions, 'other-ns', 'anything', 'backend')).toBe(false)
+  })
+
+  // This is the exact bug the live cluster caught: an intra-namespace allow
+  // in the DESTINATION's namespace must not exempt a source from a
+  // completely different namespace just because "intra" showed up in the
+  // exceptions list.
+  it('sourceIsExempt does not let an intra-namespace allow exempt a source from a different namespace', () => {
+    const policies = [policy({ policy_type: 'allow-intranamespace', namespace: 'backend', policy_types: ['Ingress'] })]
+    const r = explainAccess('worker', 'backend', 'ingress', policies)
+    expect(sourceIsExempt(r.exceptions, 'backend', 'other-svc', 'backend')).toBe(true) // same namespace: covered
+    expect(sourceIsExempt(r.exceptions, 'frontend', 'app', 'backend')).toBe(false) // different namespace: not covered
+  })
+
+  it('isDestinationExempt matches a per-workload egress allow by destination service name', () => {
+    const policies = [policy({ policy_type: 'allow-egress', namespace: 'frontend', src_workload: 'app', src_namespace: 'frontend', dst_service: 'worker' })]
+    const r = explainAccess('app', 'frontend', 'egress', policies)
+    expect(isDestinationExempt(r.exceptions, 'worker', 'frontend', 'backend')).toBe(true)
+    expect(isDestinationExempt(r.exceptions, 'other-service', 'frontend', 'backend')).toBe(false)
+  })
+
+  it('isDestinationExempt matches a namespace-wide egress allow scoped to that destination', () => {
+    const policies = [policy({ policy_type: 'allow-egress', namespace: 'frontend', src_workload: '', src_namespace: 'frontend', dst_service: 'worker' })]
+    const r = explainAccess('app', 'frontend', 'egress', policies)
+    expect(isDestinationExempt(r.exceptions, 'worker', 'frontend', 'backend')).toBe(true)
+  })
+
+  it('isDestinationExempt does not exempt an unrelated internet-only egress allow', () => {
+    const policies = [policy({ policy_type: 'allow-egress', namespace: 'frontend', src_workload: '', src_namespace: 'frontend', dst_service: 'internet' })]
+    const r = explainAccess('app', 'frontend', 'egress', policies)
+    expect(isDestinationExempt(r.exceptions, 'worker', 'frontend', 'backend')).toBe(false)
+  })
+
+  // This is the exact bug the live cluster caught: frontend has an
+  // intra-namespace egress allow (for its OWN pods talking to each other),
+  // which must not exempt egress to a service in a totally different
+  // namespace (backend) just because "intra" is present in the exceptions.
+  it('isDestinationExempt does not let an intra-namespace egress allow exempt a cross-namespace destination', () => {
+    const policies = [policy({ policy_type: 'allow-intranamespace', namespace: 'frontend', policy_types: ['Egress'] })]
+    const r = explainAccess('app', 'frontend', 'egress', policies)
+    expect(isDestinationExempt(r.exceptions, 'other-app-in-frontend', 'frontend', 'frontend')).toBe(true) // same namespace: covered
+    expect(isDestinationExempt(r.exceptions, 'worker', 'frontend', 'backend')).toBe(false) // different namespace: not covered
   })
 })

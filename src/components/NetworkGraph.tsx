@@ -26,7 +26,7 @@ import { toPng } from 'html-to-image'
 import dagre from '@dagrejs/dagre'
 import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, ServiceLayout, ApprovalRequest, CiliumFlowSummary } from '@/types'
 import { deleteNetworkPolicy, restrictService, patchNetworkPolicyPort } from '@/api/client'
-import { explainAccess, type ExplainResult } from '@/lib/explainAccess'
+import { explainAccess, sourceIsExempt, isDestinationExempt, type ExplainResult } from '@/lib/explainAccess'
 import { normalizeWorkload } from '@/lib/flowMatch'
 import { getNamespaceIsolation } from '@/lib/nsIsolation'
 import { NamespaceIsolationPanel } from './NamespaceIsolationPanel'
@@ -190,23 +190,38 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
 }
 
 // ─── Service node ──────────────────────────────────────────────────────────
-function TrafficIndicator({ denied, title }: { denied: boolean; title: string }) {
+type DotStatus = 'open' | 'implicit' | 'isolated'
+
+const DOT_STYLE: Record<DotStatus, { bg: string; border: string; symbol: string }> = {
+  open:     { bg: '#dcfce7', border: '#22c55e', symbol: '✓' },
+  implicit: { bg: '#fef3c7', border: '#f59e0b', symbol: '!' },
+  isolated: { bg: '#fee2e2', border: '#ef4444', symbol: '✕' },
+}
+
+function TrafficIndicator({ status, title }: { status: DotStatus; title: string }) {
+  const s = DOT_STYLE[status]
   return (
     <div title={title} style={{
       width: 14, height: 14, borderRadius: '50%', flexShrink: 0,
-      background: denied ? '#fee2e2' : '#dcfce7',
-      border: `1.5px solid ${denied ? '#ef4444' : '#22c55e'}`,
+      background: s.bg, border: `1.5px solid ${s.border}`,
       display: 'flex', alignItems: 'center', justifyContent: 'center',
-      fontSize: 8, color: denied ? '#ef4444' : '#22c55e', fontWeight: 900,
+      fontSize: 8, color: s.border, fontWeight: 900,
     }}>
-      {denied ? '✕' : '✓'}
+      {s.symbol}
     </div>
   )
 }
 
+const DOT_TITLE: Record<DotStatus, { in: string; out: string }> = {
+  open:     { in: 'Inbound: aberto', out: 'Outbound: aberto' },
+  implicit: { in: 'Inbound: bloqueado implicitamente (allow existente sem isolamento)', out: 'Outbound: bloqueado implicitamente (allow existente sem isolamento)' },
+  isolated: { in: 'Inbound: default-deny ativo', out: 'Outbound: default-deny ativo' },
+}
+
 function ServiceNodeComponent({ data, selected }: NodeProps) {
-  const d = data as { name: string; ports: Array<{ port: number }>; ingressDenied: boolean; egressDenied: boolean }
+  const d = data as { name: string; ports: Array<{ port: number }>; ingressStatus: DotStatus; egressStatus: DotStatus }
   const portList = d.ports.slice(0, 3).map(p => p.port).join(', ')
+  const handleColor = (status: DotStatus) => status === 'open' ? undefined : DOT_STYLE[status].border
   return (
     <div style={{
       background: selected ? '#eff6ff' : 'white',
@@ -215,14 +230,14 @@ function ServiceNodeComponent({ data, selected }: NodeProps) {
       boxShadow: selected ? '0 0 0 3px #bfdbfe' : '0 1px 4px rgba(0,0,0,0.08)',
       transition: 'all 0.15s',
     }}>
-      <Handle type="target" position={Position.Left} style={{ background: d.ingressDenied ? '#ef4444' : '#94a3b8', width: 10, height: 10 }} />
+      <Handle type="target" position={Position.Left} style={{ background: handleColor(d.ingressStatus) ?? '#94a3b8', width: 10, height: 10 }} />
       <div style={{ fontSize: 12, fontWeight: 700, color: '#1e293b', whiteSpace: 'nowrap' }}>{d.name}</div>
       {portList && <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1 }}>:{portList}</div>}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
-        <TrafficIndicator denied={d.ingressDenied} title={d.ingressDenied ? 'Inbound: default-deny ativo' : 'Inbound: aberto'} />
-        <TrafficIndicator denied={d.egressDenied}  title={d.egressDenied  ? 'Outbound: default-deny ativo' : 'Outbound: aberto'} />
+        <TrafficIndicator status={d.ingressStatus} title={DOT_TITLE[d.ingressStatus].in} />
+        <TrafficIndicator status={d.egressStatus}  title={DOT_TITLE[d.egressStatus].out} />
       </div>
-      <Handle type="source" position={Position.Right} style={{ background: d.egressDenied ? '#ef4444' : '#3b82f6', width: 10, height: 10 }} />
+      <Handle type="source" position={Position.Right} style={{ background: handleColor(d.egressStatus) ?? '#3b82f6', width: 10, height: 10 }} />
     </div>
   )
 }
@@ -511,12 +526,16 @@ function buildGraph(
   const serviceNodes: Node[] = []
   let autoIdx = 0
 
-  const ingressDeniedSet = new Set(
-    policies.filter(p => p.policy_type === 'restrict-ingress').map(p => `${p.namespace}::${p.dst_service}`)
-  )
-  const egressDeniedSet = new Set(
-    policies.filter(p => p.policy_type === 'restrict-egress').map(p => `${p.namespace}::${p.dst_service}`)
-  )
+  // Per-service node dot: reuses explainAccess() so it agrees with the "?"
+  // explain panel — 'isolated' (an actual restrict-ingress/egress applies,
+  // service- or namespace-scoped), 'implicit' (no restrict at all, but some
+  // allow-type policy selects this service, so Kubernetes default-denies
+  // everyone else), or 'open' (nothing restricts this direction).
+  function serviceDotStatus(name: string, ns: string, direction: 'ingress' | 'egress'): 'open' | 'implicit' | 'isolated' {
+    const r = explainAccess(name, ns, direction, policies)
+    if (!r.blocked) return 'open'
+    return r.scope === 'none' ? 'implicit' : 'isolated'
+  }
   // Namespace-wide isolation: restrict policy with empty dst_service (podSelector: {})
   const nsIsolatedIngress = new Set(
     policies.filter(p => p.policy_type === 'restrict-ingress' && p.dst_service === '').map(p => p.namespace)
@@ -589,7 +608,11 @@ function buildGraph(
         position: saved
           ? { x: saved.x, y: saved.y }
           : { x: NS_PAD + col * (NODE_W + NODE_GAPH), y: NS_HEADER + NS_PAD + row * (NODE_H + NODE_GAPV) },
-        data: { name: svc.name, namespace: ns, ports: svc.ports, ingressDenied: ingressDeniedSet.has(key), egressDenied: egressDeniedSet.has(key) },
+        data: {
+          name: svc.name, namespace: ns, ports: svc.ports,
+          ingressStatus: serviceDotStatus(svc.name, ns, 'ingress'),
+          egressStatus: serviceDotStatus(svc.name, ns, 'egress'),
+        },
         draggable: !globalLocked && !nsLocked && svcs.length > 1,
         zIndex: 10,
       })
@@ -875,7 +898,7 @@ type ConnEntry = {
 
 function buildConnections(
   name: string, ns: string,
-  policies: NetworkPolicyInfo[], drafts: Draft[],
+  policies: NetworkPolicyInfo[], drafts: Draft[], services: ServiceInfo[],
 ) {
   const inbound:  Map<string, ConnEntry> = new Map()
   const outbound: Map<string, ConnEntry> = new Map()
@@ -891,8 +914,15 @@ function buildConnections(
   for (const p of policies) {
     if (p.policy_type === 'allow' && p.dst_service === name && p.namespace === ns)
       upsert(inbound, `${p.src_namespace}/${p.src_workload}`, `${p.src_workload} (${p.src_namespace})`, p.dst_port, 'policy')
-    if (p.policy_type === 'allow-egress' && p.src_workload === name && p.src_namespace === ns)
-      upsert(outbound, `${p.namespace}/${p.dst_service}`, `${p.dst_service} (${p.namespace})`, p.dst_port, 'policy-egress')
+    if (p.policy_type === 'allow-egress' && p.src_workload === name && p.src_namespace === ns) {
+      // p.namespace here is the SOURCE namespace (egress policies live
+      // there), NOT the destination's — NetworkPolicyInfo has no field for
+      // it, so resolve it by looking up the real service instead of
+      // mislabeling the destination with the source's own namespace.
+      const dstNs = p.dst_service === 'internet' ? null : services.find(s => s.name === p.dst_service)?.namespace
+      const label = dstNs ? `${p.dst_service} (${dstNs})` : p.dst_service
+      upsert(outbound, `${dstNs ?? ''}/${p.dst_service}`, label, p.dst_port, 'policy-egress')
+    }
   }
   for (const d of drafts) {
     if (d.dst_service === name && d.dst_namespace === ns)
@@ -920,7 +950,7 @@ const smallBtn = (danger = false): React.CSSProperties => ({
 })
 
 function AccessSection({
-  direction, restrictPolicy, connections, explain, isViewer, onRestrict, onRemoveRestrict,
+  direction, restrictPolicy, connections, explain, isViewer, onRestrict, onRemoveRestrict, implicitAllowCount, onRemoveImplicit,
 }: {
   direction: 'Inbound' | 'Outbound'
   restrictPolicy: NetworkPolicyInfo | undefined
@@ -929,10 +959,13 @@ function AccessSection({
   isViewer?: boolean
   onRestrict: () => void
   onRemoveRestrict: () => void
+  implicitAllowCount: number
+  onRemoveImplicit: () => void
 }) {
   const dir = direction === 'Inbound' ? 'ingress' : 'egress'
   const blocked = !!restrictPolicy
   const hasAllows = connections.length > 0
+  const isImplicitOnly = !blocked && explain.scope === 'none' && explain.blocked
   const [showWhy, setShowWhy] = React.useState(false)
 
   let icon: string, statusColor: string, bg: string, border: string
@@ -991,9 +1024,18 @@ function AccessSection({
           <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 4 }}>
             {blocked
               ? <button style={smallBtn(true)} onClick={onRemoveRestrict}>Remover default-deny</button>
-              : <button style={smallBtn()} onClick={onRestrict}>
-                  + {hasAllows ? 'Tornar default-deny explícito' : 'Aplicar default-deny'}
-                </button>
+              : (
+                <>
+                  {isImplicitOnly && (
+                    <button style={smallBtn(true)} onClick={onRemoveImplicit}>
+                      Remover bloqueio implícito ({implicitAllowCount})
+                    </button>
+                  )}
+                  <button style={smallBtn()} onClick={onRestrict}>
+                    + {hasAllows ? 'Tornar default-deny explícito' : 'Aplicar default-deny'}
+                  </button>
+                </>
+              )
             }
           </div>
         )}
@@ -1038,12 +1080,22 @@ function ServiceDetailPanel({
   const ns = parts[1], name = parts[2]
   const canManageCurrent = typeof canManageNamespace === 'function' ? canManageNamespace(ns) : !isViewer
   const svc = services.find(s => s.name === name && s.namespace === ns)
-  const { inbound, outbound } = buildConnections(name, ns, policies, drafts)
+  const { inbound, outbound } = buildConnections(name, ns, policies, drafts, services)
 
   const ingressRestrict = policies.find(p => p.dst_service === name && p.namespace === ns && p.policy_type === 'restrict-ingress')
   const egressRestrict  = policies.find(p => p.dst_service === name && p.namespace === ns && p.policy_type === 'restrict-egress')
   const ingressExplain = explainAccess(name, ns, 'ingress', policies)
   const egressExplain  = explainAccess(name, ns, 'egress',  policies)
+
+  // The allow-type policies causing an implicit lockdown (no restrict at
+  // all, but Kubernetes default-denies everyone else once these select this
+  // service) — removing them is what "Remover bloqueio implícito" does.
+  const ingressAllows = policies.filter(p =>
+    (p.policy_type === 'allow' || p.policy_type === 'allow-namespace' || p.policy_type === 'cidr-ingress') &&
+    p.dst_service === name && p.namespace === ns)
+  const egressAllows = policies.filter(p =>
+    (p.policy_type === 'allow-egress' || p.policy_type === 'cidr-egress') &&
+    p.src_workload === name && p.src_namespace === ns)
 
   async function applyRestrict(direction: 'ingress' | 'egress') {
     await restrictService({ service_name: name, namespace: ns, direction })
@@ -1052,6 +1104,14 @@ function ServiceDetailPanel({
 
   async function removeRestrict(policy: NetworkPolicyInfo) {
     await deleteNetworkPolicy(policy.namespace, policy.name)
+    onPolicyChanged()
+  }
+
+  async function removeImplicitBlock(allows: NetworkPolicyInfo[]) {
+    if (allows.length === 0) return
+    const names = allows.map(p => p.name).join(', ')
+    if (!confirm(`Remover ${allows.length === 1 ? 'essa regra' : `essas ${allows.length} regras`} (${names})? Isso deixa "${name}" totalmente aberto nessa direção.`)) return
+    await Promise.all(allows.map(p => deleteNetworkPolicy(p.namespace, p.name)))
     onPolicyChanged()
   }
 
@@ -1088,6 +1148,8 @@ function ServiceDetailPanel({
           isViewer={!canManageCurrent}
           onRestrict={() => applyRestrict('ingress')}
           onRemoveRestrict={() => ingressRestrict && removeRestrict(ingressRestrict)}
+          implicitAllowCount={ingressAllows.length}
+          onRemoveImplicit={() => removeImplicitBlock(ingressAllows)}
         />
         <div style={{ borderTop: '1px solid #f1f5f9' }} />
         <AccessSection
@@ -1098,6 +1160,8 @@ function ServiceDetailPanel({
           isViewer={!canManageCurrent}
           onRestrict={() => applyRestrict('egress')}
           onRemoveRestrict={() => egressRestrict && removeRestrict(egressRestrict)}
+          implicitAllowCount={egressAllows.length}
+          onRemoveImplicit={() => removeImplicitBlock(egressAllows)}
         />
       </div>
     </div>
@@ -1110,16 +1174,8 @@ function parseServiceNodeId(id: string): { ns: string; name: string } | null {
   return parts[0] === 'svc' ? { ns: parts[1], name: parts[2] } : null
 }
 
-// Does this specific flow's source match one of the destination's ingress
-// exceptions? Matched by the same label format explainAccess() generates —
-// good enough since we control that format ourselves.
-function sourceIsExempt(exceptions: ExplainResult['exceptions'], srcNs: string, srcName: string): boolean {
-  return exceptions.some(e =>
-    e.label === `${srcName} (${srcNs})` || e.label === `todo o namespace ${srcNs}` || e.label === 'pods do mesmo namespace')
-}
-
-function FlowExplainPanel({ edge, policies, onClose }: {
-  edge: Edge; policies: NetworkPolicyInfo[]; onClose: () => void
+function FlowExplainPanel({ edge, policies, onClose, onExplainFlow }: {
+  edge: Edge; policies: NetworkPolicyInfo[]; onClose: () => void; onExplainFlow?: (flowId: string) => void
 }) {
   const flow = edge.data!.flow as CiliumFlowSummary
   const dst = parseServiceNodeId(edge.target)
@@ -1131,7 +1187,20 @@ function FlowExplainPanel({ edge, policies, onClose }: {
   const dstName = dst?.name ?? normalizeWorkload(flow.dst_workload)
   const dstNs   = dst?.ns   ?? flow.dst_namespace
 
-  const exempt = dstExplain ? sourceIsExempt(dstExplain.exceptions, srcNs, srcName) : false
+  // "Exempt at dst" means ingress isn't what's blocking this flow — either
+  // nothing restricts ingress here at all, or it does and this source is
+  // specifically allowed through.
+  const exemptAtDst = dstExplain ? (!dstExplain.blocked || sourceIsExempt(dstExplain.exceptions, srcNs, srcName, dstNs)) : false
+
+  // The destination allowing ingress isn't the whole story — the source
+  // namespace's own egress restrictions can block the flow independently.
+  // Only worth computing once the destination side looks fine, since that's
+  // the confusing case: "source is allowed in, so why is this dropped?"
+  const srcExplain = exemptAtDst ? explainAccess(srcName, srcNs, 'egress', policies) : null
+  const exemptAtSrc = srcExplain ? (!srcExplain.blocked || isDestinationExempt(srcExplain.exceptions, dstName, srcNs, dstNs)) : true
+  const blockedAtSrc = !!srcExplain?.blocked && !exemptAtSrc
+
+  const exempt = exemptAtDst && !blockedAtSrc
 
   return (
     <div style={{
@@ -1154,23 +1223,24 @@ function FlowExplainPanel({ edge, policies, onClose }: {
         {dstExplain ? (
           <>
             <div style={{ fontSize: 11, fontWeight: 700, color: exempt ? '#b45309' : '#991b1b' }}>
-              {exempt
-                ? `${srcName} está na lista de liberados. Se mesmo assim foi bloqueado, pode ser porta/protocolo diferente ou um atraso momentâneo do Cilium.`
-                : `${srcName} (${srcNs}) não está liberado para acessar ${dstName} (${dstNs}).`}
+              {blockedAtSrc
+                ? `${dstName} permite a entrada, mas o namespace de origem "${srcNs}" está bloqueando a saída (egress).`
+                : exempt
+                  ? `${srcName} está na lista de liberados. Se mesmo assim foi bloqueado, pode ser porta/protocolo diferente ou um atraso momentâneo do Cilium.`
+                  : `${srcName} (${srcNs}) não está liberado para acessar ${dstName} (${dstNs}).`}
             </div>
 
             <div>
               <div style={{ fontSize: 9, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Motivo</div>
-              <div style={{ fontSize: 10.5, color: '#1e293b', fontWeight: 600 }}>{dstExplain.headline}</div>
-              {dstExplain.detail.length === 0 && (
-                <div style={{ fontSize: 9.5, color: '#64748b', marginTop: 2 }}>Nenhuma exceção configurada: ninguém tem acesso.</div>
-              )}
+              <div style={{ fontSize: 10.5, color: '#1e293b', fontWeight: 600 }}>{blockedAtSrc ? srcExplain!.headline : dstExplain.headline}</div>
             </div>
 
-            {dstExplain.exceptions.length > 0 && (
+            {(blockedAtSrc ? srcExplain!.exceptions.length > 0 : dstExplain.exceptions.length > 0) && (
               <div>
-                <div style={{ fontSize: 9, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Quem tem acesso liberado</div>
-                {dstExplain.exceptions.map((e, i) => (
+                <div style={{ fontSize: 9, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>
+                  {blockedAtSrc ? 'Quem pode sair (egress)' : 'Quem tem acesso liberado'}
+                </div>
+                {(blockedAtSrc ? srcExplain!.exceptions : dstExplain.exceptions).map((e, i) => (
                   <div key={i} style={{ fontSize: 9.5, color: '#334155', marginTop: 2 }}>✓ {e.label}</div>
                 ))}
               </div>
@@ -1185,6 +1255,15 @@ function FlowExplainPanel({ edge, policies, onClose }: {
         <div style={{ fontSize: 9, color: '#94a3b8', background: '#f8fafc', borderRadius: 6, padding: '6px 8px', lineHeight: 1.5 }}>
           Baseado em todas as NetworkPolicies do cluster, inclusive não-gerenciadas pelo Floodgate. O Hubble reporta o bloqueio real do Cilium, que pode vir de qualquer policy.
         </div>
+
+        {onExplainFlow && (
+          <button
+            onClick={() => onExplainFlow(flow.id)}
+            style={{ fontSize: 10.5, fontWeight: 600, color: '#2563eb', background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 6, cursor: 'pointer', padding: '6px 8px' }}
+          >
+            Abrir na Descoberta
+          </button>
+        )}
       </div>
     </div>
   )
@@ -1399,6 +1478,10 @@ interface Props {
   // this same floating panel) — falls back to internal state when omitted.
   selectedNamespace?: string | null
   onSelectNamespace?: (ns: string | null) => void
+  // Lets the "Abrir na Descoberta" button inside FlowExplainPanel jump to
+  // that flow's card in the Descoberta tab — owned by page.tsx, which knows
+  // how to switch RightPanel's active tab.
+  onExplainFlow?: (flowId: string) => void
 }
 
 // ─── Layout toolbar ────────────────────────────────────────────────────────
@@ -1646,7 +1729,7 @@ export default function NetworkGraph({
   onAddDraft, onRemoveDraft, onPolicyChanged,
   layoutSaveStatus = 'idle',
   ciliumFlows, ciliumStreaming, ignoredNamespaces = [], visibleNamespaces,
-  selectedNamespace, onSelectNamespace,
+  selectedNamespace, onSelectNamespace, onExplainFlow,
 }: Props) {
   const [nodes, setNodes] = useNodesState<Node>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<BuiltInEdge>([])
@@ -1958,6 +2041,7 @@ export default function NetworkGraph({
           edge={selectedFlowEdge}
           policies={allPolicies ?? policies}
           onClose={() => setSelectedFlowEdge(null)}
+          onExplainFlow={onExplainFlow}
         />
       )}
 

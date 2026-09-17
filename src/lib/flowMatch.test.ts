@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { normalizeWorkload, flowHasPolicy } from './flowMatch'
+import { normalizeWorkload, flowHasPolicy, classifyFlowGap } from './flowMatch'
 import { NetworkPolicyInfo } from '@/types'
 
 function policy(overrides: Partial<NetworkPolicyInfo>): NetworkPolicyInfo {
@@ -89,5 +89,60 @@ describe('flowHasPolicy', () => {
   it('ignores policies in a different namespace even if names match', () => {
     const policies = [policy({ policy_type: 'allow', namespace: 'other-ns', dst_service: 'worker', src_workload: 'app', src_namespace: 'frontend', dst_ports: [{ port: 8080, protocol: 'TCP' }] })]
     expect(flowHasPolicy(flow, policies)).toBe(false)
+  })
+
+  it('is false when the destination allows ingress but the source namespace has an unexempted namespace-wide egress-deny (the exact bug reported live: backend allowed app in, but frontend never let it out)', () => {
+    const policies = [
+      policy({ policy_type: 'allow', namespace: 'backend', dst_service: 'worker', src_workload: 'app', src_namespace: 'frontend', dst_ports: [{ port: 8080, protocol: 'TCP' }] }),
+      policy({ policy_type: 'restrict-egress', namespace: 'frontend', dst_service: '' }),
+    ]
+    expect(flowHasPolicy(flow, policies)).toBe(false)
+  })
+
+  it('is true when the source has a namespace-wide egress-deny but also a specific egress-allow exception covering this destination', () => {
+    const policies = [
+      policy({ policy_type: 'allow', namespace: 'backend', dst_service: 'worker', src_workload: 'app', src_namespace: 'frontend', dst_ports: [{ port: 8080, protocol: 'TCP' }] }),
+      policy({ policy_type: 'restrict-egress', namespace: 'frontend', dst_service: '' }),
+      policy({ policy_type: 'allow-egress', namespace: 'frontend', src_workload: 'app', src_namespace: 'frontend', dst_service: 'worker' }),
+    ]
+    expect(flowHasPolicy(flow, policies)).toBe(true)
+  })
+
+  it('is true when the source namespace has no egress restriction at all, even without any egress-allow', () => {
+    const policies = [
+      policy({ policy_type: 'allow', namespace: 'backend', dst_service: 'worker', src_workload: 'app', src_namespace: 'frontend', dst_ports: [{ port: 8080, protocol: 'TCP' }] }),
+    ]
+    expect(flowHasPolicy(flow, policies)).toBe(true)
+  })
+})
+
+describe('classifyFlowGap', () => {
+  const flow = { src_workload: 'app', src_namespace: 'frontend', dst_workload: 'worker', dst_namespace: 'backend', dst_port: 8080 }
+
+  it('flags neither side when nothing restricts ingress or egress (destination wide open)', () => {
+    const policies: NetworkPolicyInfo[] = []
+    expect(classifyFlowGap(flow, policies)).toEqual({ missingIngress: false, missingEgress: false })
+  })
+
+  it('flags only missing ingress when the destination has a restrict-ingress with no exception and the source has no egress restriction', () => {
+    const policies = [
+      policy({ policy_type: 'restrict-ingress', namespace: 'backend', dst_service: '' }),
+    ]
+    expect(classifyFlowGap(flow, policies)).toEqual({ missingIngress: true, missingEgress: false })
+  })
+
+  it('flags only missing egress when the destination has no policy at all (open) but the source egress is blocked (the reported bug: worker -> pgbouncer)', () => {
+    const policies = [
+      policy({ policy_type: 'restrict-egress', namespace: 'frontend', dst_service: '' }),
+    ]
+    expect(classifyFlowGap(flow, policies)).toEqual({ missingIngress: false, missingEgress: true })
+  })
+
+  it('flags both missing when the destination has a restrict-ingress and the source has a restrict-egress, neither with an exception', () => {
+    const policies = [
+      policy({ policy_type: 'restrict-ingress', namespace: 'backend', dst_service: '' }),
+      policy({ policy_type: 'restrict-egress', namespace: 'frontend', dst_service: '' }),
+    ]
+    expect(classifyFlowGap(flow, policies)).toEqual({ missingIngress: true, missingEgress: true })
   })
 })

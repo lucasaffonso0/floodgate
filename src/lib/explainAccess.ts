@@ -15,6 +15,10 @@ export interface ExplainExceptionEntry {
   policy: PolicyRef
   label: string
   scope: 'service' | 'namespace'
+  // Stable key for exemption checks (sourceIsExempt/isDestinationExempt) —
+  // separate from `label`, which is display text only and shouldn't be
+  // parsed. CIDR exceptions have no workload identity, so they get none.
+  matchKey?: string
 }
 
 export interface ExplainResult {
@@ -60,28 +64,32 @@ export function explainAccess(
         const label = p.policy_type === 'allow-namespace'
           ? `todo o namespace ${p.src_namespace}`
           : `${p.src_workload} (${p.src_namespace})`
-        exceptions.push({ kind: p.policy_type, policy: toRef(p), label, scope: 'service' })
+        const matchKey = p.policy_type === 'allow-namespace' ? `namespace:${p.src_namespace}` : `service:${p.src_workload}@${p.src_namespace}`
+        exceptions.push({ kind: p.policy_type, policy: toRef(p), label, scope: 'service', matchKey })
       }
       if (p.policy_type === 'cidr-ingress' && p.namespace === ns && (p.dst_service === name || p.dst_service === '')) {
         exceptions.push({ kind: 'cidr-ingress', policy: toRef(p), label: p.name, scope: p.dst_service === '' ? 'namespace' : 'service' })
       }
       if (p.policy_type === 'allow-intranamespace' && p.namespace === ns && p.policy_types.includes('Ingress')) {
-        exceptions.push({ kind: 'allow-intranamespace', policy: toRef(p), label: 'pods do mesmo namespace', scope: 'namespace' })
+        exceptions.push({ kind: 'allow-intranamespace', policy: toRef(p), label: 'pods do mesmo namespace', scope: 'namespace', matchKey: 'intra' })
       }
     }
   } else {
     for (const p of policies) {
       if (p.policy_type === 'allow-egress' && p.src_workload === name && p.src_namespace === ns) {
-        exceptions.push({ kind: 'allow-egress', policy: toRef(p), label: `${p.dst_service} (${p.namespace})`, scope: 'service' })
+        // p.namespace here is the SOURCE namespace (egress policies live
+        // there) — this label shows it in parens, not the destination's
+        // namespace, which NetworkPolicyInfo has no field for at all.
+        exceptions.push({ kind: 'allow-egress', policy: toRef(p), label: `${p.dst_service} (${p.namespace})`, scope: 'service', matchKey: `service:${p.dst_service}` })
       }
       if (p.policy_type === 'allow-egress' && p.src_workload === '' && p.namespace === ns) {
-        exceptions.push({ kind: 'allow-egress', policy: toRef(p), label: p.dst_service || 'internet', scope: 'namespace' })
+        exceptions.push({ kind: 'allow-egress', policy: toRef(p), label: p.dst_service || 'internet', scope: 'namespace', matchKey: `service:${p.dst_service}` })
       }
       if (p.policy_type === 'cidr-egress' && p.namespace === ns && (p.dst_service === name || p.dst_service === '')) {
         exceptions.push({ kind: 'cidr-egress', policy: toRef(p), label: p.name, scope: p.dst_service === '' ? 'namespace' : 'service' })
       }
       if (p.policy_type === 'allow-intranamespace' && p.namespace === ns && p.policy_types.includes('Egress')) {
-        exceptions.push({ kind: 'allow-intranamespace', policy: toRef(p), label: 'pods do mesmo namespace', scope: 'namespace' })
+        exceptions.push({ kind: 'allow-intranamespace', policy: toRef(p), label: 'pods do mesmo namespace', scope: 'namespace', matchKey: 'intra' })
       }
     }
   }
@@ -103,6 +111,28 @@ export function explainAccess(
     headline,
     detail,
   }
+}
+
+// Does this specific source match one of the destination's ingress
+// exceptions (from explainAccess(dst, dstNs, 'ingress', ...))? `dstNs` is
+// needed because an "intra" (allow-intranamespace) exception only ever
+// covers same-namespace traffic — it must NOT exempt a source that just
+// happens to live in a namespace with its own unrelated intra-namespace
+// allow rule.
+export function sourceIsExempt(exceptions: ExplainExceptionEntry[], srcNs: string, srcName: string, dstNs: string): boolean {
+  return exceptions.some(e =>
+    e.matchKey === `service:${srcName}@${srcNs}` ||
+    e.matchKey === `namespace:${srcNs}` ||
+    (e.matchKey === 'intra' && srcNs === dstNs))
+}
+
+// Does this specific destination match one of the source's egress
+// exceptions (from explainAccess(src, srcNs, 'egress', ...))? Matches by
+// service name only — NetworkPolicyInfo doesn't track a destination
+// namespace for egress policies, same limitation as the label above.
+// `dstNs` gates the "intra" match for the same reason as sourceIsExempt.
+export function isDestinationExempt(exceptions: ExplainExceptionEntry[], dstService: string, srcNs: string, dstNs: string): boolean {
+  return exceptions.some(e => e.matchKey === `service:${dstService}` || (e.matchKey === 'intra' && srcNs === dstNs))
 }
 
 function exceptionLines(exceptions: ExplainExceptionEntry[]): string[] {

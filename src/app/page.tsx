@@ -138,7 +138,14 @@ export default function App() {
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
   const [showApprovalToast, setShowApprovalToast] = useState(false)
   const [openPasswordModal, setOpenPasswordModal] = useState(false)
-  const [requestTab, setRequestTab] = useState<'aprovacoes' | 'drafts' | null>(null)
+  const [requestTab, setRequestTab] = useState<'aprovacoes' | 'drafts' | 'descoberta' | null>(null)
+  // "Abrir na Descoberta" (FlowExplainPanel no gráfico) — token muda a cada
+  // clique, mesmo pro mesmo flow, pra sempre re-disparar o scroll/destaque.
+  const [focusFlow, setFocusFlow] = useState<{ flowId: string; token: number } | null>(null)
+  function handleExplainFlow(flowId: string) {
+    setFocusFlow({ flowId, token: Date.now() })
+    setRequestTab('descoberta')
+  }
   // Controlled so the Segurança tab's "Isolar" button can open this same
   // floating panel on the graph, instead of duplicating its UI inline.
   const [selectedNamespace, setSelectedNamespace] = useState<string | null>(null)
@@ -865,6 +872,7 @@ export default function App() {
           pendingApprovals={pendingApprovals}
           requestTab={requestTab}
           onTabOpened={() => setRequestTab(null)}
+          focusFlow={focusFlow}
           openPasswordModal={openPasswordModal}
           onPasswordModalClosed={() => setOpenPasswordModal(false)}
           ciliumFlows={ciliumFlows}
@@ -931,6 +939,7 @@ export default function App() {
             visibleNamespaces={visibleNamespaces}
             selectedNamespace={selectedNamespace}
             onSelectNamespace={setSelectedNamespace}
+            onExplainFlow={currentUser?.role === 'admin' ? handleExplainFlow : undefined}
           />
         </div>
       </div>

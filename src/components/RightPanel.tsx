@@ -12,7 +12,7 @@ import {
   adoptPolicy, unadoptPolicy, checkHubble, previewDiscoveryPolicyYAML, createCidrPolicy,
   getBackupStatus, triggerBackup,
 } from '@/api/client'
-import { normalizeWorkload } from '@/lib/flowMatch'
+import { normalizeWorkload, classifyFlowGap } from '@/lib/flowMatch'
 import { getNamespaceIsolation } from '@/lib/nsIsolation'
 import { CronExpressionParser } from 'cron-parser'
 
@@ -2363,7 +2363,7 @@ function Forbidden() {
 // ─── DescobertaTab ───────────────────────────────────────────────────────────
 const DISC_FILTER_KEY = 'floodgate-disc-filters'
 
-function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDraft, onSaveConfig, onSwitchTab }: {
+function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDraft, onSaveConfig, onSwitchTab, focusFlow }: {
   flows: CiliumFlowSummary[]
   config: AppConfig
   streaming: boolean
@@ -2372,6 +2372,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   onAddDraft: (d: Omit<Draft, 'id'>) => void
   onSaveConfig: (c: AppConfig) => Promise<void>
   onSwitchTab: (tab: Tab) => void
+  focusFlow?: { flowId: string; token: number } | null
 }) {
   const savedFilters = (() => { try { return JSON.parse(localStorage.getItem(DISC_FILTER_KEY) ?? '{}') } catch { return {} } })()
   const [nsFilter, setNsFilter] = useState<string>(savedFilters.nsFilter ?? 'all')
@@ -2387,6 +2388,26 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   function toggleDiscNs(ns: string) {
     setCollapsedNs(prev => { const n = new Set(prev); n.has(ns) ? n.delete(ns) : n.add(ns); return n })
   }
+
+  // "Abrir na Descoberta" (clicado no aviso de fluxo bloqueado do gráfico) —
+  // acha o card do flow, força namespace/filtros que o esconderiam a
+  // aparecer, rola até ele e pisca um destaque.
+  const [highlightedFlowId, setHighlightedFlowId] = useState<string | null>(null)
+  const cardRefs = React.useRef<Record<string, HTMLDivElement | null>>({})
+  React.useEffect(() => {
+    if (!focusFlow) return
+    const flow = flows.find(f => f.id === focusFlow.flowId)
+    if (!flow) return
+    setSearchText('')
+    setNsFilter('all')
+    setVerdictFilter('all')
+    setCollapsedNs(prev => { if (!prev.has(flow.dst_namespace)) return prev; const n = new Set(prev); n.delete(flow.dst_namespace); return n })
+    setHighlightedFlowId(focusFlow.flowId)
+    requestAnimationFrame(() => cardRefs.current[focusFlow.flowId]?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
+    const t = setTimeout(() => setHighlightedFlowId(null), 2200)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusFlow?.token])
 
   React.useEffect(() => {
     checkHubble().then(r => setHubbleAvailable(r.available)).catch(() => setHubbleAvailable(false))
@@ -2611,6 +2632,12 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
             <div style={{ padding: '8px 14px', display: 'flex', flexDirection: 'column', gap: 6 }}>
               {nsFlows.map(f => {
                 const matchedPolicy = findMatchedPolicy(f)
+                const gap = !f.has_policy && f.verdict === 'DROPPED' ? classifyFlowGap({
+                  src_workload: f.src_workload, src_namespace: f.src_namespace,
+                  dst_workload: f.dst_workload, dst_namespace: f.dst_namespace, dst_port: f.dst_port,
+                }, allPolicies) : null
+                const gapDirection: 'ingress' | 'egress' | 'both' = gap?.missingIngress && gap?.missingEgress ? 'both' : gap?.missingEgress ? 'egress' : 'ingress'
+                const gapLabel = gapDirection === 'both' ? 'Criar política de ingress e egress' : gapDirection === 'egress' ? 'Criar política de egress' : 'Criar política de ingress'
                 const vc = f.verdict === 'DROPPED'
                   ? { bg: '#fff1f2', border: '#fecdd3', badge: '#fee2e2', text: '#dc2626' }
                   : { bg: '#f8fafc', border: '#e2e8f0', badge: '#dcfce7', text: '#16a34a' }
@@ -2621,8 +2648,14 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                   if (s < 3600) return `há ${Math.floor(s / 60)} min`
                   return lastSeen.toLocaleTimeString()
                 })()
+                const isHighlighted = highlightedFlowId === f.id
                 return (
-                  <div key={f.id} style={{ background: vc.bg, border: `1px solid ${vc.border}`, borderRadius: 8, padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <div key={f.id} ref={el => { cardRefs.current[f.id] = el }} style={{
+                    background: vc.bg, borderRadius: 8, padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 6,
+                    border: isHighlighted ? '2px solid #2563eb' : `1px solid ${vc.border}`,
+                    boxShadow: isHighlighted ? '0 0 0 3px rgba(37,99,235,0.25)' : 'none',
+                    transition: 'box-shadow 0.3s, border-color 0.3s',
+                  }}>
 
                     {/* Linha 1: veredicto + ocorrências + tempo */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -2658,10 +2691,10 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                     <div style={{ display: 'flex', gap: 6, alignItems: 'center', paddingTop: 2 }}>
                       {!f.has_policy && f.verdict === 'DROPPED' && (
                         <button onClick={() => {
-                          onAddDraft({ src_workload: f.src_workload, src_namespace: f.src_namespace, dst_service: f.dst_workload, dst_namespace: f.dst_namespace, dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }], policy_direction: 'ingress' })
+                          onAddDraft({ src_workload: f.src_workload, src_namespace: f.src_namespace, dst_service: f.dst_workload, dst_namespace: f.dst_namespace, dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }], policy_direction: gapDirection })
                           onSwitchTab('drafts')
                         }} style={{ ...btn.base, ...btn.green }}>
-                          Criar política
+                          {gapLabel}
                         </button>
                       )}
                       {!f.has_policy && (
@@ -2745,8 +2778,12 @@ interface Props {
   policies: NetworkPolicyInfo[]; allPolicies: NetworkPolicyInfo[]; drafts: Draft[]
   visibleNamespaces: Set<string>; config: AppConfig; configLoaded: boolean
   pendingApprovals?: ApprovalRequest[]
-  requestTab?: 'aprovacoes' | 'drafts' | null
+  requestTab?: 'aprovacoes' | 'drafts' | 'descoberta' | null
   onTabOpened?: () => void
+  // "Abrir na Descoberta" (FlowExplainPanel, no gráfico) — flowId + token
+  // (token changes every click, even for the same flow, to re-trigger the
+  // scroll/highlight in DescobertaTab)
+  focusFlow?: { flowId: string; token: number } | null
   openPasswordModal?: boolean
   onPasswordModalClosed?: () => void
   onToggleNamespace: (ns: string) => void; onRemoveDraft: (id: string) => void
@@ -2762,7 +2799,7 @@ interface Props {
 
 export default function RightPanel({
   currentUser, allNamespaces, services, policies, allPolicies, drafts, visibleNamespaces, config, configLoaded,
-  pendingApprovals = [], requestTab, onTabOpened, openPasswordModal, onPasswordModalClosed,
+  pendingApprovals = [], requestTab, onTabOpened, focusFlow, openPasswordModal, onPasswordModalClosed,
   onToggleNamespace, onRemoveDraft, onAddDraft, onApplyDraft, onApplyAllDrafts, onDiscardAllDrafts,
   onUpdateDraftPort, onPoliciesChanged, onSaveConfig,
   ciliumFlows = [], ciliumStreaming = false,
@@ -3031,7 +3068,7 @@ export default function RightPanel({
             {activeTab === 'policies' && <PoliciesTab policies={policies} allPolicies={allPolicies} services={services} isAdmin={isAdmin} isViewer={isViewer} canManageNamespace={canManageNamespace} onDelete={onPoliciesChanged} onRefresh={onPoliciesChanged} />}
             {activeTab === 'aprovacoes' && <ApprovacoesTab key={approvalTabKey} currentUser={currentUser} config={config} onRefresh={onPoliciesChanged} pendingApprovals={pendingApprovals} />}
             {activeTab === 'seguranca' && <SegurancaTab services={services} policies={policies} config={config} isAdmin={isAdmin} canManageNamespace={canManageNamespace} onRefresh={onPoliciesChanged} onViewNamespace={onViewNamespace} />}
-            {activeTab === 'descoberta' && isAdmin && <DescobertaTab flows={ciliumFlows} config={config} streaming={ciliumStreaming} allPolicies={allPolicies} onClear={onClearCiliumFlows} onAddDraft={onAddDraft} onSaveConfig={onSaveConfig} onSwitchTab={(tab) => setActiveTab(tab)} />}
+            {activeTab === 'descoberta' && isAdmin && <DescobertaTab flows={ciliumFlows} config={config} streaming={ciliumStreaming} allPolicies={allPolicies} onClear={onClearCiliumFlows} onAddDraft={onAddDraft} onSaveConfig={onSaveConfig} onSwitchTab={(tab) => setActiveTab(tab)} focusFlow={focusFlow} />}
             {activeTab === 'descoberta' && !isAdmin && <Forbidden />}
             {activeTab === 'config' && isAdmin && <ConfigTab config={config} onSave={onSaveConfig} />}
             {activeTab === 'config' && !isAdmin && <Forbidden />}
