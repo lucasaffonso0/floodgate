@@ -102,28 +102,38 @@ export function NamespaceIsolationPanel({
       (op.policy_type === 'restrict-ingress' || op.policy_type === 'restrict-egress') &&
       op.dst_service === ''
     )
-    const companions = otherRestrict ? [] : policies.filter(op =>
+    const allCompanions = policies.filter(op =>
       op.namespace === namespace &&
       (op.policy_type === 'allow-intranamespace' ||
        (op.policy_type === 'allow-egress' && op.dst_service === 'internet'))
     )
+    const companions = otherRestrict ? [] : allCompanions
 
     // Qualquer outra policy que sobrar continua restringindo implicitamente
     // o que ela seleciona, mesmo sem o restrict — avisa antes de deixar o
-    // namespace "parecendo aberto" sem estar de verdade.
-    const others = getOtherPoliciesInNamespace(namespace, [p.name, ...companions.map(c => c.name)], policies)
-    let removeOthers = false
+    // namespace "parecendo aberto" sem estar de verdade. O restrict da OUTRA
+    // direção fica de fora: é isolamento próprio dela, não uma regra
+    // residual, e remover só uma direção não pode apagar a outra também. Se
+    // a outra direção sobrevive, os companions dela (intra/internet) também
+    // ficam de fora — ainda servem pra isolação que continua ativa.
+    const excludeNames = [p.name, ...companions.map(c => c.name)]
+    if (otherRestrict) excludeNames.push(otherRestrict.name, ...allCompanions.map(c => c.name))
+    const others = getOtherPoliciesInNamespace(namespace, excludeNames, policies)
+    // Cancelar aqui precisa abortar a ação inteira — não só a parte de
+    // remover as "outras" regras — senão o isolamento (e os companions dele)
+    // são removidos de qualquer forma, mesmo com o usuário clicando Cancelar.
     if (others.length > 0) {
-      removeOthers = confirm(
-        `Remover o isolamento não deixa "${namespace}" totalmente aberto: ainda ${others.length === 1 ? 'existe 1 outra regra' : `existem ${others.length} outras regras`} nesse namespace (${others.map(o => o.name).join(', ')}) que vão continuar restringindo o que elas selecionam.\n\nRemover essa(s) regra(s) também?`
+      const confirmed = confirm(
+        `Remover o isolamento de "${namespace}" também remove ${others.length === 1 ? 'esta outra regra' : `estas outras ${others.length} regras`} (${others.map(o => o.name).join(', ')}), que ficariam sem função e continuariam restringindo o que elas selecionam.\n\nRemover tudo?`
       )
+      if (!confirmed) return
     }
 
     setApplying(true); setResult(null)
     try {
       await deleteNetworkPolicy(p.namespace, p.name)
       await Promise.all(companions.map(op => deleteNetworkPolicy(op.namespace, op.name).catch(() => {})))
-      if (removeOthers) {
+      if (others.length > 0) {
         await Promise.all(others.map(op => deleteNetworkPolicy(op.namespace, op.name).catch(() => {})))
       }
       onPolicyChanged()
