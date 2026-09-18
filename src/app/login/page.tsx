@@ -2,10 +2,12 @@
 
 import React, { useState } from 'react'
 import { FloodgateLogoFull } from '@/components/FloodgateLogo'
+import { EyeIcon } from '@/components/PasswordModal'
 
 export default function LoginPage() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
   const [error, setError]       = useState('')
   const [loading, setLoading]   = useState(false)
 
@@ -92,22 +94,34 @@ export default function LoginPage() {
               }}>
                 Senha
               </label>
-              <input
-                type="password"
-                value={password}
-                onChange={e => setPassword(e.target.value)}
-                autoComplete="current-password"
-                required
-                placeholder="••••••••"
-                style={{
-                  width: '100%', border: '1.5px solid #e2e8f0', borderRadius: 10,
-                  padding: '11px 14px', fontSize: 14, boxSizing: 'border-box',
-                  outline: 'none', background: '#f8fafc', color: '#0f172a',
-                  transition: 'border-color 0.15s, background 0.15s',
-                }}
-                onFocus={e => { e.target.style.borderColor = '#185FA5'; e.target.style.background = '#fff' }}
-                onBlur={e =>  { e.target.style.borderColor = '#e2e8f0'; e.target.style.background = '#f8fafc' }}
-              />
+              <div style={{ position: 'relative' }}>
+                <input
+                  type={showPassword ? 'text' : 'password'}
+                  value={password}
+                  onChange={e => setPassword(e.target.value)}
+                  autoComplete="current-password"
+                  required
+                  placeholder="••••••••"
+                  style={{
+                    width: '100%', border: '1.5px solid #e2e8f0', borderRadius: 10,
+                    padding: '11px 42px 11px 14px', fontSize: 14, boxSizing: 'border-box',
+                    outline: 'none', background: '#f8fafc', color: '#0f172a',
+                    transition: 'border-color 0.15s, background 0.15s',
+                  }}
+                  onFocus={e => { e.target.style.borderColor = '#185FA5'; e.target.style.background = '#fff' }}
+                  onBlur={e =>  { e.target.style.borderColor = '#e2e8f0'; e.target.style.background = '#f8fafc' }}
+                />
+                <button
+                  type="button" onClick={() => setShowPassword(v => !v)} tabIndex={-1}
+                  style={{
+                    position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)',
+                    background: 'none', border: 'none', cursor: 'pointer', color: '#94a3b8',
+                    display: 'flex', alignItems: 'center', padding: 2,
+                  }}
+                >
+                  <EyeIcon visible={showPassword} />
+                </button>
+              </div>
             </div>
 
             {error && (
