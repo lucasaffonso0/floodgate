@@ -10,6 +10,7 @@ import {
   useNodesState,
   useEdgesState,
   useReactFlow,
+  useNodes,
   getViewportForBounds,
   type Connection,
   type Node,
@@ -1504,6 +1505,10 @@ function LayoutToolbar({
   // only the hook version resolves that via the internal nodeLookup to give
   // correct absolute bounds.
   const { fitView, getNodes, getNodesBounds } = useReactFlow()
+  // Reactive count, unlike getNodes() above — lets the button disable itself
+  // while the graph is still loading instead of silently doing nothing when
+  // clicked too early (nodes.length === 0 right after navigating in).
+  const nodeCount = useNodes().length
   const [layoutMode, setLayoutMode] = React.useState<'namespaces' | 'services' | 'both'>('both')
   const [tick, setTick] = React.useState(0)
   const [capturing, setCapturing] = React.useState(false)
@@ -1534,8 +1539,8 @@ function LayoutToolbar({
       a.href = dataUrl
       a.download = `floodgate-grafo-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`
       a.click()
-    } catch {
-      // captura falhou silenciosamente (ex: imagem grande demais) — usuário pode tentar de novo
+    } catch (e) {
+      console.error('[floodgate] screenshot do grafo falhou:', e)
     } finally {
       setCapturing(false)
     }
@@ -1699,15 +1704,15 @@ function LayoutToolbar({
       {/* ── Screenshot ── */}
       <button
         onClick={handleScreenshot}
-        disabled={capturing}
-        title="Baixar screenshot do grafo inteiro em alta resolução"
+        disabled={capturing || nodeCount === 0}
+        title={nodeCount === 0 ? 'Aguarde o grafo carregar' : 'Baixar screenshot do grafo inteiro em alta resolução'}
         style={{
           height: 36, padding: '0 10px', border: 'none', background: 'none',
-          fontSize: 11, fontWeight: 600, color: capturing ? '#94a3b8' : '#475569',
-          cursor: capturing ? 'default' : 'pointer',
+          fontSize: 11, fontWeight: 600, color: (capturing || nodeCount === 0) ? '#94a3b8' : '#475569',
+          cursor: (capturing || nodeCount === 0) ? 'default' : 'pointer',
           display: 'flex', alignItems: 'center', gap: 5, transition: 'background 0.12s',
         }}
-        onMouseEnter={e => { if (!capturing) e.currentTarget.style.background = '#f1f5f9' }}
+        onMouseEnter={e => { if (!capturing && nodeCount > 0) e.currentTarget.style.background = '#f1f5f9' }}
         onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
       >
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
