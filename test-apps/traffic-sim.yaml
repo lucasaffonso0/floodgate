@@ -136,6 +136,42 @@ spec:
   - port: 8080
     targetPort: 8080
 ---
+# backend/worker-queue: fila de tarefas (só chamadas de saída, nunca recebe
+# tráfego — igual a um celery-worker real) — DE PROPÓSITO sem Service, para
+# exercitar resolvePodSelector() ter que cair para o Deployment (k8s.ts)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-queue
+  namespace: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-queue
+  template:
+    metadata:
+      labels:
+        app: worker-queue
+    spec:
+      containers:
+      - name: worker-queue
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          while true; do
+            wget -qT3 -O/dev/null http://pgbouncer.database.svc.cluster.local:6432 2>/dev/null
+            sleep 10
+          done
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
 # monitoring/grafana: dashboard (porta 3000) → scraping do backend e banco
 apiVersion: apps/v1
 kind: Deployment

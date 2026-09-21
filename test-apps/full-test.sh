@@ -4,11 +4,12 @@
 # Uso: ./full-test.sh [url] [usuario] [senha]
 #
 # Topology (traffic-sim.yaml):
-#   frontend/app       port 80
-#   backend/worker     port 8080
-#   infra/haproxy      port 80
-#   database/pgbouncer port 6432
-#   monitoring/grafana port 3000
+#   frontend/app             port 80
+#   backend/worker           port 8080
+#   backend/worker-queue     sem porta, sem Service (fila de tarefas)
+#   infra/haproxy            port 80
+#   database/pgbouncer       port 6432
+#   monitoring/grafana       port 3000
 
 set -euo pipefail
 
@@ -415,7 +416,7 @@ test_protocol_api() {
 }
 
 test_portrange_and_allports() {
-  header_scenario "14/14 — Faixa de portas (endPort) e allow sem restrição de porta"
+  header_scenario "14/15 — Faixa de portas (endPort) e allow sem restrição de porta"
 
   echo "  Faixa de portas (endPort): restrict-ingress pgbouncer + allow TCP 6000-7000"
   assert_ok "restrict-ingress pgbouncer (base)" "$(api POST '/api/networkpolicies/restrict' \
@@ -444,6 +445,41 @@ test_portrange_and_allports() {
   cleanup
 }
 
+test_no_service_workload() {
+  header_scenario "15/15 — política com workload de origem sem Service (resolvePodSelector cascata)"
+  local r body policy_name policy_ns
+
+  # backend/worker-queue não tem Service (só faz chamadas de saída, como um
+  # celery-worker real) — antes da correção, resolvePodSelector() (então
+  # getServiceSelector) dava 404 tentando achar um Service "worker-queue"
+  # que nunca existiu, e nem preview nem criação real funcionavam.
+  echo "  Preview: backend/worker-queue (sem Service) → database/pgbouncer"
+  r=$(api POST '/api/networkpolicies/preview' \
+    '{"src_workload":"worker-queue","src_namespace":"backend","dst_service":"pgbouncer","dst_namespace":"database","dst_ports":[{"port":6432,"protocol":"TCP"}],"direction":"egress"}')
+  assert_ok "preview egress worker-queue→pgbouncer (sem Service)" "$r"
+  body="${r#*|}"
+  assert_field "YAML usa o selector do Deployment (app: worker-queue)" \
+    "$(echo "$body" | grep -c 'app: worker-queue' 2>/dev/null || true)" "1"
+
+  echo ""
+  echo "  Criação real: allow egress worker-queue → pgbouncer"
+  r=$(api POST '/api/networkpolicies/egress' \
+    '{"src_workload":"worker-queue","src_namespace":"backend","dst_service":"pgbouncer","dst_namespace":"database","dst_ports":[{"port":6432,"protocol":"TCP"}]}')
+  assert_ok "allow egress worker-queue→pgbouncer (sem Service)" "$r"
+  body="${r#*|}"
+  policy_name=$(json_get "$body" "d['name']")
+  policy_ns=$(json_get "$body" "d['namespace']")
+  if [ -n "$policy_name" ] && [ -n "$policy_ns" ]; then
+    local yaml_r yaml_body
+    yaml_r=$(api GET "/api/networkpolicies/$policy_ns/$policy_name")
+    yaml_body="${yaml_r#*|}"
+    assert_field "NetworkPolicy criada usa o selector correto" \
+      "$(echo "$yaml_body" | grep -c 'app: worker-queue' 2>/dev/null || true)" "1"
+  fi
+  sleep "$PROPAGATION_WAIT"
+  cleanup
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -458,6 +494,7 @@ login
 echo -e "${YELLOW}Aguardando pods de teste ficarem Ready...${NC}"
 kubectl wait --for=condition=Ready pod -l app=app        -n frontend   --timeout=60s 2>/dev/null || true
 kubectl wait --for=condition=Ready pod -l app=worker     -n backend    --timeout=60s 2>/dev/null || true
+kubectl wait --for=condition=Ready pod -l app=worker-queue -n backend  --timeout=60s 2>/dev/null || true
 kubectl wait --for=condition=Ready pod -l app=haproxy    -n infra      --timeout=60s 2>/dev/null || true
 kubectl wait --for=condition=Ready pod -l app=pgbouncer  -n database   --timeout=60s 2>/dev/null || true
 kubectl wait --for=condition=Ready pod -l app=grafana    -n monitoring --timeout=60s 2>/dev/null || true
@@ -481,6 +518,7 @@ test_isolate_db_egress_allow_backend
 test_restrict_multiple
 test_protocol_api
 test_portrange_and_allports
+test_no_service_workload
 
 # Limpeza final
 cleanup
