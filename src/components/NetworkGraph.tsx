@@ -281,6 +281,25 @@ const NODE_W = 160, NODE_H = 56, NODE_GAPH = 20, NODE_GAPV = 16
 const NS_PAD = 20, NS_HEADER = 34
 const TREE_COL_GAP = 130, TREE_ROW_GAP = 70
 
+// Fraction of the smaller rect's area covered by the intersection (0..1).
+// Used instead of a boolean overlap test to decide live drag-reorder swaps:
+// node width (160) is much bigger than the grid gap (20), so a plain "any
+// overlap" test stays true for both a sibling's old slot and its new
+// (post-swap) slot at once when they're adjacent — the cursor doesn't have
+// to move far to re-trigger the swap in the opposite direction, which reads
+// as flicker. Requiring most of the area to be covered means the cursor has
+// to travel past the slot's midpoint to swap, and just as far back to undo
+// it — a real dead zone instead of a hair-trigger boundary.
+function overlapFraction(
+  a: { x: number; y: number; w: number; h: number },
+  b: { x: number; y: number; w: number; h: number },
+) {
+  const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x))
+  const iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y))
+  const minArea = Math.min(a.w * a.h, b.w * b.h)
+  return minArea > 0 ? (ix * iy) / minArea : 0
+}
+
 function rectsOverlap(
   a: { x: number; y: number; w: number; h: number },
   b: { x: number; y: number; w: number; h: number },
@@ -592,11 +611,47 @@ function buildGraph(
     const nsLocked = namespaceLocks[ns] ?? false
     const canToggleLock = !!canManageNamespace?.(ns)
 
+    // Resolve every service's slot before building any node. A saved custom
+    // position (from a past drag) can coincidentally collide with another
+    // service's freshly-computed default grid slot — e.g. right after
+    // autosync discovers a brand-new, never-positioned service — so each
+    // candidate is checked against every slot already resolved in this
+    // namespace and nudged to the next free default slot on collision.
+    // Two services must never render on top of one another.
+    const svcSlots: Array<{ svc: typeof svcs[number]; position: { x: number; y: number } }> = []
+    let nextSlot = svcs.length
+    svcs.forEach((svc, i) => {
+      const col = i % cols, row = Math.floor(i / cols)
+      const key = `${ns}::${svc.name}`
+      const saved = layoutMode === 'namespaces' ? layoutMap.get(key) : undefined
+      let position = saved
+        ? { x: saved.x, y: saved.y }
+        : { x: NS_PAD + col * (NODE_W + NODE_GAPH), y: NS_HEADER + NS_PAD + row * (NODE_H + NODE_GAPV) }
+
+      const collides = svcSlots.some(s => rectsOverlap({ ...position, w: NODE_W, h: NODE_H }, { ...s.position, w: NODE_W, h: NODE_H }, 4))
+      if (collides) {
+        let placed = false
+        while (!placed) {
+          const c = nextSlot % cols, r = Math.floor(nextSlot / cols)
+          nextSlot++
+          const candidate = { x: NS_PAD + c * (NODE_W + NODE_GAPH), y: NS_HEADER + NS_PAD + r * (NODE_H + NODE_GAPV) }
+          const stillCollides = svcSlots.some(s => rectsOverlap({ ...candidate, w: NODE_W, h: NODE_H }, { ...s.position, w: NODE_W, h: NODE_H }, 4))
+          if (!stillCollides) { position = candidate; placed = true }
+        }
+      }
+      svcSlots.push({ svc, position })
+    })
+
+    const maxBottom = Math.max(NS_HEADER + NS_PAD, ...svcSlots.map(s => s.position.y + NODE_H))
+    const maxRight = Math.max(NS_PAD, ...svcSlots.map(s => s.position.x + NODE_W))
+    const correctedW = Math.max(nsW, maxRight + NS_PAD)
+    const correctedH = Math.max(nsH, maxBottom + NS_PAD)
+
     groupNodes.push({
       id: `ns::${ns}`,
       type: 'namespace',
       position: pos,
-      style: { width: nsW, height: nsH, padding: 0 },
+      style: { width: correctedW, height: correctedH, padding: 0 },
       data: {
         label: ns,
         color: p.bg,
@@ -612,18 +667,13 @@ function buildGraph(
       zIndex: 0,
     })
 
-    svcs.forEach((svc, i) => {
-      const col = i % cols, row = Math.floor(i / cols)
-      const key = `${ns}::${svc.name}`
-      const saved = layoutMode === 'namespaces' ? layoutMap.get(key) : undefined
+    for (const { svc, position } of svcSlots) {
       serviceNodes.push({
         id: `svc::${ns}::${svc.name}`,
         type: 'service',
         parentId: `ns::${ns}`,
         extent: 'parent',
-        position: saved
-          ? { x: saved.x, y: saved.y }
-          : { x: NS_PAD + col * (NODE_W + NODE_GAPH), y: NS_HEADER + NS_PAD + row * (NODE_H + NODE_GAPV) },
+        position,
         data: {
           name: svc.name, namespace: ns, ports: svc.ports,
           ingressStatus: serviceDotStatus(svc.name, ns, 'ingress'),
@@ -632,7 +682,7 @@ function buildGraph(
         draggable: !globalLocked && !nsLocked && svcs.length > 1,
         zIndex: 10,
       })
-    })
+    }
   }
 
   const nodes: Node[] = [...groupNodes, ...serviceNodes]
@@ -1838,6 +1888,30 @@ export default function NetworkGraph({
   const nsPositions  = useRef<Map<string, { x: number; y: number }>>(new Map())
   const nsPaletteIdx = useRef<Map<string, number>>(new Map())
   const dragStartPos = useRef<Map<string, { x: number; y: number }>>(new Map())
+  // Mirrors `nodes` for the drag handlers below. They must read fresh node
+  // data but stay referentially STABLE across renders (deps: []) — React
+  // Flow re-runs its own internal drag setup whenever onNodeDragStart /
+  // onNodeDragStop change identity, and `nodes` updates on every pointermove
+  // during a drag, so depending on `nodes` directly there tore down and
+  // rebuilt React Flow's drag machinery mid-gesture on every frame, which is
+  // what made a dragged namespace's children visibly lag behind it.
+  const nodesRef = useRef<Node[]>([])
+  useEffect(() => { nodesRef.current = nodes }, [nodes])
+  const reorderSlot = useRef<Map<string, { x: number; y: number }>>(new Map())
+  const dragSiblingsStart = useRef<Map<string, Map<string, { x: number; y: number }>>>(new Map())
+  const lastBumpTarget = useRef<Map<string, string>>(new Map())
+  const transitioning = useRef<Set<string>>(new Set())
+  // Guards the auto-rebuild effects below from firing mid-drag. Those effects
+  // re-run whenever live data changes identity (services/policies/cilium
+  // flows/etc — cilium flows in particular can update very frequently once
+  // Hubble is actually streaming), and a rebuild reconstructs every node's
+  // position from the last DB-persisted layout. A drag's new position is
+  // only persisted on drop, so a rebuild mid-drag would snap the dragged
+  // node back to its old position and then jump back to the cursor on the
+  // next pointer move — a visible "goes back, then returns" flicker.
+  const isDragging = useRef(false)
+  const transitionClearTimers = useRef<ReturnType<typeof setTimeout>[]>([])
+  useEffect(() => () => { transitionClearTimers.current.forEach(clearTimeout) }, [])
   const rebuildRef = useRef<(mode?: 'namespaces' | 'services' | 'both', force?: boolean, persist?: boolean) => Promise<void>>(() => Promise.resolve())
 
   const rebuildGraph = useCallback(async (layoutMode: 'namespaces' | 'services' | 'both' = 'both', forceNsReset = false, persistAutoLayout = false) => {
@@ -1887,11 +1961,12 @@ export default function NetworkGraph({
   }, [services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, canManageNamespace, onToggleNamespaceLock, onAutoLayoutServices, globalLocked, ciliumFlows, showFlowEdges, ignoredNamespaces, visibleNamespaces, selectedNodeId, selectedNs, draftMode])
 
   useEffect(() => { rebuildRef.current = rebuildGraph }, [rebuildGraph])
-  useEffect(() => { rebuildGraph('namespaces').catch(() => {}) }, [rebuildGraph])
+  useEffect(() => { if (!isDragging.current) rebuildGraph('namespaces').catch(() => {}) }, [rebuildGraph])
 
   // Apply DB positions whenever they arrive (initial load or poll)
   useEffect(() => {
     if (Object.keys(nsPositionsFromDB).length === 0) return
+    if (isDragging.current) return
     for (const [ns, pos] of Object.entries(nsPositionsFromDB)) {
       nsPositions.current.set(ns, pos)
     }
@@ -1902,14 +1977,19 @@ export default function NetworkGraph({
   // Re-initialize from DB when user discards layout changes
   useEffect(() => {
     if (layoutResetKey === 0) return
+    if (isDragging.current) return
     nsPositions.current.clear()
     for (const [ns, pos] of Object.entries(nsPositionsFromDB)) nsPositions.current.set(ns, pos)
     rebuildRef.current('namespaces', false, false).catch(() => {})
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layoutResetKey])
 
+  const SWAP_THRESHOLD = 0.5
+
   const handleNodesChange = useCallback((changes: NodeChange[]) => {
     setNodes(nds => {
+      let bump: { id: string; position: { x: number; y: number } } | null = null
+
       const adjusted = changes.map(change => {
         if (change.type !== 'position' || !change.id.startsWith('svc::') || !change.position) return change
         const node = nds.find(n => n.id === change.id)
@@ -1922,25 +2002,76 @@ export default function NetworkGraph({
         const maxX = Math.max(minX, parentW - NODE_W - 2)
         const minY = NS_HEADER + 4
         const maxY = Math.max(minY, parentH - NODE_H - 2)
-
-        return {
-          ...change,
-          position: {
-            x: Math.min(maxX, Math.max(minX, change.position.x)),
-            y: Math.min(maxY, Math.max(minY, change.position.y)),
-          },
+        const clamped = {
+          x: Math.min(maxX, Math.max(minX, change.position.x)),
+          y: Math.min(maxY, Math.max(minY, change.position.y)),
         }
+
+        // Live reorder: while actively dragging, passing more than halfway
+        // over a sibling bumps it into whichever slot the dragged node last
+        // vacated, instead of waiting for drop to resolve the swap. The 50%
+        // threshold (not "any overlap") is what keeps this stable — see
+        // overlapFraction() above for why a boolean test flickers here.
+        if (change.dragging) {
+          const candidate = { x: clamped.x, y: clamped.y, w: NODE_W, h: NODE_H }
+          const siblings = nds.filter(n => n.id.startsWith('svc::') && n.parentId === node.parentId && n.id !== node.id)
+          const covering = siblings
+            .map(o => ({ o, frac: overlapFraction(candidate, { x: o.position.x, y: o.position.y, w: NODE_W, h: NODE_H }) }))
+            .filter(x => x.frac >= SWAP_THRESHOLD)
+          if (covering.length > 0) {
+            const target = covering.reduce((best, cur) => cur.frac > best.frac ? cur : best).o
+            if (lastBumpTarget.current.get(node.id) !== target.id) {
+              const empty = reorderSlot.current.get(node.id) ?? dragStartPos.current.get(node.id)
+              if (empty) {
+                bump = { id: target.id, position: empty }
+                reorderSlot.current.set(node.id, target.position)
+                lastBumpTarget.current.set(node.id, target.id)
+                transitioning.current.add(target.id)
+              }
+            }
+          }
+        }
+
+        return { ...change, position: clamped }
       })
 
-      return applyNodeChanges(adjusted, nds)
+      let result = applyNodeChanges<Node>(adjusted, nds)
+      if (bump) {
+        const b = bump as { id: string; position: { x: number; y: number } }
+        result = result.map(n => n.id === b.id
+          ? { ...n, position: b.position, style: { ...n.style, transition: 'transform 150ms ease-out' } }
+          : n)
+      }
+      return result
     })
   }, [])
 
   const handleNodeDragStart = useCallback((_: React.MouseEvent | MouseEvent | TouchEvent, node: Node) => {
+    isDragging.current = true
     dragStartPos.current.set(node.id, { x: node.position.x, y: node.position.y })
-  }, [])
+    reorderSlot.current.delete(node.id)
+    lastBumpTarget.current.delete(node.id)
+    if (node.id.startsWith('svc::')) {
+      dragSiblingsStart.current.set(
+        node.id,
+        new Map(
+          nodesRef.current
+            .filter(n => n.id.startsWith('svc::') && n.parentId === node.parentId)
+            .map(n => [n.id, { x: n.position.x, y: n.position.y }])
+        )
+      )
+    }
+    // Defensive: a transition style should never survive past the drag that
+    // set it, but clear any stray leftovers before this one starts.
+    if (transitioning.current.size > 0) {
+      const stale = [...transitioning.current]
+      transitioning.current.clear()
+      setNodes(nds => nds.map(n => stale.includes(n.id) ? { ...n, style: { ...n.style, transition: undefined } } : n))
+    }
+  }, [setNodes])
 
   const handleNodeDragStop = useCallback((_: React.MouseEvent | MouseEvent | TouchEvent, node: Node) => {
+    isDragging.current = false
     const start = dragStartPos.current.get(node.id)
     if (!start) return
 
@@ -1951,7 +2082,7 @@ export default function NetworkGraph({
         w: Number(node.style?.width ?? 0),
         h: Number(node.style?.height ?? 0),
       }
-      const collides = nodes
+      const collides = nodesRef.current
         .filter(n => n.id.startsWith('ns::') && n.id !== node.id)
         .some(other => rectsOverlap(
           candidate,
@@ -1969,36 +2100,72 @@ export default function NetworkGraph({
     }
 
     if (node.id.startsWith('svc::')) {
-      const parent = nodes.find(n => n.id === node.parentId)
-      if (!parent) return
-      const parentW = Number(parent.style?.width ?? 0)
-      const parentH = Number(parent.style?.height ?? 0)
-      const minX = 2
-      const maxX = Math.max(minX, parentW - NODE_W - 2)
-      const minY = NS_HEADER + 4
-      const maxY = Math.max(minY, parentH - NODE_H - 2)
-      const clamped = {
-        x: Math.min(maxX, Math.max(minX, node.position.x)),
-        y: Math.min(maxY, Math.max(minY, node.position.y)),
+      // If hovering over a sibling during the drag already bumped it into a
+      // vacated slot (handleNodesChange), that slot is the dragged node's
+      // final home — ease into it rather than teleporting, since it can
+      // differ from the exact point the cursor released at. Otherwise it was
+      // never dragged over anything — fall back to free placement, clamped
+      // to the namespace box, no settle animation needed since it already
+      // tracked the cursor exactly.
+      const reorderedSlot = reorderSlot.current.get(node.id)
+      let clamped: { x: number; y: number }
+      if (reorderedSlot) {
+        clamped = reorderedSlot
+        transitioning.current.add(node.id)
+      } else {
+        const parent = nodesRef.current.find(n => n.id === node.parentId)
+        if (!parent) return
+        const parentW = Number(parent.style?.width ?? 0)
+        const parentH = Number(parent.style?.height ?? 0)
+        const minX = 2
+        const maxX = Math.max(minX, parentW - NODE_W - 2)
+        const minY = NS_HEADER + 4
+        const maxY = Math.max(minY, parentH - NODE_H - 2)
+        clamped = {
+          x: Math.min(maxX, Math.max(minX, node.position.x)),
+          y: Math.min(maxY, Math.max(minY, node.position.y)),
+        }
       }
 
-      const candidate = { x: clamped.x, y: clamped.y, w: NODE_W, h: NODE_H }
-      const collides = nodes
-        .filter(n => n.id.startsWith('svc::') && n.parentId === node.parentId && n.id !== node.id)
-        .some(other => rectsOverlap(candidate, { x: other.position.x, y: other.position.y, w: NODE_W, h: NODE_H }, 4))
+      setNodes(nds => nds.map(n => n.id === node.id
+        ? { ...n, position: clamped, style: reorderedSlot ? { ...n.style, transition: 'transform 150ms ease-out' } : n.style }
+        : n))
 
-      if (collides) {
-        setNodes(nds => nds.map(n => n.id === node.id ? { ...n, position: start } : n))
-        return
+      // A single drag gesture can bump more than one sibling on its way — persist
+      // every service in this namespace whose position actually changed, not just
+      // the dragged one.
+      const siblingsStart = dragSiblingsStart.current.get(node.id)
+      const parentId = node.parentId
+      const finalPositions = nodesRef.current.map(n => n.id === node.id ? { ...n, position: clamped } : n)
+      for (const n of finalPositions) {
+        if (!n.id.startsWith('svc::') || n.parentId !== parentId) continue
+        const startPos = siblingsStart?.get(n.id)
+        if (startPos && startPos.x === n.position.x && startPos.y === n.position.y) continue
+        const [, ns, svc] = n.id.split('::')
+        if (ns && svc) onServiceMove({ namespace: ns, service_name: svc, x: n.position.x, y: n.position.y }).catch(() => {})
       }
 
-      setNodes(nds => nds.map(n => n.id === node.id ? { ...n, position: clamped } : n))
-      const [, ns, svc] = node.id.split('::')
-      if (ns && svc) {
-        onServiceMove({ namespace: ns, service_name: svc, x: clamped.x, y: clamped.y }).catch(() => {})
+      reorderSlot.current.delete(node.id)
+      dragSiblingsStart.current.delete(node.id)
+      lastBumpTarget.current.delete(node.id)
+
+      // The transition styles applied during this gesture (bumped siblings,
+      // plus the dragged node's own settle just above) need to actually play
+      // before being cleared — clearing them synchronously here, in the same
+      // update as the one that just set them, would strip the style before
+      // the browser ever renders a frame with it. Give it a beat past the
+      // 150ms duration, then clear so an unrelated later move (e.g. dragging
+      // the parent namespace) never inherits a lingering transition.
+      if (transitioning.current.size > 0) {
+        const done = [...transitioning.current]
+        transitioning.current.clear()
+        const t = setTimeout(() => {
+          setNodes(nds => nds.map(n => done.includes(n.id) ? { ...n, style: { ...n.style, transition: undefined } } : n))
+        }, 200)
+        transitionClearTimers.current.push(t)
       }
     }
-  }, [nodes, onServiceMove, onNsMove, setNodes])
+  }, [onServiceMove, onNsMove, setNodes])
 
   const handleNodeClick = useCallback((_: React.MouseEvent, node: Node) => {
     if (node.id.startsWith('svc::')) { setSelectedNs(null); setSelectedNodeId(node.id) }
