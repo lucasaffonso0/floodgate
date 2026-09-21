@@ -9,7 +9,7 @@ export async function GET() {
   const me = await getCurrentUser()
   if (me?.role !== 'admin') return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
 
-  const users = getDb().prepare('SELECT id, username, role, created_at FROM users ORDER BY created_at').all()
+  const users = getDb().prepare('SELECT id, username, role, must_change_password, created_at FROM users ORDER BY created_at').all()
   return NextResponse.json(users)
 }
 
