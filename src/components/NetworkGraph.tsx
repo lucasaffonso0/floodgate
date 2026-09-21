@@ -28,7 +28,8 @@ import dagre from '@dagrejs/dagre'
 import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, ServiceLayout, ApprovalRequest, CiliumFlowSummary } from '@/types'
 import { deleteNetworkPolicy, restrictService, patchNetworkPolicyPort } from '@/api/client'
 import { explainAccess, sourceIsExempt, isDestinationExempt, type ExplainResult } from '@/lib/explainAccess'
-import { normalizeWorkload } from '@/lib/flowMatch'
+import { isFlowBlocked, computeEffectivePolicies } from '@/lib/simulate'
+import { normalizeWorkload, classifyFlowGap } from '@/lib/flowMatch'
 import { getNamespaceIsolation } from '@/lib/nsIsolation'
 import { NamespaceIsolationPanel } from './NamespaceIsolationPanel'
 
@@ -452,12 +453,23 @@ function buildGraph(
   showFlowEdges = false,
   ignoredNamespaces: string[] = [],
   visibleNamespaces?: Set<string>,
+  draftMode = false,
 ): { nodes: Node[]; edges: BuiltInEdge[] } {
   const nsVisible = (ns: string) =>
     !visibleNamespaces || visibleNamespaces.size === 0 || visibleNamespaces.has(ns)
   const visibleFlows = ciliumFlows.filter(
     f => nsVisible(f.src_namespace) && nsVisible(f.dst_namespace)
   )
+
+  // Modo Rascunho: preview the graph as if the current drafts had been
+  // applied — same computeEffectivePolicies() the Rascunhos tab's impact
+  // warning already uses, so the two always agree. No-op (effectivePolicies
+  // === policies) outside Modo Rascunho or with no pending drafts. Gated on
+  // drafts.length, not on whether anything got fabricated — a 'toggle'
+  // 'disable' draft legitimately adds zero fabricated policies (its effect
+  // is excluding a real one instead) but still needs the preview to engage.
+  const hasDraftPreview = draftMode && drafts.length > 0
+  const effectivePolicies = hasDraftPreview ? computeEffectivePolicies(policies, drafts) : policies
 
   const nsMap = new Map<string, ServiceInfo[]>()
   for (const svc of services) {
@@ -533,7 +545,9 @@ function buildGraph(
   // default-denies everyone else), or 'open' (nothing restricts this
   // direction).
   function serviceDotStatus(name: string, ns: string, direction: 'ingress' | 'egress'): DotStatus {
-    const r = explainAccess(name, ns, direction, policies)
+    // effectivePolicies (real + drafts) when Modo Rascunho is previewing —
+    // same "as if applied" logic as the flow edges below.
+    const r = explainAccess(name, ns, direction, effectivePolicies)
     if (!r.blocked) return 'open'
     if (r.scope === 'none') return 'implicit'
     return r.exceptions.length > 0 ? 'isolated-exc' : 'isolated'
@@ -859,7 +873,12 @@ function buildGraph(
   // Flow edges: FORWARDED coberto por policy → absorvido na policy animada (sem linha dupla)
   // Só aparecem: FORWARDED sem policy (azul = sem regra!) e DROPPED (vermelho = bloqueado)
   for (const [pairKey, { flow, srcId, dstId, ports }] of flowPairMap) {
-    const isDropped = flow.verdict === 'DROPPED'
+    const reallyDropped = flow.verdict === 'DROPPED'
+    // Modo Rascunho: mostra a linha como se os rascunhos atuais já tivessem
+    // sido aplicados, não o veredito real do Hubble — é exatamente o que o
+    // aviso de impacto da aba Rascunhos calcula, só que desenhado no grafo.
+    const isDropped = hasDraftPreview ? isFlowBlocked(flow, effectivePolicies) : reallyDropped
+    const previewChanged = hasDraftPreview && isDropped !== reallyDropped
     if (!isDropped && policyNodePairs.has(`${srcId}|${dstId}`)) continue
     const id = `flow::${pairKey}`
     const cur = curvatureMap.get(id) ?? 0.25
@@ -876,14 +895,14 @@ function buildGraph(
       style: {
         stroke: isDropped ? '#dc2626' : '#3b82f6',
         strokeWidth: isDropped ? 2 : 1.5,
-        strokeDasharray: isDropped ? '4 3' : undefined,
+        strokeDasharray: isDropped ? (previewChanged ? '2 2' : '4 3') : undefined,
         opacity,
       },
-      label: `${isDropped ? '✗' : '↓'} :${portLabel}`,
+      label: `${previewChanged ? '🧪 ' : ''}${isDropped ? '✗' : '↓'} :${portLabel}`,
       labelStyle: { fontSize: 9, fill: isDropped ? '#991b1b' : '#1e40af' },
       labelBgStyle: { fill: 'white', opacity: 0.8 },
       markerEnd: { type: 'arrowclosed' as const, color: isDropped ? '#dc2626' : '#3b82f6' },
-      data: { type: 'flow', flow },
+      data: { type: 'flow', flow, previewBlocked: isDropped, previewChanged },
       zIndex: 15,
     })
   }
@@ -952,7 +971,7 @@ const smallBtn = (danger = false): React.CSSProperties => ({
 })
 
 function AccessSection({
-  direction, restrictPolicy, connections, explain, isViewer, onRestrict, onRemoveRestrict, implicitAllowCount, onRemoveImplicit,
+  direction, restrictPolicy, connections, explain, isViewer, onRestrict, onRemoveRestrict, implicitAllowCount, onRemoveImplicit, draftBlocked,
 }: {
   direction: 'Inbound' | 'Outbound'
   restrictPolicy: NetworkPolicyInfo | undefined
@@ -963,6 +982,7 @@ function AccessSection({
   onRemoveRestrict: () => void
   implicitAllowCount: number
   onRemoveImplicit: () => void
+  draftBlocked?: boolean
 }) {
   const dir = direction === 'Inbound' ? 'ingress' : 'egress'
   const blocked = !!restrictPolicy
@@ -1022,22 +1042,29 @@ function AccessSection({
             {dir === 'ingress' ? 'Qualquer pod pode acessar qualquer porta.' : 'Pode alcançar qualquer destino.'}
           </div>
         )}
+        {!blocked && draftBlocked && (
+          <div style={{ fontSize: 9.5, fontWeight: 700, color: '#b45309', background: '#fef3c7', borderRadius: 5, padding: '3px 7px', marginTop: 4, display: 'inline-block' }}>
+            🧪 Seria bloqueado pelo rascunho
+          </div>
+        )}
         {!isViewer && (
           <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 4 }}>
             {blocked
               ? <button style={smallBtn(true)} onClick={onRemoveRestrict}>Remover default-deny</button>
-              : (
-                <>
-                  {isImplicitOnly && (
-                    <button style={smallBtn(true)} onClick={onRemoveImplicit}>
-                      Remover bloqueio implícito ({implicitAllowCount})
+              : draftBlocked
+                ? <span style={{ fontSize: 9, color: '#92400e' }}>Já há um rascunho pendente — veja a aba Rascunhos</span>
+                : (
+                  <>
+                    {isImplicitOnly && (
+                      <button style={smallBtn(true)} onClick={onRemoveImplicit}>
+                        Remover bloqueio implícito ({implicitAllowCount})
+                      </button>
+                    )}
+                    <button style={smallBtn()} onClick={onRestrict}>
+                      + {hasAllows ? 'Tornar default-deny explícito' : 'Aplicar default-deny'}
                     </button>
-                  )}
-                  <button style={smallBtn()} onClick={onRestrict}>
-                    + {hasAllows ? 'Tornar default-deny explícito' : 'Aplicar default-deny'}
-                  </button>
-                </>
-              )
+                  </>
+                )
             }
           </div>
         )}
@@ -1072,11 +1099,12 @@ function AccessSection({
 }
 
 function ServiceDetailPanel({
-  nodeId, services, policies, drafts, isViewer, canManageNamespace, onClose, onPolicyChanged,
+  nodeId, services, policies, drafts, isViewer, canManageNamespace, onClose, onPolicyChanged, draftMode, onAddDraft,
 }: {
   nodeId: string; services: ServiceInfo[]; policies: NetworkPolicyInfo[]; drafts: Draft[];
   canManageNamespace?: (namespace: string) => boolean
   isViewer?: boolean; onClose: () => void; onPolicyChanged: () => void
+  draftMode?: boolean; onAddDraft?: (d: Omit<Draft, 'id'>) => void
 }) {
   const parts = nodeId.split('::')
   const ns = parts[1], name = parts[2]
@@ -1089,6 +1117,14 @@ function ServiceDetailPanel({
   const ingressExplain = explainAccess(name, ns, 'ingress', policies)
   const egressExplain  = explainAccess(name, ns, 'egress',  policies)
 
+  // Modo Rascunho: essa direção está liberada nas policies reais, mas um
+  // isolate/restrict pendente (ainda não aplicado) vai bloqueá-la assim que
+  // for aplicado — sem isso o painel parecia "normal" mesmo com um rascunho
+  // pendente pra esse exato serviço.
+  const effectivePolicies = draftMode ? computeEffectivePolicies(policies, drafts) : policies
+  const ingressDraftBlocked = !!draftMode && !ingressExplain.blocked && explainAccess(name, ns, 'ingress', effectivePolicies).blocked
+  const egressDraftBlocked  = !!draftMode && !egressExplain.blocked  && explainAccess(name, ns, 'egress',  effectivePolicies).blocked
+
   // The allow-type policies causing an implicit lockdown (no restrict at
   // all, but Kubernetes default-denies everyone else once these select this
   // service) — removing them is what "Remover bloqueio implícito" does.
@@ -1100,6 +1136,13 @@ function ServiceDetailPanel({
     p.src_workload === name && p.src_namespace === ns)
 
   async function applyRestrict(direction: 'ingress' | 'egress') {
+    if (draftMode) {
+      onAddDraft?.({
+        kind: 'restrict', restrict_service: name, restrict_namespace: ns, restrict_direction: direction,
+        src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: direction,
+      })
+      return
+    }
     await restrictService({ service_name: name, namespace: ns, direction })
     onPolicyChanged()
   }
@@ -1152,6 +1195,7 @@ function ServiceDetailPanel({
           onRemoveRestrict={() => ingressRestrict && removeRestrict(ingressRestrict)}
           implicitAllowCount={ingressAllows.length}
           onRemoveImplicit={() => removeImplicitBlock(ingressAllows)}
+          draftBlocked={ingressDraftBlocked}
         />
         <div style={{ borderTop: '1px solid #f1f5f9' }} />
         <AccessSection
@@ -1164,6 +1208,7 @@ function ServiceDetailPanel({
           onRemoveRestrict={() => egressRestrict && removeRestrict(egressRestrict)}
           implicitAllowCount={egressAllows.length}
           onRemoveImplicit={() => removeImplicitBlock(egressAllows)}
+          draftBlocked={egressDraftBlocked}
         />
       </div>
     </div>
@@ -1176,8 +1221,13 @@ function parseServiceNodeId(id: string): { ns: string; name: string } | null {
   return parts[0] === 'svc' ? { ns: parts[1], name: parts[2] } : null
 }
 
-function FlowExplainPanel({ edge, policies, onClose, onExplainFlow }: {
+function gapDirectionOf(gap: { missingIngress: boolean; missingEgress: boolean } | null): 'ingress' | 'egress' | 'both' {
+  return gap?.missingIngress && gap?.missingEgress ? 'both' : gap?.missingEgress ? 'egress' : 'ingress'
+}
+
+function FlowExplainPanel({ edge, policies, onClose, onExplainFlow, draftMode, onAddDraft, drafts }: {
   edge: Edge; policies: NetworkPolicyInfo[]; onClose: () => void; onExplainFlow?: (flowId: string) => void
+  draftMode?: boolean; onAddDraft?: (d: Omit<Draft, 'id'>) => void; drafts?: Draft[]
 }) {
   const flow = edge.data!.flow as CiliumFlowSummary
   const dst = parseServiceNodeId(edge.target)
@@ -1213,7 +1263,9 @@ function FlowExplainPanel({ edge, policies, onClose, onExplainFlow }: {
     }}>
       <div style={{ background: '#fef2f2', borderBottom: '1px solid #fecaca', padding: '10px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>
-          <div style={{ fontSize: 12, fontWeight: 700, color: '#991b1b' }}>✗ Fluxo bloqueado (DROPPED)</div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#991b1b' }}>
+            {flow.verdict === 'DROPPED' ? '✗ Fluxo bloqueado (DROPPED)' : '🧪 Fluxo seria bloqueado pelos rascunhos'}
+          </div>
           <div style={{ fontSize: 10.5, color: '#7f1d1d', marginTop: 3 }}>
             {srcName} ({srcNs}) → {dstName} ({dstNs}) :{flow.dst_port}/{flow.protocol}
           </div>
@@ -1258,6 +1310,37 @@ function FlowExplainPanel({ edge, policies, onClose, onExplainFlow }: {
           Baseado em todas as NetworkPolicies do cluster, inclusive não-gerenciadas pelo Floodgate. O Hubble reporta o bloqueio real do Cilium, que pode vir de qualquer policy.
         </div>
 
+        {draftMode && onAddDraft && (() => {
+          // Include the draft-fabricated policies here (not just the real
+          // ones) — a flow can be preview-blocked purely by an unapplied
+          // isolate/restrict draft, and diagnosing direction against real
+          // policies alone would default to "ingress" even when it's really
+          // the source's egress being cut off by that draft.
+          const gapPolicies = draftMode && drafts ? computeEffectivePolicies(policies, drafts) : policies
+          const gap = classifyFlowGap({
+            src_workload: flow.src_workload, src_namespace: flow.src_namespace,
+            dst_workload: flow.dst_workload, dst_namespace: flow.dst_namespace, dst_port: flow.dst_port,
+          }, gapPolicies)
+          const direction = gapDirectionOf(gap)
+          const label = direction === 'both' ? 'Criar rascunho de ingress e egress' : direction === 'egress' ? 'Criar rascunho de egress' : 'Criar rascunho de ingress'
+          return (
+            <button
+              onClick={() => {
+                onAddDraft({
+                  src_workload: flow.src_workload, src_namespace: flow.src_namespace,
+                  dst_service: flow.dst_workload, dst_namespace: flow.dst_namespace,
+                  dst_ports: [{ port: flow.dst_port, protocol: flow.protocol as 'TCP' | 'UDP' }],
+                  policy_direction: direction,
+                })
+                onClose()
+              }}
+              style={{ fontSize: 10.5, fontWeight: 600, color: '#b45309', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 6, cursor: 'pointer', padding: '6px 8px' }}
+            >
+              🧪 {label}
+            </button>
+          )
+        })()}
+
         {onExplainFlow && (
           <button
             onClick={() => onExplainFlow(flow.id)}
@@ -1273,11 +1356,12 @@ function FlowExplainPanel({ edge, policies, onClose, onExplainFlow }: {
 
 // ─── Namespace detail panel ───────────────────────────────────────────────
 function NamespaceDetailPanel({
-  namespace, services, policies, isViewer, canManageNamespace, onClose, onPolicyChanged,
+  namespace, services, policies, drafts, isViewer, canManageNamespace, onClose, onPolicyChanged, draftMode, onAddDraft,
 }: {
-  namespace: string; services: ServiceInfo[]; policies: NetworkPolicyInfo[]
+  namespace: string; services: ServiceInfo[]; policies: NetworkPolicyInfo[]; drafts?: Draft[]
   canManageNamespace?: (namespace: string) => boolean
   isViewer?: boolean; onClose: () => void; onPolicyChanged: () => void
+  draftMode?: boolean; onAddDraft?: (d: Omit<Draft, 'id'>) => void
 }) {
   const total = services.filter(s => s.namespace === namespace).length
   const { anyIsolated, fullyIsolated } = getNamespaceIsolation(namespace, policies)
@@ -1311,8 +1395,9 @@ function NamespaceDetailPanel({
 
       <div style={{ padding: 14, maxHeight: 460, overflowY: 'auto' }}>
         <NamespaceIsolationPanel
-          namespace={namespace} services={services} policies={policies}
+          namespace={namespace} services={services} policies={policies} drafts={drafts}
           isViewer={isViewer} canManageNamespace={canManageNamespace} onPolicyChanged={onPolicyChanged}
+          draftMode={draftMode} onAddDraft={onAddDraft}
         />
       </div>
     </div>
@@ -1484,6 +1569,9 @@ interface Props {
   // that flow's card in the Descoberta tab — owned by page.tsx, which knows
   // how to switch RightPanel's active tab.
   onExplainFlow?: (flowId: string) => void
+  // Modo Rascunho: "Aplicar default-deny" no painel do serviço vira
+  // rascunho em vez de chamar restrictService() direto.
+  draftMode?: boolean
 }
 
 // ─── Layout toolbar ────────────────────────────────────────────────────────
@@ -1735,7 +1823,7 @@ export default function NetworkGraph({
   onAddDraft, onRemoveDraft, onPolicyChanged,
   layoutSaveStatus = 'idle',
   ciliumFlows, ciliumStreaming, ignoredNamespaces = [], visibleNamespaces,
-  selectedNamespace, onSelectNamespace, onExplainFlow,
+  selectedNamespace, onSelectNamespace, onExplainFlow, draftMode,
 }: Props) {
   const [nodes, setNodes] = useNodesState<Node>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<BuiltInEdge>([])
@@ -1761,7 +1849,7 @@ export default function NetworkGraph({
       services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, onToggleNamespaceLock,
       nsPositions.current, nsPaletteIdx.current, canManageNamespace,
       layoutMode, globalLocked,
-      ciliumFlows ?? [], showFlowEdges, ignoredNamespaces, visibleNamespaces,
+      ciliumFlows ?? [], showFlowEdges, ignoredNamespaces, visibleNamespaces, draftMode,
     )
     // buildGraph() always constructs fresh node objects, so ReactFlow's own
     // click-driven `selected` highlight (the box-shadow on the open node)
@@ -1796,7 +1884,7 @@ export default function NetworkGraph({
         .map(node => ({ namespace: node.id.slice(4), x: node.position.x, y: node.position.y }))
       await onAutoLayoutServices([], movedNamespaces)
     }
-  }, [services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, canManageNamespace, onToggleNamespaceLock, onAutoLayoutServices, globalLocked, ciliumFlows, showFlowEdges, ignoredNamespaces, visibleNamespaces, selectedNodeId, selectedNs])
+  }, [services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, canManageNamespace, onToggleNamespaceLock, onAutoLayoutServices, globalLocked, ciliumFlows, showFlowEdges, ignoredNamespaces, visibleNamespaces, selectedNodeId, selectedNs, draftMode])
 
   useEffect(() => { rebuildRef.current = rebuildGraph }, [rebuildGraph])
   useEffect(() => { rebuildGraph('namespaces').catch(() => {}) }, [rebuildGraph])
@@ -1935,7 +2023,10 @@ export default function NetworkGraph({
   function handleEdgeClick(_: React.MouseEvent, edge: Edge) {
     if (edge.data?.type === 'flow') {
       const flow = edge.data.flow as CiliumFlowSummary
-      if (flow.verdict === 'DROPPED') setSelectedFlowEdge(edge)
+      // No Modo Rascunho, uma linha só fica vermelha por causa dos
+      // rascunhos atuais (previewBlocked) mesmo sem ter sido dropada de
+      // verdade — precisa abrir o painel dos dois jeitos.
+      if (flow.verdict === 'DROPPED' || edge.data?.previewBlocked) setSelectedFlowEdge(edge)
       return
     }
     if (isViewer) return
@@ -2027,6 +2118,8 @@ export default function NetworkGraph({
           canManageNamespace={canManageNamespace}
           onClose={() => setSelectedNodeId(null)}
           onPolicyChanged={onPolicyChanged}
+          draftMode={draftMode}
+          onAddDraft={onAddDraft}
         />
       )}
 
@@ -2035,10 +2128,13 @@ export default function NetworkGraph({
           namespace={selectedNs}
           services={services}
           policies={policies}
+          drafts={drafts}
           isViewer={isViewer}
           canManageNamespace={canManageNamespace}
           onClose={() => setSelectedNs(null)}
           onPolicyChanged={onPolicyChanged}
+          draftMode={draftMode}
+          onAddDraft={onAddDraft}
         />
       )}
 
@@ -2048,6 +2144,9 @@ export default function NetworkGraph({
           policies={allPolicies ?? policies}
           onClose={() => setSelectedFlowEdge(null)}
           onExplainFlow={onExplainFlow}
+          draftMode={draftMode}
+          onAddDraft={onAddDraft}
+          drafts={drafts}
         />
       )}
 

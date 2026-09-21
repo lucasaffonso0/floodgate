@@ -10,6 +10,8 @@ import {
   getMe, logout, getServiceLayout, setNamespaceLayoutLock,
   saveAllLayout, setGlobalLayoutLock, getApprovalRequests,
   getCiliumFlows, clearCiliumFlows,
+  isolateNamespace, restrictService, deleteNetworkPolicy,
+  getDraftMode, activateDraftMode, deactivateDraftMode,
 } from '@/api/client'
 import NetworkGraph from '@/components/NetworkGraph'
 import RightPanel from '@/components/RightPanel'
@@ -150,6 +152,29 @@ export default function App() {
   // floating panel on the graph, instead of duplicating its UI inline.
   const [selectedNamespace, setSelectedNamespace] = useState<string | null>(null)
   const [ciliumFlows, setCiliumFlows] = useState<CiliumFlowSummary[]>([])
+  // Modo Rascunho: enquanto ativo, isolar/restringir vira rascunho em vez
+  // de aplicar direto — draftModeFlows é a foto congelada da Descoberta
+  // tirada na ativação (comparação de impacto, nunca escrita de volta).
+  const [draftMode, setDraftMode] = useState(false)
+  const [draftModeFlows, setDraftModeFlows] = useState<CiliumFlowSummary[]>([])
+  const [draftModeError, setDraftModeError] = useState<string | null>(null)
+
+  async function toggleDraftMode() {
+    setDraftModeError(null)
+    if (draftMode) {
+      await deactivateDraftMode()
+      setDraftMode(false)
+      setDraftModeFlows([])
+      return
+    }
+    try {
+      const r = await activateDraftMode()
+      setDraftMode(r.active)
+      setDraftModeFlows(r.flows)
+    } catch (e: unknown) {
+      setDraftModeError((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Falha ao ativar o Modo Rascunho')
+    }
+  }
   const [ciliumStreaming, setCiliumStreaming] = useState(false)
   const currentUserRef = useRef<User | null>(null)
 
@@ -316,6 +341,7 @@ export default function App() {
       .then(cfg => { setConfig(cfg); configRef.current = cfg })
       .catch(() => {})
       .finally(() => setConfigLoaded(true))
+    getDraftMode().then(r => { setDraftMode(r.active); setDraftModeFlows(r.flows) }).catch(() => {})
     const timer = setInterval(refresh, POLL_INTERVAL)
     return () => clearInterval(timer)
   }, [refresh])
@@ -383,19 +409,30 @@ export default function App() {
     saveHiddenToStorage(new Set())
   }
 
+  // isolate/restrict-kind drafts share the same placeholder connection
+  // fields ('') by design (see types.ts), so the dedup check below can't
+  // just compare src/dst fields directly — every isolate/restrict draft
+  // would collide with the first one ever added, silently dropping any
+  // later one (a different namespace, or even the other direction).
+  function draftKey(d: Omit<Draft, 'id'> | Draft): string {
+    if (d.kind === 'isolate') return `isolate|${d.isolate_namespace}|${d.isolate_direction}`
+    if (d.kind === 'restrict') return `restrict|${d.restrict_service}|${d.restrict_namespace}|${d.restrict_direction}`
+    // Keyed by namespace+option only (not action) — a second click on the
+    // same toggle while one is already pending is a no-op in the UI, not a
+    // second draft, so there's never two contradicting toggle drafts queued
+    // for the same thing.
+    if (d.kind === 'toggle') return `toggle|${d.toggle_namespace}|${d.toggle_option}`
+    return `connection|${d.src_workload}|${d.src_namespace}|${d.dst_service}|${d.dst_namespace}`
+  }
+
   function addDraft(d: Omit<Draft, 'id'>) {
+    const key = draftKey(d)
     setDrafts(prev => {
-      const exists = prev.some(x =>
-        x.src_workload === d.src_workload && x.src_namespace === d.src_namespace &&
-        x.dst_service === d.dst_service && x.dst_namespace === d.dst_namespace
-      )
+      const exists = prev.some(x => draftKey(x) === key)
       if (exists) return prev
       return [...prev, { ...d, id: `${Date.now()}-${Math.random()}` }]
     })
-    const alreadyExists = drafts.some(x =>
-      x.src_workload === d.src_workload && x.src_namespace === d.src_namespace &&
-      x.dst_service === d.dst_service && x.dst_namespace === d.dst_namespace
-    )
+    const alreadyExists = drafts.some(x => draftKey(x) === key)
     if (!alreadyExists) setRequestTab('drafts')
   }
 
@@ -407,7 +444,53 @@ export default function App() {
     setDrafts(prev => prev.map(d => d.id === id ? { ...d, dst_ports: ports } : d))
   }
 
+  // Aplica um rascunho de toggle (liga/desliga o companion allow-intranamespace
+  // ou allow-egress-internet de um namespace já isolado de verdade). 'enable'
+  // reusa isolateNamespace() como o toggle ao vivo já faz; 'disable' apaga a(s)
+  // policy(ies) companion reais que casam com o que o rascunho representa.
+  async function applyToggleDraft(d: Draft) {
+    const ns = d.toggle_namespace!
+    if (d.toggle_action === 'enable') {
+      if (d.toggle_option === 'intra') {
+        const dirs = d.toggle_directions ?? ['ingress', 'egress']
+        const direction = dirs.length === 2 ? 'both' : dirs[0]
+        await isolateNamespace({ namespace: ns, direction, allow_intra_namespace: true, allow_egress_internet: false })
+      } else {
+        await isolateNamespace({ namespace: ns, direction: 'egress', allow_intra_namespace: false, allow_egress_internet: true })
+      }
+      return
+    }
+    const toRemove = policies.filter(p =>
+      p.namespace === ns &&
+      (d.toggle_option === 'intra' ? p.policy_type === 'allow-intranamespace' : (p.policy_type === 'allow-egress' && p.dst_service === 'internet'))
+    )
+    await Promise.all(toRemove.map(p => deleteNetworkPolicy(p.namespace, p.name)))
+  }
+
   async function applyDraft(draft: Draft, allowedApprovers: Array<{ id: string; username: string }> = []) {
+    // Isolar/restringir/toggle nunca passaram pelo fluxo de aprovação — mesmo
+    // comportamento de hoje, só que agora podem ficar em rascunho antes.
+    if (draft.kind === 'isolate') {
+      await isolateNamespace({
+        namespace: draft.isolate_namespace!, direction: draft.isolate_direction!,
+        allow_intra_namespace: !!draft.isolate_allow_intra, allow_egress_internet: !!draft.isolate_allow_internet,
+      })
+      removeDraft(draft.id)
+      await refresh()
+      return
+    }
+    if (draft.kind === 'restrict') {
+      await restrictService({ service_name: draft.restrict_service!, namespace: draft.restrict_namespace!, direction: draft.restrict_direction! })
+      removeDraft(draft.id)
+      await refresh()
+      return
+    }
+    if (draft.kind === 'toggle') {
+      await applyToggleDraft(draft)
+      removeDraft(draft.id)
+      await refresh()
+      return
+    }
     if (config.approval_enabled) {
       const { id: _id, ...draftData } = draft
       await createApprovalRequest(draftData, allowedApprovers)
@@ -442,35 +525,19 @@ export default function App() {
   }
 
   async function applyAllDrafts() {
-    if (config.approval_enabled) {
-      await Promise.all(drafts.map(async d => {
-        const { id: _id, ...draftData } = d
-        await createApprovalRequest(draftData, [])
-      }))
-      setDrafts([])
-      return
-    }
-    await Promise.all(drafts.map(async d => {
-      if (d.src_cidr || d.dst_cidr) {
-        await createCidrPolicy({
-          namespace: d.dst_namespace,
-          service_name: d.dst_service || undefined,
-          cidr: (d.src_cidr ?? d.dst_cidr)!,
-          except: d.cidr_except,
-          dst_ports: d.dst_ports.length > 0 ? d.dst_ports : undefined,
-          direction: d.src_cidr ? 'ingress' : 'egress',
-        })
-        return
-      }
-      const req = {
-        src_workload: d.src_workload, src_namespace: d.src_namespace,
-        dst_service: d.dst_service, dst_namespace: d.dst_namespace, dst_ports: d.dst_ports,
-      }
-      if (d.policy_direction === 'ingress' || d.policy_direction === 'both') await createNetworkPolicy(req)
-      if (d.policy_direction === 'egress'  || d.policy_direction === 'both') await createEgressNetworkPolicy(req)
-    }))
-    setDrafts([])
-    await refresh()
+    // Delegates to applyDraft() per item (already handles every kind, plus
+    // the approval_enabled branch for connection drafts) instead of
+    // re-implementing the same branching here a second time. Uses
+    // allSettled, not all: these are independent operations against
+    // independent drafts — one failing (e.g. a real 404/409 from the
+    // cluster) must not stop the rest from applying and being cleared from
+    // the list, which is what left already-applied drafts stuck showing as
+    // "still pending" before, tempting a retry that re-applies them and
+    // fails again.
+    const targets = [...drafts]
+    const results = await Promise.allSettled(targets.map(d => applyDraft(d)))
+    const failed = results.filter(r => r.status === 'rejected').length
+    if (failed > 0) throw new Error(`${failed} de ${targets.length} rascunho(s) falharam ao aplicar`)
   }
 
   async function saveConfig(cfg: AppConfig) {
@@ -738,6 +805,26 @@ export default function App() {
             </div>
           )}
 
+          {/* Modo Rascunho: isolar/restringir vira rascunho em vez de aplicar direto */}
+          {currentUser && (currentUser.role === 'admin' || currentUser.role === 'ns_admin') && (
+            <button
+              onClick={toggleDraftMode}
+              disabled={!draftMode && !config.hubble_discovery_enabled}
+              title={!draftMode && !config.hubble_discovery_enabled ? 'Ative a Descoberta pra usar o Modo Rascunho' : draftMode ? 'Desativar Modo Rascunho' : 'Ativar Modo Rascunho: isolar/restringir vira rascunho em vez de aplicar direto'}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '5px 12px', borderRadius: 20, fontSize: 11, fontWeight: 700,
+                border: 'none', cursor: (!draftMode && !config.hubble_discovery_enabled) ? 'not-allowed' : 'pointer',
+                background: draftMode ? '#fef3c7' : '#f1f5f9',
+                color: draftMode ? '#92400e' : '#64748b',
+                opacity: (!draftMode && !config.hubble_discovery_enabled) ? 0.5 : 1,
+              }}
+            >
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: draftMode ? '#f59e0b' : '#94a3b8' }} />
+              🧪 Modo Rascunho{draftMode ? ' ATIVO' : ''}
+            </button>
+          )}
+
           {/* Refresh */}
           <button
             onClick={refresh}
@@ -849,6 +936,22 @@ export default function App() {
         </div>
       )}
 
+      {draftModeError && (
+        <div style={{ background: '#fef2f2', borderBottom: '1px solid #fecaca', padding: '6px 20px', fontSize: 11, color: '#dc2626', display: 'flex', justifyContent: 'space-between' }}>
+          {draftModeError}
+          <button onClick={() => setDraftModeError(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#dc2626' }}>✕</button>
+        </div>
+      )}
+
+      {draftMode && (
+        <div style={{
+          background: '#fef3c7', borderBottom: '1px solid #f59e0b', padding: '6px 20px',
+          fontSize: 11.5, fontWeight: 700, color: '#92400e', textAlign: 'center',
+        }}>
+          🧪 MODO RASCUNHO ATIVO — isolar/restringir vira rascunho, nada é aplicado no cluster até você clicar em Aplicar
+        </div>
+      )}
+
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
         <RightPanel
           currentUser={currentUser}
@@ -879,6 +982,8 @@ export default function App() {
           ciliumStreaming={ciliumStreaming}
           onClearCiliumFlows={() => clearCiliumFlows().then(() => setCiliumFlows([])).catch(() => {})}
           onViewNamespace={setSelectedNamespace}
+          draftMode={draftMode}
+          draftModeFlows={draftModeFlows}
         />
         <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
           {visibleNamespaces.size > 0 && visibleNamespaces.size < allNamespaces.length && (
@@ -940,6 +1045,7 @@ export default function App() {
             selectedNamespace={selectedNamespace}
             onSelectNamespace={setSelectedNamespace}
             onExplainFlow={currentUser?.role === 'admin' ? handleExplainFlow : undefined}
+            draftMode={draftMode}
           />
         </div>
       </div>

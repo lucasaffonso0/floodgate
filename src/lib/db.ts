@@ -165,6 +165,43 @@ function initDb(): DbType {
       last_seen    TEXT NOT NULL
     );
 
+    -- Snapshot of discovered_flows taken when Modo Rascunho is activated —
+    -- a frozen copy to compare drafts against, never written back into
+    -- discovered_flows/managed_policies or the cluster.
+    CREATE TABLE IF NOT EXISTS draft_mode_flows (
+      id           TEXT PRIMARY KEY,
+      src_workload  TEXT NOT NULL,
+      src_namespace TEXT NOT NULL,
+      dst_workload  TEXT NOT NULL,
+      dst_namespace TEXT NOT NULL,
+      dst_port     INTEGER NOT NULL,
+      protocol     TEXT NOT NULL,
+      verdict      TEXT NOT NULL,
+      flow_count   INTEGER NOT NULL DEFAULT 1,
+      has_policy   INTEGER NOT NULL DEFAULT 0,
+      first_seen   TEXT NOT NULL,
+      last_seen    TEXT NOT NULL
+    );
+
+    -- Flows capturados de/para uma namespace que está em "Ignoradas" —
+    -- mesmo formato de discovered_flows, mas guardados à parte em vez de
+    -- descartados, pra migrar de volta se a namespace deixar de ser
+    -- ignorada (ver migrateUnignoredFlows em hubble.ts).
+    CREATE TABLE IF NOT EXISTS ignored_flows (
+      id           TEXT PRIMARY KEY,
+      src_workload  TEXT NOT NULL,
+      src_namespace TEXT NOT NULL,
+      dst_workload  TEXT NOT NULL,
+      dst_namespace TEXT NOT NULL,
+      dst_port     INTEGER NOT NULL,
+      protocol     TEXT NOT NULL,
+      verdict      TEXT NOT NULL,
+      flow_count   INTEGER NOT NULL DEFAULT 1,
+      has_policy   INTEGER NOT NULL DEFAULT 0,
+      first_seen   TEXT NOT NULL,
+      last_seen    TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
     CREATE INDEX IF NOT EXISTS idx_approval_votes_request_id ON approval_votes(request_id);
     CREATE INDEX IF NOT EXISTS idx_discovered_flows_flow_count ON discovered_flows(flow_count);

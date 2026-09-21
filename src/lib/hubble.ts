@@ -123,6 +123,14 @@ function getIgnoredNamespaces(): string[] {
   return _ignoredNsCache
 }
 
+// Chamado por PUT /api/config quando ignored_namespaces muda — sem isso, um
+// flow que chega nos até 10s seguintes ainda usaria a lista antiga (podendo
+// gravar em ignored_flows um flow que acabou de ser des-ignorado, bem depois
+// de migrateUnignoredFlows já ter rodado pra essa mesma mudança).
+export function invalidateIgnoredNamespacesCache(): void {
+  _ignoredNsCacheAt = 0
+}
+
 // ─── Deduplicação por conexão TCP (source port identifica cada conexão única) ──
 // key: "flowId:srcPort" → timestamp de primeiro avistamento (para limpeza TTL)
 const _connDedup = new Map<string, number>()
@@ -176,8 +184,13 @@ function processFlow(msg: unknown): void {
     if (!isKnownServicePort(dst.namespace, dst.workload, portInfo.port)) return
   }
 
+  // Namespace ignorada não descarta o flow mais — vai pra uma tabela
+  // separada (ignored_flows) em vez de discovered_flows, pra não perder o
+  // histórico. Se a namespace deixar de ser ignorada depois, esses flows
+  // migram pra discovered_flows (ver migrateUnignoredFlows, chamado quando
+  // a config muda) em vez de terem sido descartados pra sempre.
   const ignored = getIgnoredNamespaces()
-  if (ignored.includes(src.namespace) || ignored.includes(dst.namespace)) return
+  const table = (ignored.includes(src.namespace) || ignored.includes(dst.namespace)) ? 'ignored_flows' : 'discovered_flows'
 
   if (Date.now() - _policyCacheAt > 15_000) refreshPolicyCache()  // refresh async em background
 
@@ -202,22 +215,26 @@ function processFlow(msg: unknown): void {
         _policyCache,
       )
       getDb().prepare(`
-        INSERT INTO discovered_flows (id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port, protocol, verdict, flow_count, has_policy, first_seen, last_seen)
+        INSERT INTO ${table} (id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port, protocol, verdict, flow_count, has_policy, first_seen, last_seen)
         VALUES (@id, @src_workload, @src_namespace, @dst_workload, @dst_namespace, @dst_port, @protocol, @verdict, 1, @has_policy, @now, @now)
         ON CONFLICT(id) DO UPDATE SET
-          flow_count = discovered_flows.flow_count + 1,
+          flow_count = ${table}.flow_count + 1,
           verdict = excluded.verdict,
           last_seen = excluded.last_seen
       `).run({ id, src_workload: src.workload, src_namespace: src.namespace, dst_workload: dstWorkload, dst_namespace: dst.namespace, dst_port: portInfo.port, protocol: portInfo.protocol, verdict, has_policy: hasPolicy ? 1 : 0, now })
     } else {
-      getDb().prepare(`UPDATE discovered_flows SET verdict = ?, last_seen = ? WHERE id = ?`).run(verdict, now, id)
+      getDb().prepare(`UPDATE ${table} SET verdict = ?, last_seen = ? WHERE id = ?`).run(verdict, now, id)
     }
 
-    // Emit SSE no máximo a cada 3s para não sobrecarregar o frontend
-    const lastEmit = g._hubbleLastSseEmit ?? 0
-    if (Date.now() - lastEmit > 3000) {
-      g._hubbleLastSseEmit = Date.now()
-      emit({ type: 'hubble_flow_new' })
+    // Emit SSE no máximo a cada 3s para não sobrecarregar o frontend — só
+    // pros visíveis (discovered_flows); flows de namespace ignorada não têm
+    // nada pra atualizar na tela agora mesmo.
+    if (table === 'discovered_flows') {
+      const lastEmit = g._hubbleLastSseEmit ?? 0
+      if (Date.now() - lastEmit > 3000) {
+        g._hubbleLastSseEmit = Date.now()
+        emit({ type: 'hubble_flow_new' })
+      }
     }
   } catch (e) {
     console.error('[hubble] DB write error:', e)
@@ -279,11 +296,25 @@ export function stopHubbleStream(): void {
   console.log('[hubble] stream stopped')
 }
 
+function reclassifyFlowPolicies(table: 'discovered_flows' | 'ignored_flows', allPolicies: NetworkPolicyInfo[]): void {
+  const db = getDb()
+  const flows = db.prepare(`SELECT id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port FROM ${table}`).all() as Array<{
+    id: string; src_workload: string; src_namespace: string; dst_workload: string; dst_namespace: string; dst_port: number
+  }>
+  if (flows.length === 0) return
+  const updateStmt = db.prepare(`UPDATE ${table} SET has_policy = ? WHERE id = ?`)
+  db.transaction(() => {
+    for (const f of flows) {
+      updateStmt.run(flowHasPolicy(f, allPolicies) ? 1 : 0, f.id)
+    }
+  })()
+}
+
 // ─── Atualiza has_policy para todos os flows (chamado pelo scheduler) ──────
 export async function updateFlowPolicies(): Promise<void> {
   try {
     const db = getDb()
-    const count = (db.prepare('SELECT COUNT(*) as c FROM discovered_flows').get() as { c: number }).c
+    const count = (db.prepare('SELECT (SELECT COUNT(*) FROM discovered_flows) + (SELECT COUNT(*) FROM ignored_flows) as c').get() as { c: number }).c
     if (count === 0) return
 
     // Fetch fresh rather than trust the cache here: this is the periodic
@@ -294,15 +325,8 @@ export async function updateFlowPolicies(): Promise<void> {
     _policyCache = allPolicies
     _policyCacheAt = Date.now()
 
-    const flows = db.prepare('SELECT id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port FROM discovered_flows').all() as Array<{
-      id: string; src_workload: string; src_namespace: string; dst_workload: string; dst_namespace: string; dst_port: number
-    }>
-    const updateStmt = db.prepare('UPDATE discovered_flows SET has_policy = ? WHERE id = ?')
-    db.transaction(() => {
-      for (const f of flows) {
-        updateStmt.run(flowHasPolicy(f, allPolicies) ? 1 : 0, f.id)
-      }
-    })()
+    reclassifyFlowPolicies('discovered_flows', allPolicies)
+    reclassifyFlowPolicies('ignored_flows', allPolicies)
   } catch { /* non-critical */ }
 }
 
@@ -314,43 +338,48 @@ type DiscoveredFlowRow = {
   first_seen: string; last_seen: string
 }
 
+function normalizeFlowTable(table: 'discovered_flows' | 'ignored_flows'): void {
+  const db = getDb()
+  const rows = db.prepare(`SELECT * FROM ${table}`).all() as DiscoveredFlowRow[]
+  if (rows.length === 0) return
+
+  const dirty = rows.some(r => normalizeWorkload(r.src_workload) !== r.src_workload || normalizeWorkload(r.dst_workload) !== r.dst_workload)
+  if (!dirty) return
+
+  const merged = new Map<string, DiscoveredFlowRow>()
+  for (const r of rows) {
+    const src_workload = normalizeWorkload(r.src_workload)
+    const dst_workload = normalizeWorkload(r.dst_workload)
+    const id = flowId(r.src_namespace, src_workload, r.dst_namespace, dst_workload, r.dst_port, r.protocol)
+    const existing = merged.get(id)
+    if (!existing) {
+      merged.set(id, { ...r, id, src_workload, dst_workload })
+      continue
+    }
+    existing.flow_count += r.flow_count
+    // Don't trust either row's stored has_policy across a merge: it may
+    // have been computed under stale data. updateFlowPolicies() recomputes
+    // it fresh right after this runs, every tick.
+    existing.has_policy = 0
+    if (r.first_seen < existing.first_seen) existing.first_seen = r.first_seen
+    if (r.last_seen > existing.last_seen) { existing.last_seen = r.last_seen; existing.verdict = r.verdict }
+  }
+
+  const del = db.prepare(`DELETE FROM ${table}`)
+  const ins = db.prepare(`
+    INSERT INTO ${table} (id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port, protocol, verdict, flow_count, has_policy, first_seen, last_seen)
+    VALUES (@id, @src_workload, @src_namespace, @dst_workload, @dst_namespace, @dst_port, @protocol, @verdict, @flow_count, @has_policy, @first_seen, @last_seen)
+  `)
+  db.transaction(() => {
+    del.run()
+    for (const m of merged.values()) ins.run(m)
+  })()
+}
+
 export function normalizeStoredFlows(): void {
   try {
-    const db = getDb()
-    const rows = db.prepare('SELECT * FROM discovered_flows').all() as DiscoveredFlowRow[]
-    if (rows.length === 0) return
-
-    const dirty = rows.some(r => normalizeWorkload(r.src_workload) !== r.src_workload || normalizeWorkload(r.dst_workload) !== r.dst_workload)
-    if (!dirty) return
-
-    const merged = new Map<string, DiscoveredFlowRow>()
-    for (const r of rows) {
-      const src_workload = normalizeWorkload(r.src_workload)
-      const dst_workload = normalizeWorkload(r.dst_workload)
-      const id = flowId(r.src_namespace, src_workload, r.dst_namespace, dst_workload, r.dst_port, r.protocol)
-      const existing = merged.get(id)
-      if (!existing) {
-        merged.set(id, { ...r, id, src_workload, dst_workload })
-        continue
-      }
-      existing.flow_count += r.flow_count
-      // Don't trust either row's stored has_policy across a merge: it may
-      // have been computed under stale data. updateFlowPolicies() recomputes
-      // it fresh right after this runs, every tick.
-      existing.has_policy = 0
-      if (r.first_seen < existing.first_seen) existing.first_seen = r.first_seen
-      if (r.last_seen > existing.last_seen) { existing.last_seen = r.last_seen; existing.verdict = r.verdict }
-    }
-
-    const del = db.prepare('DELETE FROM discovered_flows')
-    const ins = db.prepare(`
-      INSERT INTO discovered_flows (id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port, protocol, verdict, flow_count, has_policy, first_seen, last_seen)
-      VALUES (@id, @src_workload, @src_namespace, @dst_workload, @dst_namespace, @dst_port, @protocol, @verdict, @flow_count, @has_policy, @first_seen, @last_seen)
-    `)
-    db.transaction(() => {
-      del.run()
-      for (const m of merged.values()) ins.run(m)
-    })()
+    normalizeFlowTable('discovered_flows')
+    normalizeFlowTable('ignored_flows')
   } catch { /* non-critical */ }
 }
 
@@ -359,7 +388,44 @@ export function runRetentionCleanup(): void {
   try {
     const retentionDays = getConfig().hubble_flow_retention_days ?? 7
     const staleDate = new Date(Date.now() - retentionDays * 86400 * 1000).toISOString()
-    getDb().prepare('DELETE FROM discovered_flows WHERE last_seen < ?').run(staleDate)
+    const db = getDb()
+    db.prepare('DELETE FROM discovered_flows WHERE last_seen < ?').run(staleDate)
+    db.prepare('DELETE FROM ignored_flows WHERE last_seen < ?').run(staleDate)
+  } catch { /* non-critical */ }
+}
+
+// ─── Migra de volta pra discovered_flows os flows de uma namespace que
+// deixou de ser ignorada (chamado por PUT /api/config quando a lista de
+// ignored_namespaces perde alguma entrada) ─────────────────────────────────
+export function migrateUnignoredFlows(newIgnoredNamespaces: string[]): void {
+  try {
+    const db = getDb()
+    const rows = db.prepare('SELECT * FROM ignored_flows').all() as DiscoveredFlowRow[]
+    if (rows.length === 0) return
+
+    const stillIgnored = new Set(newIgnoredNamespaces)
+    // Só migra quem não tem NENHUM dos dois lados ainda ignorado — um flow
+    // entre duas namespaces ignoradas continua escondido até as duas saírem
+    // da lista.
+    const toMigrate = rows.filter(r => !stillIgnored.has(r.src_namespace) && !stillIgnored.has(r.dst_namespace))
+    if (toMigrate.length === 0) return
+
+    const upsert = db.prepare(`
+      INSERT INTO discovered_flows (id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port, protocol, verdict, flow_count, has_policy, first_seen, last_seen)
+      VALUES (@id, @src_workload, @src_namespace, @dst_workload, @dst_namespace, @dst_port, @protocol, @verdict, @flow_count, @has_policy, @first_seen, @last_seen)
+      ON CONFLICT(id) DO UPDATE SET
+        flow_count = discovered_flows.flow_count + excluded.flow_count,
+        verdict = excluded.verdict,
+        last_seen = CASE WHEN excluded.last_seen > discovered_flows.last_seen THEN excluded.last_seen ELSE discovered_flows.last_seen END,
+        first_seen = CASE WHEN excluded.first_seen < discovered_flows.first_seen THEN excluded.first_seen ELSE discovered_flows.first_seen END
+    `)
+    const del = db.prepare('DELETE FROM ignored_flows WHERE id = ?')
+    db.transaction(() => {
+      for (const r of toMigrate) {
+        upsert.run(r)
+        del.run(r.id)
+      }
+    })()
   } catch { /* non-critical */ }
 }
 
@@ -392,5 +458,54 @@ export function getDiscoveredFlows(): CiliumFlowSummary[] {
 }
 
 export function clearDiscoveredFlows(): void {
-  getDb().prepare('DELETE FROM discovered_flows').run()
+  const db = getDb()
+  db.prepare('DELETE FROM discovered_flows').run()
+  db.prepare('DELETE FROM ignored_flows').run()
+}
+
+// ── Modo Rascunho ────────────────────────────────────────────────────────
+// A frozen copy of discovered_flows, taken once when Modo Rascunho turns
+// on — the fixed baseline drafts are compared against. Never written back
+// into discovered_flows: live Hubble ingestion keeps running untouched.
+export function snapshotFlowsForDraftMode(): void {
+  const db = getDb()
+  db.exec('DELETE FROM draft_mode_flows')
+  db.exec('INSERT INTO draft_mode_flows SELECT * FROM discovered_flows')
+}
+
+export function getDraftModeFlows(): CiliumFlowSummary[] {
+  const rows = getDb().prepare('SELECT * FROM draft_mode_flows ORDER BY first_seen DESC, id').all() as Array<Record<string, unknown>>
+  return rows.map(r => ({
+    id: r.id as string,
+    src_workload: r.src_workload as string,
+    src_namespace: r.src_namespace as string,
+    dst_workload: r.dst_workload as string,
+    dst_namespace: r.dst_namespace as string,
+    dst_port: r.dst_port as number,
+    protocol: r.protocol as 'TCP' | 'UDP',
+    verdict: r.verdict as CiliumFlowSummary['verdict'],
+    flow_count: r.flow_count as number,
+    has_policy: Boolean(r.has_policy),
+    first_seen: r.first_seen as string,
+    last_seen: r.last_seen as string,
+  }))
+}
+
+export function clearDraftModeFlows(): void {
+  getDb().prepare('DELETE FROM draft_mode_flows').run()
+}
+
+// Own flag in app_config, not part of AppConfig (same treatment as
+// autosync_last_run) — can't infer "active" from the snapshot being
+// non-empty, since an empty discovered_flows table at activation time
+// would look identical to "never activated".
+const DRAFT_MODE_KEY = 'draft_mode_active'
+
+export function isDraftModeActive(): boolean {
+  const row = getDb().prepare('SELECT value FROM app_config WHERE key = ?').get(DRAFT_MODE_KEY) as { value: string } | undefined
+  return row?.value === 'true'
+}
+
+export function setDraftModeActive(active: boolean): void {
+  getDb().prepare('INSERT OR REPLACE INTO app_config (key, value) VALUES (?, ?)').run(DRAFT_MODE_KEY, JSON.stringify(active))
 }

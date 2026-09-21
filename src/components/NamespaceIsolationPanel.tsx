@@ -1,12 +1,13 @@
 'use client'
 
 import React from 'react'
-import { ServiceInfo, NetworkPolicyInfo } from '@/types'
+import { ServiceInfo, NetworkPolicyInfo, Draft } from '@/types'
 import { deleteNetworkPolicy, isolateNamespace } from '@/api/client'
 import { getNamespaceIsolation, getOtherPoliciesInNamespace } from '@/lib/nsIsolation'
+import { computeEffectivePolicies } from '@/lib/simulate'
 
 function NsDirRow({
-  label, nsIsolated, nsPolicy, applying, isViewer, onApply, onRemove,
+  label, nsIsolated, nsPolicy, applying, isViewer, onApply, onRemove, draftBlocked,
 }: {
   label: string
   nsIsolated: boolean
@@ -15,6 +16,7 @@ function NsDirRow({
   isViewer?: boolean
   onApply: () => void
   onRemove: (p: NetworkPolicyInfo) => void
+  draftBlocked?: boolean
 }) {
   const dir = label === 'Inbound' ? 'ingress' : 'egress'
   const color = nsIsolated ? '#15803d' : '#dc2626'
@@ -39,7 +41,7 @@ function NsDirRow({
               Remover
             </button>
           )
-          : !isViewer && (
+          : !isViewer && !draftBlocked && (
             <button disabled={applying} onClick={onApply} style={{
               padding: '3px 9px', fontSize: 9, fontWeight: 700,
               border: '1px solid #93c5fd', borderRadius: 5,
@@ -51,6 +53,14 @@ function NsDirRow({
           )
         }
       </div>
+      {!nsIsolated && draftBlocked && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 3, marginTop: 4 }}>
+          <div style={{ fontSize: 9.5, fontWeight: 700, color: '#b45309', background: '#fef3c7', borderRadius: 5, padding: '3px 7px', display: 'inline-block', alignSelf: 'flex-start' }}>
+            🧪 Seria isolado pelo rascunho
+          </div>
+          <div style={{ fontSize: 9, color: '#92400e' }}>Já há um rascunho pendente — veja a aba Rascunhos</div>
+        </div>
+      )}
     </div>
   )
 }
@@ -61,11 +71,12 @@ function NsDirRow({
 // Shared between NetworkGraph's namespace panel and the Segurança tab so
 // both always show and do exactly the same thing.
 export function NamespaceIsolationPanel({
-  namespace, services, policies, isViewer, canManageNamespace, onPolicyChanged,
+  namespace, services, policies, drafts, isViewer, canManageNamespace, onPolicyChanged, draftMode, onAddDraft,
 }: {
-  namespace: string; services: ServiceInfo[]; policies: NetworkPolicyInfo[]
+  namespace: string; services: ServiceInfo[]; policies: NetworkPolicyInfo[]; drafts?: Draft[]
   canManageNamespace?: (namespace: string) => boolean
   isViewer?: boolean; onPolicyChanged: () => void
+  draftMode?: boolean; onAddDraft?: (d: Omit<Draft, 'id'>) => void
 }) {
   const [applying, setApplying]           = React.useState(false)
   const [allowIntra, setAllowIntra]       = React.useState(true)
@@ -76,11 +87,38 @@ export function NamespaceIsolationPanel({
   const iso = getNamespaceIsolation(namespace, policies)
   const { ingressPolicy: nsIngressPolicy, egressPolicy: nsEgressPolicy, isolatedIn: nsIsolatedIn, isolatedEg: nsIsolatedEg, anyIsolated, fullyIsolated } = iso
 
+  // Modo Rascunho: essa direção está aberta nas policies reais, mas um
+  // isolate (ou restrict de algum service dela) pendente vai fechá-la assim
+  // que for aplicado — sem isso o painel de namespace parecia "normal" com
+  // um rascunho pendente pra ela, igual ao que já foi corrigido no painel
+  // de serviço.
+  const effectivePolicies = draftMode && drafts ? computeEffectivePolicies(policies, drafts) : policies
+  const effIso = draftMode ? getNamespaceIsolation(namespace, effectivePolicies) : iso
+  const ingressDraftBlocked = !!draftMode && !nsIsolatedIn && effIso.isolatedIn
+  const egressDraftBlocked  = !!draftMode && !nsIsolatedEg && effIso.isolatedEg
+
   // Live option detection: do these bonus policies already exist?
   const hasIntraPolicy    = policies.some(p => p.namespace === namespace && p.policy_type === 'allow-intranamespace')
   const hasInternetPolicy = policies.some(p => p.namespace === namespace && p.policy_type === 'allow-egress' && p.dst_service === 'internet')
 
+  // Modo Rascunho: reflete no switch o estado que valeria DEPOIS de aplicar
+  // o rascunho pendente (se houver um), não o real — e trava o switch nesse
+  // meio tempo pra não empilhar um segundo rascunho contraditório em cima.
+  const intraDraftPending    = !!draftMode && !!drafts?.some(d => d.kind === 'toggle' && d.toggle_namespace === namespace && d.toggle_option === 'intra')
+  const internetDraftPending = !!draftMode && !!drafts?.some(d => d.kind === 'toggle' && d.toggle_namespace === namespace && d.toggle_option === 'internet')
+  const effectiveHasIntraPolicy    = draftMode ? effectivePolicies.some(p => p.namespace === namespace && p.policy_type === 'allow-intranamespace') : hasIntraPolicy
+  const effectiveHasInternetPolicy = draftMode ? effectivePolicies.some(p => p.namespace === namespace && p.policy_type === 'allow-egress' && p.dst_service === 'internet') : hasInternetPolicy
+
   async function apply(direction: 'ingress' | 'egress' | 'both') {
+    if (draftMode) {
+      onAddDraft?.({
+        kind: 'isolate', isolate_namespace: namespace, isolate_direction: direction,
+        isolate_allow_intra: allowIntra, isolate_allow_internet: allowInternet,
+        src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: direction === 'both' ? 'both' : direction,
+      })
+      setResult('Adicionado aos rascunhos')
+      return
+    }
     setApplying(true); setResult(null)
     try {
       const r = await isolateNamespace({ namespace, direction, allow_intra_namespace: allowIntra, allow_egress_internet: allowInternet })
@@ -145,6 +183,17 @@ export function NamespaceIsolationPanel({
   }
 
   async function toggleIntra() {
+    if (draftMode) {
+      if (intraDraftPending) return
+      const directions: ('ingress' | 'egress')[] = nsIsolatedIn && nsIsolatedEg ? ['ingress', 'egress'] : nsIsolatedIn ? ['ingress'] : ['egress']
+      onAddDraft?.({
+        kind: 'toggle', toggle_namespace: namespace, toggle_option: 'intra',
+        toggle_action: hasIntraPolicy ? 'disable' : 'enable', toggle_directions: directions,
+        src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: 'both',
+      })
+      setResult('Adicionado aos rascunhos')
+      return
+    }
     setApplying(true); setResult(null)
     try {
       if (hasIntraPolicy) {
@@ -159,6 +208,16 @@ export function NamespaceIsolationPanel({
   }
 
   async function toggleInternet() {
+    if (draftMode) {
+      if (internetDraftPending) return
+      onAddDraft?.({
+        kind: 'toggle', toggle_namespace: namespace, toggle_option: 'internet',
+        toggle_action: hasInternetPolicy ? 'disable' : 'enable',
+        src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: 'egress',
+      })
+      setResult('Adicionado aos rascunhos')
+      return
+    }
     setApplying(true); setResult(null)
     try {
       if (hasInternetPolicy) {
@@ -173,9 +232,9 @@ export function NamespaceIsolationPanel({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      <NsDirRow label="Inbound"  nsIsolated={nsIsolatedIn} nsPolicy={nsIngressPolicy} applying={applying} isViewer={!canManageCurrent} onApply={() => apply('ingress')} onRemove={removePolicy} />
+      <NsDirRow label="Inbound"  nsIsolated={nsIsolatedIn} nsPolicy={nsIngressPolicy} applying={applying} isViewer={!canManageCurrent} onApply={() => apply('ingress')} onRemove={removePolicy} draftBlocked={ingressDraftBlocked} />
       <div style={{ borderTop: '1px solid #f1f5f9' }} />
-      <NsDirRow label="Outbound" nsIsolated={nsIsolatedEg} nsPolicy={nsEgressPolicy}  applying={applying} isViewer={!canManageCurrent} onApply={() => apply('egress')}  onRemove={removePolicy} />
+      <NsDirRow label="Outbound" nsIsolated={nsIsolatedEg} nsPolicy={nsEgressPolicy}  applying={applying} isViewer={!canManageCurrent} onApply={() => apply('egress')}  onRemove={removePolicy} draftBlocked={egressDraftBlocked} />
 
       {/* ── Exceptions section ── */}
       {(nsIsolatedIn || nsIsolatedEg) && (() => {
@@ -249,16 +308,22 @@ export function NamespaceIsolationPanel({
                   <div style={{ fontSize: 9, color: '#94a3b8' }}>Allow entre pods do mesmo namespace</div>
                 </div>
                 <button
-                  disabled={applying}
+                  disabled={applying || intraDraftPending}
                   onClick={toggleIntra}
+                  title={intraDraftPending ? 'Já há um rascunho pendente pra esse toggle — veja a aba Rascunhos' : undefined}
                   style={{
-                    width: 36, height: 20, borderRadius: 10, border: 'none', cursor: applying ? 'not-allowed' : 'pointer',
-                    background: hasIntraPolicy ? '#10b981' : '#cbd5e1', position: 'relative', flexShrink: 0, transition: 'background 0.2s', padding: 0,
+                    width: 36, height: 20, borderRadius: 10, border: 'none', cursor: (applying || intraDraftPending) ? 'not-allowed' : 'pointer',
+                    background: effectiveHasIntraPolicy ? '#10b981' : '#cbd5e1', position: 'relative', flexShrink: 0, transition: 'background 0.2s', padding: 0,
+                    opacity: intraDraftPending ? 0.6 : 1,
+                    boxShadow: draftMode && effectiveHasIntraPolicy !== hasIntraPolicy ? '0 0 0 2px #fde68a' : 'none',
                   }}
                 >
-                  <span style={{ position: 'absolute', top: 2, left: hasIntraPolicy ? 18 : 2, width: 16, height: 16, borderRadius: '50%', background: 'white', transition: 'left 0.2s', display: 'block' }} />
+                  <span style={{ position: 'absolute', top: 2, left: effectiveHasIntraPolicy ? 18 : 2, width: 16, height: 16, borderRadius: '50%', background: 'white', transition: 'left 0.2s', display: 'block' }} />
                 </button>
               </div>
+              {intraDraftPending && (
+                <div style={{ fontSize: 9, color: '#92400e', marginTop: -3 }}>🧪 Rascunho pendente — veja a aba Rascunhos</div>
+              )}
               {/* Internet egress toggle: only relevant when egress is isolated */}
               {nsIsolatedEg && (
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 10px', borderRadius: 7, background: '#f8fafc', border: '1px solid #e2e8f0' }}>
@@ -267,63 +332,81 @@ export function NamespaceIsolationPanel({
                     <div style={{ fontSize: 9, color: '#94a3b8' }}>Libera egress ports 80/443 (IPs públicos)</div>
                   </div>
                   <button
-                    disabled={applying}
+                    disabled={applying || internetDraftPending}
                     onClick={toggleInternet}
+                    title={internetDraftPending ? 'Já há um rascunho pendente pra esse toggle — veja a aba Rascunhos' : undefined}
                     style={{
-                      width: 36, height: 20, borderRadius: 10, border: 'none', cursor: applying ? 'not-allowed' : 'pointer',
-                      background: hasInternetPolicy ? '#10b981' : '#cbd5e1', position: 'relative', flexShrink: 0, transition: 'background 0.2s', padding: 0,
+                      width: 36, height: 20, borderRadius: 10, border: 'none', cursor: (applying || internetDraftPending) ? 'not-allowed' : 'pointer',
+                      background: effectiveHasInternetPolicy ? '#10b981' : '#cbd5e1', position: 'relative', flexShrink: 0, transition: 'background 0.2s', padding: 0,
+                      opacity: internetDraftPending ? 0.6 : 1,
+                      boxShadow: draftMode && effectiveHasInternetPolicy !== hasInternetPolicy ? '0 0 0 2px #fde68a' : 'none',
                     }}
                   >
-                    <span style={{ position: 'absolute', top: 2, left: hasInternetPolicy ? 18 : 2, width: 16, height: 16, borderRadius: '50%', background: 'white', transition: 'left 0.2s', display: 'block' }} />
+                    <span style={{ position: 'absolute', top: 2, left: effectiveHasInternetPolicy ? 18 : 2, width: 16, height: 16, borderRadius: '50%', background: 'white', transition: 'left 0.2s', display: 'block' }} />
                   </button>
                 </div>
+              )}
+              {internetDraftPending && (
+                <div style={{ fontSize: 9, color: '#92400e', marginTop: -3 }}>🧪 Rascunho pendente — veja a aba Rascunhos</div>
               )}
             </div>
           )}
 
-          {/* Pre-apply options: shown only when not fully isolated yet */}
+          {/* Pre-apply options: shown only when not fully isolated yet. Once
+              both directions already have a pending draft, neither this
+              button nor the individual "Isolar ingress/egress" ones below
+              are actionable anymore — hide the toggles too, since nothing
+              left in this panel would consume them. */}
           {!fullyIsolated && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {!anyIsolated && (
+              {ingressDraftBlocked && egressDraftBlocked ? (
+                <div style={{ fontSize: 9, color: '#92400e', textAlign: 'center' }}>
+                  🧪 Já há um rascunho pendente pras duas direções — veja a aba Rascunhos
+                </div>
+              ) : (
                 <>
-                  <div style={{ fontSize: 9, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Opções de isolamento</div>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 10px', borderRadius: 7, background: '#f8fafc', border: '1px solid #e2e8f0' }}>
-                    <div>
-                      <div style={{ fontSize: 10, fontWeight: 600, color: '#334155' }}>Tráfego interno</div>
-                      <div style={{ fontSize: 9, color: '#94a3b8' }}>Allow entre pods do mesmo namespace</div>
-                    </div>
-                    <button onClick={() => setAllowIntra(v => !v)} style={{ width: 36, height: 20, borderRadius: 10, border: 'none', cursor: 'pointer', background: allowIntra ? '#10b981' : '#cbd5e1', position: 'relative', flexShrink: 0, transition: 'background 0.2s', padding: 0 }}>
-                      <span style={{ position: 'absolute', top: 2, left: allowIntra ? 18 : 2, width: 16, height: 16, borderRadius: '50%', background: 'white', transition: 'left 0.2s', display: 'block' }} />
-                    </button>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 10px', borderRadius: 7, background: '#f8fafc', border: '1px solid #e2e8f0' }}>
-                    <div>
-                      <div style={{ fontSize: 10, fontWeight: 600, color: '#334155' }}>Saída para internet</div>
-                      <div style={{ fontSize: 9, color: '#94a3b8' }}>Libera egress ports 80/443 (IPs públicos)</div>
-                    </div>
-                    <button onClick={() => setAllowInternet(v => !v)} style={{ width: 36, height: 20, borderRadius: 10, border: 'none', cursor: 'pointer', background: allowInternet ? '#10b981' : '#cbd5e1', position: 'relative', flexShrink: 0, transition: 'background 0.2s', padding: 0 }}>
-                      <span style={{ position: 'absolute', top: 2, left: allowInternet ? 18 : 2, width: 16, height: 16, borderRadius: '50%', background: 'white', transition: 'left 0.2s', display: 'block' }} />
-                    </button>
-                  </div>
+                  {!anyIsolated && (
+                    <>
+                      <div style={{ fontSize: 9, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Opções de isolamento</div>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 10px', borderRadius: 7, background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                        <div>
+                          <div style={{ fontSize: 10, fontWeight: 600, color: '#334155' }}>Tráfego interno</div>
+                          <div style={{ fontSize: 9, color: '#94a3b8' }}>Allow entre pods do mesmo namespace</div>
+                        </div>
+                        <button onClick={() => setAllowIntra(v => !v)} style={{ width: 36, height: 20, borderRadius: 10, border: 'none', cursor: 'pointer', background: allowIntra ? '#10b981' : '#cbd5e1', position: 'relative', flexShrink: 0, transition: 'background 0.2s', padding: 0 }}>
+                          <span style={{ position: 'absolute', top: 2, left: allowIntra ? 18 : 2, width: 16, height: 16, borderRadius: '50%', background: 'white', transition: 'left 0.2s', display: 'block' }} />
+                        </button>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 10px', borderRadius: 7, background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                        <div>
+                          <div style={{ fontSize: 10, fontWeight: 600, color: '#334155' }}>Saída para internet</div>
+                          <div style={{ fontSize: 9, color: '#94a3b8' }}>Libera egress ports 80/443 (IPs públicos)</div>
+                        </div>
+                        <button onClick={() => setAllowInternet(v => !v)} style={{ width: 36, height: 20, borderRadius: 10, border: 'none', cursor: 'pointer', background: allowInternet ? '#10b981' : '#cbd5e1', position: 'relative', flexShrink: 0, transition: 'background 0.2s', padding: 0 }}>
+                          <span style={{ position: 'absolute', top: 2, left: allowInternet ? 18 : 2, width: 16, height: 16, borderRadius: '50%', background: 'white', transition: 'left 0.2s', display: 'block' }} />
+                        </button>
+                      </div>
+                    </>
+                  )}
+                  <button
+                    disabled={applying}
+                    onClick={() => apply('both')}
+                    style={{
+                      width: '100%', padding: '8px 12px', fontSize: 11, fontWeight: 600,
+                      background: applying ? '#dbeafe' : '#eff6ff', color: applying ? '#93c5fd' : '#2563eb',
+                      border: `1.5px solid ${applying ? '#bfdbfe' : '#93c5fd'}`, borderRadius: 7, cursor: applying ? 'not-allowed' : 'pointer',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+                      opacity: applying ? 0.7 : 1,
+                    }}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                      <rect x="3" y="11" width="18" height="11" rx="2"/>
+                      <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                    </svg>
+                    {applying ? 'Aplicando…' : 'Isolar namespace inteiro'}
+                  </button>
                 </>
               )}
-              <button
-                disabled={applying}
-                onClick={() => apply('both')}
-                style={{
-                  width: '100%', padding: '8px 12px', fontSize: 11, fontWeight: 600,
-                  background: applying ? '#dbeafe' : '#eff6ff', color: applying ? '#93c5fd' : '#2563eb',
-                  border: `1.5px solid ${applying ? '#bfdbfe' : '#93c5fd'}`, borderRadius: 7, cursor: applying ? 'not-allowed' : 'pointer',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
-                  opacity: applying ? 0.7 : 1,
-                }}
-              >
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                  <rect x="3" y="11" width="18" height="11" rx="2"/>
-                  <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-                </svg>
-                {applying ? 'Aplicando…' : 'Isolar namespace inteiro'}
-              </button>
             </div>
           )}
 

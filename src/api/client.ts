@@ -203,6 +203,16 @@ export const clearCiliumFlows = (): Promise<void> =>
 export const checkHubble = (): Promise<{ available: boolean }> =>
   api.get('/cilium/flows/check').then(r => r.data)
 
+// ── Modo Rascunho ────────────────────────────────────────────────────────
+export const getDraftMode = (): Promise<{ active: boolean; flows: CiliumFlowSummary[] }> =>
+  api.get('/draft-mode').then(r => r.data)
+
+export const activateDraftMode = (): Promise<{ active: boolean; flows: CiliumFlowSummary[] }> =>
+  api.post('/draft-mode').then(r => r.data)
+
+export const deactivateDraftMode = (): Promise<void> =>
+  api.delete('/draft-mode').then(() => undefined)
+
 export const getNetworkPolicyYaml = (namespace: string, name: string): Promise<string> =>
   api.get(`/networkpolicies/${namespace}/${name}`, { headers: { Accept: 'application/yaml' } }).then(r => r.data)
 

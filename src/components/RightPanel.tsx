@@ -13,6 +13,7 @@ import {
   getBackupStatus, triggerBackup,
 } from '@/api/client'
 import { normalizeWorkload, classifyFlowGap } from '@/lib/flowMatch'
+import { simulateImpact, isFlowBlocked, computeEffectivePolicies } from '@/lib/simulate'
 import { getNamespaceIsolation } from '@/lib/nsIsolation'
 import { CronExpressionParser } from 'cron-parser'
 
@@ -506,15 +507,19 @@ function NewDraftModal({ services, ciliumFlows, onAdd, onClose }: {
   )
 }
 
-function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemove, onApply, onApplyAll, onDiscardAll, onUpdatePort, onAddDraft }: {
+function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemove, onApply, onApplyAll, onDiscardAll, onUpdatePort, onAddDraft, allPolicies, draftMode, draftModeFlows }: {
   drafts: Draft[]; services: ServiceInfo[]; ciliumFlows: CiliumFlowSummary[]; config: AppConfig; currentUser: User | null
   onRemove: (id: string) => void
   onApply: (d: Draft, allowedApprovers: Array<{ id: string; username: string }>) => Promise<void>
   onApplyAll: () => Promise<void>; onDiscardAll: () => void; onUpdatePort: (id: string, ports: PortSpec[]) => void
   onAddDraft: (d: Omit<Draft, 'id'>) => void
+  allPolicies?: NetworkPolicyInfo[]; draftMode?: boolean; draftModeFlows?: CiliumFlowSummary[]
 }) {
+  const impact = draftMode ? simulateImpact(draftModeFlows ?? [], allPolicies ?? [], drafts) : null
   const [expanded, setExpanded] = useState<string | null>(null)
   const [applying, setApplying] = useState<string | null>(null)
+  const [applyingAll, setApplyingAll] = useState(false)
+  const [applyAllError, setApplyAllError] = useState<string | null>(null)
   const [pickerDraft, setPickerDraft] = useState<string | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [approverSearch, setApproverSearch] = useState('')
@@ -530,7 +535,8 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
   }
 
   async function handleApply(d: Draft) {
-    if (config.approval_enabled) {
+    // Isolar/restringir nunca passam por aprovação, mesmo com approval_enabled.
+    if (config.approval_enabled && (!d.kind || d.kind === 'connection')) {
       const defaultIds = new Set(
         (config.approval_default_approvers ?? [])
           .filter(a => a.id !== currentUser?.id)
@@ -549,6 +555,22 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
     try { await onApply(d, approvers) } finally { setApplying(null) }
   }
 
+  // Sem isso, clicar de novo antes da primeira leva concluir dispara uma
+  // segunda applyAllDrafts() em paralelo, contra os MESMOS rascunhos ainda
+  // não removidos do estado — a segunda tenta apagar/criar as mesmas
+  // policies de novo e quebra com 404/409 no meio do caminho.
+  async function handleApplyAll() {
+    if (applyingAll) return
+    setApplyingAll(true); setApplyAllError(null)
+    try {
+      await onApplyAll()
+    } catch {
+      setApplyAllError('Erro ao aplicar um ou mais rascunhos — confira a aba Policies antes de tentar de novo.')
+    } finally {
+      setApplyingAll(false)
+    }
+  }
+
   const otherUsers = users
     .filter(u => u.id !== currentUser?.id)
     .filter(u => !approverSearch || u.username.toLowerCase().includes(approverSearch.toLowerCase()))
@@ -561,19 +583,44 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
     ? services
     : services.filter(s => (currentUser?.allowed_namespaces ?? []).includes(s.namespace))
 
+  // Modo Rascunho: Hubble nunca captura tráfego de/para uma namespace
+  // ignorada — nem grava no discovered_flows, então a foto do Modo Rascunho
+  // não tem como saber se um isolate/restrict pendente afeta o que passa por
+  // ela. Sem esse aviso, o impacto real só aparece depois, quando alguém
+  // remove a namespace de "Ignoradas" e os fluxos bloqueados começam a
+  // chegar — tarde demais pra ter servido de aviso. Mostrado mesmo sem
+  // nenhum rascunho ainda (não é sobre um rascunho específico, é sobre uma
+  // lacuna estrutural da simulação) — por isso fica fora do early-return de
+  // "Nenhum rascunho" abaixo, chamado nos dois ramos.
+  function ignoredNamespacesWarning() {
+    if (!draftMode) return null
+    const customIgnored = config.ignored_namespaces.filter(ns => !['kube-system', 'kube-public', 'kube-node-lease'].includes(ns))
+    if (customIgnored.length === 0) return null
+    return (
+      <div style={{ margin: '10px 14px 0', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8, padding: '10px 12px' }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: '#92400e' }}>
+          🧪 {customIgnored.length === 1 ? `A namespace "${customIgnored[0]}" está ignorada` : `${customIgnored.length} namespaces estão ignoradas (${customIgnored.join(', ')})`} — a Descoberta não captura tráfego dela(s), então o impacto dos rascunhos aí não aparece nesta análise.
+        </div>
+      </div>
+    )
+  }
+
   if (drafts.length === 0) {
     return (
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#94a3b8', fontSize: 12, gap: 10, padding: 24, textAlign: 'center' }}>
-        <Icon.Draft />
-        <div>Nenhum rascunho.<br/>Conecte serviços no grafo ou crie manualmente.</div>
-        <button
-          onClick={() => setShowNewModal(true)}
-          style={{ ...btn.base, ...btn.blue, fontSize: 11, padding: '6px 14px', marginTop: 4 }}
-        >
-          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-          Nova política
-        </button>
-        {showNewModal && <NewDraftModal services={manageableServices} ciliumFlows={ciliumFlows} onAdd={onAddDraft} onClose={() => setShowNewModal(false)} />}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        {ignoredNamespacesWarning()}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#94a3b8', fontSize: 12, gap: 10, padding: 24, textAlign: 'center' }}>
+          <Icon.Draft />
+          <div>Nenhum rascunho.<br/>Conecte serviços no grafo ou crie manualmente.</div>
+          <button
+            onClick={() => setShowNewModal(true)}
+            style={{ ...btn.base, ...btn.blue, fontSize: 11, padding: '6px 14px', marginTop: 4 }}
+          >
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Nova política
+          </button>
+          {showNewModal && <NewDraftModal services={manageableServices} ciliumFlows={ciliumFlows} onAdd={onAddDraft} onClose={() => setShowNewModal(false)} />}
+        </div>
       </div>
     )
   }
@@ -587,15 +634,69 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
             <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
             Nova
           </button>
-          <button style={{ ...btn.base, ...btn.red }} onClick={onDiscardAll}><Icon.Trash /> Descartar todos</button>
-          <button style={{ ...btn.base, ...btn.green }} onClick={onApplyAll}><Icon.Check /> Aplicar todos</button>
+          <button style={{ ...btn.base, ...btn.red }} onClick={onDiscardAll} disabled={applyingAll} title={applyingAll ? 'Aguarde a aplicação terminar' : undefined}><Icon.Trash /> Descartar todos</button>
+          <button style={{ ...btn.base, ...btn.green, opacity: applyingAll ? 0.6 : 1 }} onClick={handleApplyAll} disabled={applyingAll}>
+            <Icon.Check /> {applyingAll ? 'Aplicando…' : 'Aplicar todos'}
+          </button>
         </div>
       </div>
+      {applyAllError && (
+        <div style={{ margin: '10px 14px 0', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 8, padding: '10px 12px', fontSize: 11, color: '#991b1b', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+          {applyAllError}
+          <button onClick={() => setApplyAllError(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#991b1b', fontSize: 14, flexShrink: 0 }}>×</button>
+        </div>
+      )}
+      {ignoredNamespacesWarning()}
+      {impact && impact.breaking.length > 0 && (
+        <div style={{ margin: '10px 14px 0', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: '#991b1b', marginBottom: 4 }}>
+            ⚠ Aplicar esses rascunhos vai bloquear {impact.breaking.length === 1 ? '1 fluxo que hoje funciona' : `${impact.breaking.length} fluxos que hoje funcionam`}:
+          </div>
+          {impact.breaking.map(f => (
+            <div key={f.id} style={{ fontSize: 10.5, color: '#7f1d1d' }}>
+              {f.src_workload} ({f.src_namespace}) → {f.dst_workload} ({f.dst_namespace}) :{f.dst_port}/{f.protocol}
+            </div>
+          ))}
+        </div>
+      )}
+      {impact && impact.fixed.length > 0 && (
+        <div style={{ margin: '10px 14px 0', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: '#166534', marginBottom: 4 }}>
+            ✓ Vai liberar {impact.fixed.length === 1 ? '1 fluxo hoje bloqueado' : `${impact.fixed.length} fluxos hoje bloqueados`}:
+          </div>
+          {impact.fixed.map(f => (
+            <div key={f.id} style={{ fontSize: 10.5, color: '#14532d' }}>
+              {f.src_workload} ({f.src_namespace}) → {f.dst_workload} ({f.dst_namespace}) :{f.dst_port}/{f.protocol}
+            </div>
+          ))}
+        </div>
+      )}
       {showNewModal && <NewDraftModal services={manageableServices} ciliumFlows={ciliumFlows} onAdd={onAddDraft} onClose={() => setShowNewModal(false)} />}
       <div style={{ flex: 1, overflowY: 'auto' }}>
         {drafts.map(draft => {
           const isExpanded = expanded === draft.id
           const isPicker   = pickerDraft === draft.id
+
+          if (draft.kind === 'isolate' || draft.kind === 'restrict' || draft.kind === 'toggle') {
+            const toggleOptionLabel = draft.toggle_option === 'intra' ? 'Tráfego interno' : 'Saída para internet'
+            const label = draft.kind === 'isolate'
+              ? `Isolar ${draft.isolate_namespace} (${draft.isolate_direction})`
+              : draft.kind === 'restrict'
+                ? `Restringir ${draft.restrict_service} (${draft.restrict_namespace}, ${draft.restrict_direction})`
+                : `${draft.toggle_action === 'enable' ? 'Ligar' : 'Desligar'} "${toggleOptionLabel}" (${draft.toggle_namespace})`
+            return (
+              <div key={draft.id} style={{ borderBottom: '1px solid #f9fafb', padding: '10px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                <span style={{ fontSize: 11, fontWeight: 600, color: '#92400e', background: '#fffbeb', borderRadius: 4, padding: '2px 8px' }}>🧪 {label}</span>
+                <div style={{ display: 'flex', gap: 5 }}>
+                  <button style={{ ...btn.base, ...btn.green, opacity: applying === draft.id ? 0.6 : 1 }} onClick={() => handleApply(draft)} disabled={applying === draft.id}>
+                    <Icon.Check /> {applying === draft.id ? '…' : 'Aplicar'}
+                  </button>
+                  <button style={{ ...btn.base, ...btn.red }} onClick={() => onRemove(draft.id)}><Icon.Trash /></button>
+                </div>
+              </div>
+            )
+          }
+
           return (
             <div key={draft.id} style={{ borderBottom: '1px solid #f9fafb' }}>
               <div style={{ padding: '10px 14px' }}>
@@ -1450,9 +1551,10 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
 }
 
 // ─── Security tab ──────────────────────────────────────────────────────────
-function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace, onRefresh, onViewNamespace }: {
+function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace, onRefresh, onViewNamespace, draftMode, onAddDraft }: {
   services: ServiceInfo[]; policies: NetworkPolicyInfo[]; config: AppConfig; isAdmin: boolean; canManageNamespace?: (namespace: string) => boolean; onRefresh: () => void
   onViewNamespace?: (ns: string) => void
+  draftMode?: boolean; onAddDraft?: (d: Omit<Draft, 'id'>) => void
 }) {
   const [coverageLoaded, setCoverageLoaded] = useState(false)
   const [expandedSection, setExpandedSection] = useState<'exposed' | 'partial' | 'protected' | null>('exposed')
@@ -1481,9 +1583,22 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
   const protectedNs = nsBuckets.filter(b => b.iso.fullyIsolated)
   const total = nsBuckets.length
 
+  function draftFor(namespace: string, direction: 'ingress' | 'egress' | 'both', allowIntra: boolean, allowInternet: boolean): Omit<Draft, 'id'> {
+    return {
+      kind: 'isolate', isolate_namespace: namespace, isolate_direction: direction,
+      isolate_allow_intra: allowIntra, isolate_allow_internet: allowInternet,
+      src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [],
+      policy_direction: direction === 'both' ? 'both' : direction,
+    }
+  }
+
   async function handleIsolateAllExposed() {
     const targets = exposedNs.map(b => b.ns).filter(ns => !canManageNamespace || canManageNamespace(ns))
     if (targets.length === 0) return
+    if (draftMode) {
+      targets.forEach(ns => onAddDraft?.(draftFor(ns, expDirection, expAllowIntra, expAllowInternet)))
+      return
+    }
     if (!confirm(`Isolar ${targets.length} namespace(s) expostos?`)) return
     setBulkBusy('exposed')
     for (const ns of targets) {
@@ -1496,6 +1611,10 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
   async function handleCompletePartial() {
     const targets = partialNs.filter(b => !canManageNamespace || canManageNamespace(b.ns))
     if (targets.length === 0) return
+    if (draftMode) {
+      targets.forEach(({ ns, iso }) => onAddDraft?.(draftFor(ns, iso.isolatedIn ? 'egress' : 'ingress', partAllowIntra, partAllowInternet)))
+      return
+    }
     if (!confirm(`Completar isolamento em ${targets.length} namespace(s)?`)) return
     setBulkBusy('partial')
     for (const { ns, iso } of targets) {
@@ -2367,7 +2486,7 @@ function gapDirectionOf(gap: { missingIngress: boolean; missingEgress: boolean }
   return gap?.missingIngress && gap?.missingEgress ? 'both' : gap?.missingEgress ? 'egress' : 'ingress'
 }
 
-function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDraft, onSaveConfig, onSwitchTab, focusFlow }: {
+function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDraft, onSaveConfig, onSwitchTab, focusFlow, draftMode, drafts }: {
   flows: CiliumFlowSummary[]
   config: AppConfig
   streaming: boolean
@@ -2377,12 +2496,22 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   onSaveConfig: (c: AppConfig) => Promise<void>
   onSwitchTab: (tab: Tab) => void
   focusFlow?: { flowId: string; token: number } | null
+  draftMode?: boolean
+  drafts?: Draft[]
 }) {
+  // Modo Rascunho: as policies que os rascunhos atuais criariam se
+  // aplicados, somadas às reais — usadas só para detectar flows hoje OK que
+  // passariam a ser bloqueados, sem mexer no cálculo "Sem política" acima
+  // (esse continua contra o cluster real).
+  const effectivePolicies = draftMode && drafts && drafts.length > 0
+    ? computeEffectivePolicies(allPolicies, drafts)
+    : allPolicies
   const savedFilters = (() => { try { return JSON.parse(localStorage.getItem(DISC_FILTER_KEY) ?? '{}') } catch { return {} } })()
   const [nsFilter, setNsFilter] = useState<string>(savedFilters.nsFilter ?? 'all')
   const [verdictFilter, setVerdictFilter] = useState<'all' | 'FORWARDED' | 'DROPPED'>(savedFilters.verdictFilter ?? 'all')
   const [searchText, setSearchText] = useState<string>(savedFilters.searchText ?? '')
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [selectedProtect, setSelectedProtect] = useState<Set<string>>(new Set())
   const [hubbleAvailable, setHubbleAvailable] = useState<boolean | null>(null)
   const [toggleError, setToggleError] = useState<string | null>(null)
   const [policyYaml, setPolicyYaml] = useState<{ name: string; content: string } | null>(null)
@@ -2442,11 +2571,22 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
 
   const unprotected = filtered.filter(f => !f.has_policy && f.verdict === 'DROPPED')
 
+  // Modo Rascunho: flows que funcionam hoje mas os rascunhos atuais
+  // bloqueariam — mesma lista usada linha a linha, elevada aqui pra
+  // alimentar a seleção em massa (espelha o "Sem política" acima).
+  const previewBlockedFlows = draftMode ? filtered.filter(f => f.verdict === 'FORWARDED' && isFlowBlocked(f, effectivePolicies)) : []
+
   function toggleSelect(id: string) {
     setSelected(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
   }
   function toggleAll() {
     setSelected(selected.size === unprotected.length ? new Set() : new Set(unprotected.map(f => f.id)))
+  }
+  function toggleSelectProtect(id: string) {
+    setSelectedProtect(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
+  }
+  function toggleAllProtect() {
+    setSelectedProtect(selectedProtect.size === previewBlockedFlows.length ? new Set() : new Set(previewBlockedFlows.map(f => f.id)))
   }
 
   async function handleToggle(enabled: boolean) {
@@ -2497,6 +2637,24 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
       })
     })
     setSelected(new Set())
+    onSwitchTab('drafts')
+  }
+
+  function createSelectedProtectDrafts() {
+    previewBlockedFlows.filter(f => selectedProtect.has(f.id)).forEach(f => {
+      const gap = classifyFlowGap({
+        src_workload: f.src_workload, src_namespace: f.src_namespace,
+        dst_workload: f.dst_workload, dst_namespace: f.dst_namespace, dst_port: f.dst_port,
+      }, effectivePolicies)
+      const direction = gapDirectionOf(gap)
+      onAddDraft({
+        src_workload: f.src_workload, src_namespace: f.src_namespace,
+        dst_service: f.dst_workload, dst_namespace: f.dst_namespace,
+        dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }],
+        policy_direction: direction,
+      })
+    })
+    setSelectedProtect(new Set())
     onSwitchTab('drafts')
   }
 
@@ -2623,6 +2781,19 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                 )}
               </div>
             )}
+            {previewBlockedFlows.length > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <label style={{ fontSize: 11, color: '#92400e', display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
+                  <input type="checkbox" checked={selectedProtect.size === previewBlockedFlows.length && previewBlockedFlows.length > 0} onChange={toggleAllProtect} style={{ cursor: 'pointer' }} />
+                  🧪 Seria bloqueado pelo rascunho ({previewBlockedFlows.length})
+                </label>
+                {selectedProtect.size > 0 && (
+                  <button onClick={createSelectedProtectDrafts} style={{ ...btn.base, background: '#fffbeb', color: '#b45309', border: '1px solid #fde68a', marginLeft: 'auto' }}>
+                    Criar Rascunhos de proteção ({selectedProtect.size})
+                  </button>
+                )}
+              </div>
+            )}
           </>
         )}
       </div>
@@ -2649,9 +2820,22 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                 }, allPolicies) : null
                 const gapDirection = gapDirectionOf(gap)
                 const gapLabel = gapDirection === 'both' ? 'Criar política de ingress e egress' : gapDirection === 'egress' ? 'Criar política de egress' : 'Criar política de ingress'
+
+                // Modo Rascunho: esse flow funciona hoje, mas os rascunhos
+                // atuais (isolar/restringir ainda não aplicados) o bloqueariam.
+                const previewBlocked = !!draftMode && f.verdict === 'FORWARDED' && isFlowBlocked(f, effectivePolicies)
+                const previewGap = previewBlocked ? classifyFlowGap({
+                  src_workload: f.src_workload, src_namespace: f.src_namespace,
+                  dst_workload: f.dst_workload, dst_namespace: f.dst_namespace, dst_port: f.dst_port,
+                }, effectivePolicies) : null
+                const previewDirection = gapDirectionOf(previewGap)
+                const previewLabel = previewDirection === 'both' ? 'Criar rascunho de proteção (ingress e egress)' : previewDirection === 'egress' ? 'Criar rascunho de proteção (egress)' : 'Criar rascunho de proteção (ingress)'
+
                 const vc = f.verdict === 'DROPPED'
                   ? { bg: '#fff1f2', border: '#fecdd3', badge: '#fee2e2', text: '#dc2626' }
-                  : { bg: '#f8fafc', border: '#e2e8f0', badge: '#dcfce7', text: '#16a34a' }
+                  : previewBlocked
+                    ? { bg: '#fffbeb', border: '#fde68a', badge: '#fef3c7', text: '#b45309' }
+                    : { bg: '#f8fafc', border: '#e2e8f0', badge: '#dcfce7', text: '#16a34a' }
                 const lastSeen = new Date(f.last_seen)
                 const timeSince = (() => {
                   const s = Math.floor((Date.now() - lastSeen.getTime()) / 1000)
@@ -2673,11 +2857,19 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                       {!f.has_policy && f.verdict === 'DROPPED' && (
                         <input type="checkbox" checked={selected.has(f.id)} onChange={() => toggleSelect(f.id)} style={{ cursor: 'pointer', flexShrink: 0 }} />
                       )}
+                      {previewBlocked && (
+                        <input type="checkbox" checked={selectedProtect.has(f.id)} onChange={() => toggleSelectProtect(f.id)} style={{ cursor: 'pointer', flexShrink: 0 }} />
+                      )}
                       <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 10, background: vc.badge, color: vc.text }}>
                         {f.verdict}
                       </span>
                       {f.has_policy && (
                         <span style={{ fontSize: 10, color: '#2563eb', fontWeight: 600 }}>✓ com política</span>
+                      )}
+                      {previewBlocked && (
+                        <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 10, background: '#fef3c7', color: '#b45309' }}>
+                          🧪 Seria bloqueado pelo rascunho
+                        </span>
                       )}
                       <span style={{ fontSize: 10, color: '#94a3b8', marginLeft: 'auto' }}>
                         {f.flow_count === 1 ? '1 ocorrência' : `${f.flow_count} ocorrências`} · {timeSince}
@@ -2720,8 +2912,9 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                             const yaml = await previewDiscoveryPolicyYAML(f, gapDirection)
                             setPreviewYamlMap(prev => new Map(prev).set(f.id, yaml))
                             setPolicyYaml({ name: title, content: yaml })
-                          } catch {
-                            setPolicyYaml({ name: title, content: '# Erro ao gerar YAML' })
+                          } catch (e: unknown) {
+                            const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+                            setPolicyYaml({ name: title, content: `# Erro ao gerar YAML\n# ${detail ?? 'motivo desconhecido — confira o console do navegador'}` })
                           } finally {
                             setLoadingYaml(null)
                           }
@@ -2733,6 +2926,14 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                         <button onClick={() => handleViewPolicy(f)} disabled={loadingYaml === f.id}
                           style={{ ...btn.base, background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe' }}>
                           {loadingYaml === f.id ? 'Carregando…' : 'Ver política'}
+                        </button>
+                      )}
+                      {previewBlocked && (
+                        <button onClick={() => {
+                          onAddDraft({ src_workload: f.src_workload, src_namespace: f.src_namespace, dst_service: f.dst_workload, dst_namespace: f.dst_namespace, dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }], policy_direction: previewDirection })
+                          onSwitchTab('drafts')
+                        }} style={{ ...btn.base, background: '#fffbeb', color: '#b45309', border: '1px solid #fde68a' }}>
+                          {previewLabel}
                         </button>
                       )}
                     </div>
@@ -2806,6 +3007,10 @@ interface Props {
   ciliumStreaming?: boolean
   onClearCiliumFlows?: () => void
   onViewNamespace?: (ns: string) => void
+  // Modo Rascunho: draftModeFlows é a foto congelada da Descoberta (só
+  // preenchida quando ativo) usada pra calcular o aviso de impacto.
+  draftMode?: boolean
+  draftModeFlows?: CiliumFlowSummary[]
 }
 
 export default function RightPanel({
@@ -2816,6 +3021,7 @@ export default function RightPanel({
   ciliumFlows = [], ciliumStreaming = false,
   onClearCiliumFlows,
   onViewNamespace,
+  draftMode = false, draftModeFlows = [],
 }: Props) {
   // Defaults here must match what the server renders (no localStorage access
   // during the initial render) — reading it happens in the mount effect
@@ -3075,11 +3281,11 @@ export default function RightPanel({
               onIgnore={isAdmin ? (ns) => onSaveConfig({ ...config, ignored_namespaces: [...config.ignored_namespaces.filter(x => x !== ns), ns] }) : undefined}
               onUnignore={isAdmin ? (ns) => onSaveConfig({ ...config, ignored_namespaces: config.ignored_namespaces.filter(x => x !== ns) }) : undefined}
             />}
-            {activeTab === 'drafts' && !isViewer && <DraftsTab drafts={drafts} services={services} ciliumFlows={ciliumFlows} config={config} currentUser={currentUser} onRemove={onRemoveDraft} onApply={onApplyDraft} onApplyAll={onApplyAllDrafts} onDiscardAll={onDiscardAllDrafts} onUpdatePort={onUpdateDraftPort} onAddDraft={onAddDraft} />}
+            {activeTab === 'drafts' && !isViewer && <DraftsTab drafts={drafts} services={services} ciliumFlows={ciliumFlows} config={config} currentUser={currentUser} onRemove={onRemoveDraft} onApply={onApplyDraft} onApplyAll={onApplyAllDrafts} onDiscardAll={onDiscardAllDrafts} onUpdatePort={onUpdateDraftPort} onAddDraft={onAddDraft} allPolicies={allPolicies} draftMode={draftMode} draftModeFlows={draftModeFlows} />}
             {activeTab === 'policies' && <PoliciesTab policies={policies} allPolicies={allPolicies} services={services} isAdmin={isAdmin} isViewer={isViewer} canManageNamespace={canManageNamespace} onDelete={onPoliciesChanged} onRefresh={onPoliciesChanged} />}
             {activeTab === 'aprovacoes' && <ApprovacoesTab key={approvalTabKey} currentUser={currentUser} config={config} onRefresh={onPoliciesChanged} pendingApprovals={pendingApprovals} />}
-            {activeTab === 'seguranca' && <SegurancaTab services={services} policies={policies} config={config} isAdmin={isAdmin} canManageNamespace={canManageNamespace} onRefresh={onPoliciesChanged} onViewNamespace={onViewNamespace} />}
-            {activeTab === 'descoberta' && isAdmin && <DescobertaTab flows={ciliumFlows} config={config} streaming={ciliumStreaming} allPolicies={allPolicies} onClear={onClearCiliumFlows} onAddDraft={onAddDraft} onSaveConfig={onSaveConfig} onSwitchTab={(tab) => setActiveTab(tab)} focusFlow={focusFlow} />}
+            {activeTab === 'seguranca' && <SegurancaTab services={services} policies={policies} config={config} isAdmin={isAdmin} canManageNamespace={canManageNamespace} onRefresh={onPoliciesChanged} onViewNamespace={onViewNamespace} draftMode={draftMode} onAddDraft={onAddDraft} />}
+            {activeTab === 'descoberta' && isAdmin && <DescobertaTab flows={ciliumFlows} config={config} streaming={ciliumStreaming} allPolicies={allPolicies} onClear={onClearCiliumFlows} onAddDraft={onAddDraft} onSaveConfig={onSaveConfig} onSwitchTab={(tab) => setActiveTab(tab)} focusFlow={focusFlow} draftMode={draftMode} drafts={drafts} />}
             {activeTab === 'descoberta' && !isAdmin && <Forbidden />}
             {activeTab === 'config' && isAdmin && <ConfigTab config={config} onSave={onSaveConfig} />}
             {activeTab === 'config' && !isAdmin && <Forbidden />}

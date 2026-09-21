@@ -60,6 +60,13 @@ export interface IsolateNamespaceRequest {
 
 export interface Draft {
   id: string
+  // Absent = 'connection' (allow/egress/CIDR) — the original, only kind
+  // this used to represent, so every existing call site that only ever
+  // built/read connection drafts keeps working unchanged. 'isolate'/
+  // 'restrict' stage a namespace/service default-deny instead, via their
+  // own fields below — the connection fields above are left at inert
+  // defaults ('', []) for those two kinds, never read for them.
+  kind?: 'connection' | 'isolate' | 'restrict' | 'toggle'
   src_workload: string
   src_namespace: string
   dst_service: string
@@ -69,6 +76,24 @@ export interface Draft {
   src_cidr?: string
   dst_cidr?: string
   cidr_except?: string[]
+  isolate_namespace?: string
+  isolate_direction?: 'ingress' | 'egress' | 'both'
+  isolate_allow_intra?: boolean
+  isolate_allow_internet?: boolean
+  restrict_service?: string
+  restrict_namespace?: string
+  restrict_direction?: 'ingress' | 'egress'
+  // 'toggle': liga/desliga o companion (allow-intranamespace ou
+  // allow-egress-internet) de um namespace JÁ isolado de verdade — diferente
+  // de 'isolate', que cria o isolamento do zero. toggle_directions só se
+  // aplica a 'intra' (o companion de internet é sempre só egress): captura
+  // quais direções o isolamento real já cobre no momento em que o rascunho
+  // foi criado, pra fabricar a(s) mesma(s) policy(ies) que isolateNamespace()
+  // criaria de verdade.
+  toggle_namespace?: string
+  toggle_option?: 'intra' | 'internet'
+  toggle_action?: 'enable' | 'disable'
+  toggle_directions?: ('ingress' | 'egress')[]
 }
 
 export interface CidrPolicyRequest {

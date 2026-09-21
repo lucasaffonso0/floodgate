@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
 import { getConfig, setConfig, isNamespaceWatched, setAutoDefaultDenyBaseline } from '@/lib/config'
 import { listServices } from '@/lib/k8s'
+import { migrateUnignoredFlows, invalidateIgnoredNamespacesCache } from '@/lib/hubble'
 import { apiError, parseBody } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { CronExpressionParser } from 'cron-parser'
@@ -94,6 +95,17 @@ export async function PUT(req: NextRequest) {
 
     // Merge over the current config so partial updates don't write `undefined`
     setConfig({ ...previous, ...body })
+
+    // Uma namespace que saiu da lista de ignoradas pode ter flows presos em
+    // ignored_flows desde antes — traz de volta pra discovered_flows agora
+    // que ela voltou a ser observada, em vez de esperar o próximo flow novo.
+    // Invalida o cache em memória do ingestion antes disso, senão um flow
+    // que chegar nos segundos seguintes ainda usaria a lista antiga.
+    if (body.ignored_namespaces !== undefined) {
+      invalidateIgnoredNamespacesCache()
+      migrateUnignoredFlows(body.ignored_namespaces)
+    }
+
     logAudit({ user_id: user.sub, username: user.username, action: 'update_config', resource_type: 'Config', resource_name: 'app_config' })
     return NextResponse.json(getConfig())
   } catch (e) {
