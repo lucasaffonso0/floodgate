@@ -196,9 +196,17 @@ rbac:
   # Rules granted to the ServiceAccount
   rules:
     - apiGroups: [""]
-      # pods: needed to resolve named targetPorts (containerPort lookup)
+      # pods: needed to resolve named targetPorts (containerPort lookup) and
+      # as the last-resort tier of resolvePodSelector (src.ts/k8s.ts)
       resources: ["services", "namespaces", "endpoints", "pods"]
       verbs: ["get", "list", "watch"]
+    - apiGroups: ["apps"]
+      # Fallback tiers of resolvePodSelector (src/lib/k8s.ts): a source
+      # workload with no Service (e.g. a queue worker, only ever makes
+      # outbound connections) is looked up here instead, by exact name —
+      # "get" only, no "list"/"watch" needed.
+      resources: ["deployments", "statefulsets", "daemonsets"]
+      verbs: ["get"]
     - apiGroups: ["networking.k8s.io"]
       resources: ["networkpolicies"]
       verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

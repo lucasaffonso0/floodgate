@@ -3,6 +3,8 @@ import * as k8s from '@kubernetes/client-node'
 import yaml from 'js-yaml'
 import { createHash } from 'crypto'
 import { UserFacingError } from '@/lib/api-helpers'
+import { normalizeWorkload } from '@/lib/flowMatch'
+import { identityLabels } from '@/lib/podIdentity'
 import type { ServiceInfo, NetworkPolicyInfo, CreatePolicyRequest, PortSpec, RestrictPolicyRequest, IsolateNamespaceRequest, CidrPolicyRequest } from '@/types'
 
 const MANAGED_BY = 'floodgate'
@@ -34,6 +36,7 @@ kc.loadFromDefault()
 
 const core = kc.makeApiClient(k8s.CoreV1Api)
 const networking = kc.makeApiClient(k8s.NetworkingV1Api)
+const apps = kc.makeApiClient(k8s.AppsV1Api)
 
 // @kubernetes/client-node models V1NetworkPolicyIngressRule.from as `_from`
 // (its JS identifier), since it's serialized back to `from` only through the
@@ -104,9 +107,51 @@ function selectorOf(svc: k8s.V1Service, name: string, namespace: string): Record
   return sel as Record<string, string>
 }
 
-async function getServiceSelector(name: string, namespace: string): Promise<Record<string, string>> {
-  const svc = await core.readNamespacedService({ name, namespace })
-  return selectorOf(svc, name, namespace)
+// Resolves the pod selector for a workload name, trying — in order — the
+// resources that could plausibly own it: Service, Deployment, StatefulSet,
+// DaemonSet, each tried only if the previous one 404s (any other error
+// propagates immediately, never silently falls through). A workload that
+// never receives inbound traffic (a queue worker, a cron job) often has no
+// Service at all, so requiring one — the old behavior — made it impossible
+// to create any policy with that workload as the source.
+// Last resort: no Service and no matching standard controller (a bare pod,
+// a Job/CronJob-owned pod, or a custom controller) — find a live pod whose
+// normalized name matches and use its own identity labels (see
+// isIdentityLabel in podIdentity.ts). This is a best-effort guess, not a
+// guarantee: it's only reached when nothing more authoritative exists to ask.
+export async function resolvePodSelector(name: string, namespace: string): Promise<Record<string, string>> {
+  try {
+    const svc = await core.readNamespacedService({ name, namespace })
+    return selectorOf(svc, name, namespace)
+  } catch (e) {
+    if (getK8sStatus(e) !== 404) throw e
+  }
+
+  const controllerReaders: Array<() => Promise<k8s.V1Deployment | k8s.V1StatefulSet | k8s.V1DaemonSet>> = [
+    () => apps.readNamespacedDeployment({ name, namespace }),
+    () => apps.readNamespacedStatefulSet({ name, namespace }),
+    () => apps.readNamespacedDaemonSet({ name, namespace }),
+  ]
+  for (const read of controllerReaders) {
+    try {
+      const workload = await read()
+      const sel = workload.spec?.selector?.matchLabels
+      if (sel && Object.keys(sel).length > 0) return sel
+    } catch (e) {
+      if (getK8sStatus(e) !== 404) throw e
+    }
+  }
+
+  const pods = await core.listNamespacedPod({ namespace })
+  const match = pods.items.find(p => normalizeWorkload(p.metadata?.name ?? '') === name)
+  if (!match) {
+    throw new UserFacingError(`Não foi possível encontrar Service, Deployment, StatefulSet, DaemonSet ou Pod para "${namespace}/${name}"`)
+  }
+  const labels = identityLabels(match.metadata?.labels ?? {})
+  if (Object.keys(labels).length === 0) {
+    throw new UserFacingError(`Pod "${match.metadata?.name}" não tem labels suficientes para identificar "${namespace}/${name}" com segurança`)
+  }
+  return labels
 }
 
 // Resolves the pod port for a given service port. Named targetPorts (e.g.
@@ -249,7 +294,7 @@ export async function listNetworkPolicies(allPolicies = false): Promise<NetworkP
 
 export async function createNetworkPolicy(req: CreatePolicyRequest): Promise<NetworkPolicyInfo> {
   const [srcSelector, dstSvc] = await Promise.all([
-    getServiceSelector(req.src_workload, req.src_namespace),
+    resolvePodSelector(req.src_workload, req.src_namespace),
     core.readNamespacedService({ name: req.dst_service, namespace: req.dst_namespace }),
   ])
   const dstSelector = selectorOf(dstSvc, req.dst_service, req.dst_namespace)
@@ -321,7 +366,7 @@ export async function createNetworkPolicy(req: CreatePolicyRequest): Promise<Net
 
 export async function createEgressNetworkPolicy(req: CreatePolicyRequest): Promise<NetworkPolicyInfo> {
   const [srcSelector, dstSvc] = await Promise.all([
-    getServiceSelector(req.src_workload, req.src_namespace),
+    resolvePodSelector(req.src_workload, req.src_namespace),
     core.readNamespacedService({ name: req.dst_service, namespace: req.dst_namespace }),
   ])
   const dstSelector = selectorOf(dstSvc, req.dst_service, req.dst_namespace)
@@ -393,7 +438,7 @@ export async function createEgressNetworkPolicy(req: CreatePolicyRequest): Promi
 }
 
 export async function createRestrictPolicy(req: RestrictPolicyRequest): Promise<NetworkPolicyInfo> {
-  const svcSelector = await getServiceSelector(req.service_name, req.namespace)
+  const svcSelector = await resolvePodSelector(req.service_name, req.namespace)
   const policyType = `restrict-${req.direction}` as 'restrict-ingress' | 'restrict-egress'
   const policyName = sanitizeK8sName(`floodgate-restrict-${req.direction}-${req.service_name}`)
 
@@ -495,7 +540,7 @@ export async function createNamespaceIngressPolicy(req: {
   dst_port: number
 }): Promise<NetworkPolicyInfo> {
   const [dstSelector, podPort] = await Promise.all([
-    getServiceSelector(req.dst_service, req.dst_namespace),
+    resolvePodSelector(req.dst_service, req.dst_namespace),
     resolveTargetPort(req.dst_service, req.dst_namespace, req.dst_port),
   ])
 
@@ -689,7 +734,7 @@ export async function isolateNamespace(req: IsolateNamespaceRequest): Promise<{ 
 export async function createCidrPolicy(req: CidrPolicyRequest): Promise<NetworkPolicyInfo> {
   const { namespace, service_name, cidr, except, dst_ports, direction } = req
 
-  const podSelector = service_name ? await getServiceSelector(service_name, namespace) : {}
+  const podSelector = service_name ? await resolvePodSelector(service_name, namespace) : {}
 
   const kPorts = (dst_ports?.length ?? 0) > 0
     ? dst_ports!.map(p => ({
@@ -743,7 +788,7 @@ export async function previewPolicyYAML(
   direction: 'ingress' | 'egress' | 'both',
 ): Promise<string> {
   const [srcSelector, dstSvc] = await Promise.all([
-    getServiceSelector(req.src_workload, req.src_namespace),
+    resolvePodSelector(req.src_workload, req.src_namespace),
     core.readNamespacedService({ name: req.dst_service, namespace: req.dst_namespace }),
   ])
   const dstSelector = selectorOf(dstSvc, req.dst_service, req.dst_namespace)
