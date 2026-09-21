@@ -34,6 +34,71 @@ kind: Namespace
 metadata:
   name: platform
 ---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shipping
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: reporting
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: search
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inventory
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: billing
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cache
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gateway
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: security
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cdn
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logging
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: analytics
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: support
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: marketing
+---
 # ecommerce/storefront: producao simulada (porta 8080) -> product-catalog.ecommerce, cart-service.ecommerce, api-gateway.platform
 apiVersion: apps/v1
 kind: Deployment
@@ -296,6 +361,310 @@ spec:
   - port: 8080
     targetPort: 8080
 ---
+# ecommerce/recommendation-engine: producao simulada (porta 8080) -> product-catalog.ecommerce, inventory-db.data
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recommendation-engine
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: recommendation-engine
+  template:
+    metadata:
+      labels:
+        app: recommendation-engine
+    spec:
+      containers:
+      - name: recommendation-engine
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nrecommendation-engine\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://product-catalog.ecommerce.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+            wget -qT3 -O/dev/null http://inventory-db.data.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: recommendation-engine
+  namespace: ecommerce
+spec:
+  selector:
+    app: recommendation-engine
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# ecommerce/wishlist-service: producao simulada (porta 8080) -> storefront.ecommerce
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wishlist-service
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wishlist-service
+  template:
+    metadata:
+      labels:
+        app: wishlist-service
+    spec:
+      containers:
+      - name: wishlist-service
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nwishlist-service\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://storefront.ecommerce.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wishlist-service
+  namespace: ecommerce
+spec:
+  selector:
+    app: wishlist-service
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# ecommerce/review-service: producao simulada (porta 8080) -> product-catalog.ecommerce
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: review-service
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: review-service
+  template:
+    metadata:
+      labels:
+        app: review-service
+    spec:
+      containers:
+      - name: review-service
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nreview-service\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://product-catalog.ecommerce.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: review-service
+  namespace: ecommerce
+spec:
+  selector:
+    app: review-service
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# ecommerce/promotions-service: producao simulada (porta 8080) -> cart-service.ecommerce
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: promotions-service
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: promotions-service
+  template:
+    metadata:
+      labels:
+        app: promotions-service
+    spec:
+      containers:
+      - name: promotions-service
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\npromotions-service\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://cart-service.ecommerce.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: promotions-service
+  namespace: ecommerce
+spec:
+  selector:
+    app: promotions-service
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# ecommerce/order-history: producao simulada (porta 8080) -> orders-db.data
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-history
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-history
+  template:
+    metadata:
+      labels:
+        app: order-history
+    spec:
+      containers:
+      - name: order-history
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\norder-history\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://orders-db.data.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-history
+  namespace: ecommerce
+spec:
+  selector:
+    app: order-history
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# ecommerce/loyalty-service: producao simulada (porta 8080) -> user-profile.identity, orders-db.data
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loyalty-service
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loyalty-service
+  template:
+    metadata:
+      labels:
+        app: loyalty-service
+    spec:
+      containers:
+      - name: loyalty-service
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nloyalty-service\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://user-profile.identity.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+            wget -qT3 -O/dev/null http://orders-db.data.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loyalty-service
+  namespace: ecommerce
+spec:
+  selector:
+    app: loyalty-service
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
 # payments/payment-gateway: producao simulada (porta 8080) -> fraud-detector.payments
 apiVersion: apps/v1
 kind: Deployment
@@ -392,6 +761,58 @@ metadata:
 spec:
   selector:
     app: fraud-detector
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# payments/refund-service: producao simulada (porta 8080) -> payment-gateway.payments, orders-db.data
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: refund-service
+  namespace: payments
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: refund-service
+  template:
+    metadata:
+      labels:
+        app: refund-service
+    spec:
+      containers:
+      - name: refund-service
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nrefund-service\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://payment-gateway.payments.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+            wget -qT3 -O/dev/null http://orders-db.data.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: refund-service
+  namespace: payments
+spec:
+  selector:
+    app: refund-service
   ports:
   - port: 8080
     targetPort: 8080
@@ -498,7 +919,7 @@ spec:
   - port: 8080
     targetPort: 8080
 ---
-# identity/session-cache: producao simulada (porta 8080) -> (sem chamadas de saída)
+# identity/session-cache: producao simulada (porta 8080) -> (sem chamadas de saida)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -547,7 +968,57 @@ spec:
   - port: 8080
     targetPort: 8080
 ---
-# data/orders-db: producao simulada (porta 8080) -> (sem chamadas de saída)
+# identity/oauth-provider: producao simulada (porta 8080) -> auth-service.identity
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth-provider
+  namespace: identity
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oauth-provider
+  template:
+    metadata:
+      labels:
+        app: oauth-provider
+    spec:
+      containers:
+      - name: oauth-provider
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\noauth-provider\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://auth-service.identity.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth-provider
+  namespace: identity
+spec:
+  selector:
+    app: oauth-provider
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# data/orders-db: producao simulada (porta 8080) -> (sem chamadas de saida)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -596,7 +1067,7 @@ spec:
   - port: 8080
     targetPort: 8080
 ---
-# data/inventory-db: producao simulada (porta 8080) -> (sem chamadas de saída)
+# data/inventory-db: producao simulada (porta 8080) -> (sem chamadas de saida)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -645,7 +1116,7 @@ spec:
   - port: 8080
     targetPort: 8080
 ---
-# data/analytics-warehouse: producao simulada (porta 8080) -> (sem chamadas de saída)
+# data/analytics-warehouse: producao simulada (porta 8080) -> (sem chamadas de saida)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -690,6 +1161,52 @@ metadata:
 spec:
   selector:
     app: analytics-warehouse
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# data/reporting-db: recebe trafego de reporting-dashboard.reporting (sem chamadas de saida)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reporting-db
+  namespace: data
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: reporting-db
+  template:
+    metadata:
+      labels:
+        app: reporting-db
+    spec:
+      containers:
+      - name: reporting-db
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nreporting-db\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reporting-db
+  namespace: data
+spec:
+  selector:
+    app: reporting-db
   ports:
   - port: 8080
     targetPort: 8080
@@ -744,7 +1261,7 @@ spec:
   - port: 8080
     targetPort: 8080
 ---
-# messaging/email-sender: producao simulada (porta 8080) -> (sem chamadas de saída)
+# messaging/email-sender: producao simulada (porta 8080) -> (sem chamadas de saida)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -789,6 +1306,52 @@ metadata:
 spec:
   selector:
     app: email-sender
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# messaging/sms-sender: recebe trafego de notification-worker.messaging (sem chamadas de saida)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sms-sender
+  namespace: messaging
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sms-sender
+  template:
+    metadata:
+      labels:
+        app: sms-sender
+    spec:
+      containers:
+      - name: sms-sender
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nsms-sender\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sms-sender
+  namespace: messaging
+spec:
+  selector:
+    app: sms-sender
   ports:
   - port: 8080
     targetPort: 8080
@@ -947,6 +1510,56 @@ spec:
   - port: 8080
     targetPort: 8080
 ---
+# observability/tracing-collector: producao simulada (porta 8080) -> log-aggregator.observability
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tracing-collector
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tracing-collector
+  template:
+    metadata:
+      labels:
+        app: tracing-collector
+    spec:
+      containers:
+      - name: tracing-collector
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ntracing-collector\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://log-aggregator.observability.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tracing-collector
+  namespace: observability
+spec:
+  selector:
+    app: tracing-collector
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
 # platform/api-gateway: producao simulada (porta 8080) -> auth-service.identity, rate-limiter.platform
 apiVersion: apps/v1
 kind: Deployment
@@ -999,7 +1612,7 @@ spec:
   - port: 8080
     targetPort: 8080
 ---
-# platform/rate-limiter: producao simulada (porta 8080) -> (sem chamadas de saída)
+# platform/rate-limiter: producao simulada (porta 8080) -> (sem chamadas de saida)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -1044,6 +1657,902 @@ metadata:
 spec:
   selector:
     app: rate-limiter
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# shipping/shipping-service: producao simulada (porta 8080) -> orders-db.data
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shipping-service
+  namespace: shipping
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shipping-service
+  template:
+    metadata:
+      labels:
+        app: shipping-service
+    spec:
+      containers:
+      - name: shipping-service
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nshipping-service\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://orders-db.data.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shipping-service
+  namespace: shipping
+spec:
+  selector:
+    app: shipping-service
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# shipping/tracking-service: producao simulada (porta 8080) -> shipping-service.shipping
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tracking-service
+  namespace: shipping
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tracking-service
+  template:
+    metadata:
+      labels:
+        app: tracking-service
+    spec:
+      containers:
+      - name: tracking-service
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ntracking-service\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://shipping-service.shipping.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tracking-service
+  namespace: shipping
+spec:
+  selector:
+    app: tracking-service
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# reporting/reporting-dashboard: producao simulada (porta 8080) -> analytics-warehouse.data, reporting-db.data
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reporting-dashboard
+  namespace: reporting
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: reporting-dashboard
+  template:
+    metadata:
+      labels:
+        app: reporting-dashboard
+    spec:
+      containers:
+      - name: reporting-dashboard
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nreporting-dashboard\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://analytics-warehouse.data.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+            wget -qT3 -O/dev/null http://reporting-db.data.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reporting-dashboard
+  namespace: reporting
+spec:
+  selector:
+    app: reporting-dashboard
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# search/search-indexer: producao simulada (porta 8080) -> product-catalog.ecommerce
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search-indexer
+  namespace: search
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: search-indexer
+  template:
+    metadata:
+      labels:
+        app: search-indexer
+    spec:
+      containers:
+      - name: search-indexer
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nsearch-indexer\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://product-catalog.ecommerce.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: search-indexer
+  namespace: search
+spec:
+  selector:
+    app: search-indexer
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# inventory/inventory-sync: producao simulada (porta 8080) -> inventory-db.data
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-sync
+  namespace: inventory
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inventory-sync
+  template:
+    metadata:
+      labels:
+        app: inventory-sync
+    spec:
+      containers:
+      - name: inventory-sync
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ninventory-sync\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://inventory-db.data.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory-sync
+  namespace: inventory
+spec:
+  selector:
+    app: inventory-sync
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# inventory/warehouse-api: producao simulada (porta 8080) -> inventory-sync.inventory
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: warehouse-api
+  namespace: inventory
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: warehouse-api
+  template:
+    metadata:
+      labels:
+        app: warehouse-api
+    spec:
+      containers:
+      - name: warehouse-api
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nwarehouse-api\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://inventory-sync.inventory.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: warehouse-api
+  namespace: inventory
+spec:
+  selector:
+    app: warehouse-api
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# billing/invoice-service: producao simulada (porta 8080) -> payment-gateway.payments
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: invoice-service
+  namespace: billing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: invoice-service
+  template:
+    metadata:
+      labels:
+        app: invoice-service
+    spec:
+      containers:
+      - name: invoice-service
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ninvoice-service\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://payment-gateway.payments.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: invoice-service
+  namespace: billing
+spec:
+  selector:
+    app: invoice-service
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# billing/billing-api: producao simulada (porta 8080) -> invoice-service.billing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing-api
+  namespace: billing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: billing-api
+  template:
+    metadata:
+      labels:
+        app: billing-api
+    spec:
+      containers:
+      - name: billing-api
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nbilling-api\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://invoice-service.billing.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: billing-api
+  namespace: billing
+spec:
+  selector:
+    app: billing-api
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# cache/redis-proxy: recebe trafego de varios servicos (sem chamadas de saida)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-proxy
+  namespace: cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-proxy
+  template:
+    metadata:
+      labels:
+        app: redis-proxy
+    spec:
+      containers:
+      - name: redis-proxy
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nredis-proxy\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-proxy
+  namespace: cache
+spec:
+  selector:
+    app: redis-proxy
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# gateway/edge-gateway: producao simulada (porta 8080) -> api-gateway.platform
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-gateway
+  namespace: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge-gateway
+  template:
+    metadata:
+      labels:
+        app: edge-gateway
+    spec:
+      containers:
+      - name: edge-gateway
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nedge-gateway\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://api-gateway.platform.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-gateway
+  namespace: gateway
+spec:
+  selector:
+    app: edge-gateway
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# security/waf: producao simulada (porta 8080) -> auth-service.identity
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: waf
+  namespace: security
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: waf
+  template:
+    metadata:
+      labels:
+        app: waf
+    spec:
+      containers:
+      - name: waf
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nwaf\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://auth-service.identity.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: waf
+  namespace: security
+spec:
+  selector:
+    app: waf
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# security/secrets-vault: recebe trafego do waf.security (sem chamadas de saida)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secrets-vault
+  namespace: security
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: secrets-vault
+  template:
+    metadata:
+      labels:
+        app: secrets-vault
+    spec:
+      containers:
+      - name: secrets-vault
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nsecrets-vault\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secrets-vault
+  namespace: security
+spec:
+  selector:
+    app: secrets-vault
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# cdn/cdn-edge: producao simulada (porta 8080) -> app.frontend
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cdn-edge
+  namespace: cdn
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cdn-edge
+  template:
+    metadata:
+      labels:
+        app: cdn-edge
+    spec:
+      containers:
+      - name: cdn-edge
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ncdn-edge\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://app.frontend.svc.cluster.local:80 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cdn-edge
+  namespace: cdn
+spec:
+  selector:
+    app: cdn-edge
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# logging/log-shipper: producao simulada (porta 8080) -> log-aggregator.observability
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: log-shipper
+  namespace: logging
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: log-shipper
+  template:
+    metadata:
+      labels:
+        app: log-shipper
+    spec:
+      containers:
+      - name: log-shipper
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nlog-shipper\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://log-aggregator.observability.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: log-shipper
+  namespace: logging
+spec:
+  selector:
+    app: log-shipper
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# analytics/event-collector: producao simulada (porta 8080) -> analytics-warehouse.data
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-collector
+  namespace: analytics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: event-collector
+  template:
+    metadata:
+      labels:
+        app: event-collector
+    spec:
+      containers:
+      - name: event-collector
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nevent-collector\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://analytics-warehouse.data.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: event-collector
+  namespace: analytics
+spec:
+  selector:
+    app: event-collector
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# analytics/analytics-api: producao simulada (porta 8080) -> event-collector.analytics
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-api
+  namespace: analytics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: analytics-api
+  template:
+    metadata:
+      labels:
+        app: analytics-api
+    spec:
+      containers:
+      - name: analytics-api
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nanalytics-api\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://event-collector.analytics.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: analytics-api
+  namespace: analytics
+spec:
+  selector:
+    app: analytics-api
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# support/support-portal: producao simulada (porta 8080) -> auth-service.identity, storefront.ecommerce
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: support-portal
+  namespace: support
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: support-portal
+  template:
+    metadata:
+      labels:
+        app: support-portal
+    spec:
+      containers:
+      - name: support-portal
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nsupport-portal\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://auth-service.identity.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+            wget -qT3 -O/dev/null http://storefront.ecommerce.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: support-portal
+  namespace: support
+spec:
+  selector:
+    app: support-portal
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# marketing/campaign-service: producao simulada (porta 8080) -> email-sender.messaging
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: campaign-service
+  namespace: marketing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: campaign-service
+  template:
+    metadata:
+      labels:
+        app: campaign-service
+    spec:
+      containers:
+      - name: campaign-service
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ncampaign-service\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://email-sender.messaging.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: campaign-service
+  namespace: marketing
+spec:
+  selector:
+    app: campaign-service
   ports:
   - port: 8080
     targetPort: 8080
