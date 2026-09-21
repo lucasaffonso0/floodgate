@@ -27,3 +27,4 @@ Thumbs.db
 *.swp
 *.swo
 CLAUDE.md
+helm-app-template/helmvalues/values-gl.yaml

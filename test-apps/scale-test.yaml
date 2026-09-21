@@ -1560,6 +1560,108 @@ spec:
   - port: 8080
     targetPort: 8080
 ---
+# observability/victoria-metrics-k8s-stack-kube-state-metrics: nome longo (helm-style) para
+# simular overflow de nome no grafo -> metrics-collector.observability
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: victoria-metrics-k8s-stack-kube-state-metrics
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: victoria-metrics-k8s-stack-kube-state-metrics
+  template:
+    metadata:
+      labels:
+        app: victoria-metrics-k8s-stack-kube-state-metrics
+    spec:
+      containers:
+      - name: victoria-metrics-k8s-stack-kube-state-metrics
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nvictoria-metrics-k8s-stack-kube-state-metrics\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://metrics-collector.observability.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: victoria-metrics-k8s-stack-kube-state-metrics
+  namespace: observability
+spec:
+  selector:
+    app: victoria-metrics-k8s-stack-kube-state-metrics
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# observability/netbird-operator-webhook-service: nome longo (helm-style) para simular
+# overflow de nome no grafo -> log-aggregator.observability
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netbird-operator-webhook-service
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: netbird-operator-webhook-service
+  template:
+    metadata:
+      labels:
+        app: netbird-operator-webhook-service
+    spec:
+      containers:
+      - name: netbird-operator-webhook-service
+        image: busybox:1.36
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          mkdir -p /www && printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nnetbird-operator-webhook-service\n' > /www/index.html
+          busybox httpd -f -p 8080 -h /www &
+          while true; do
+            wget -qT3 -O/dev/null http://log-aggregator.observability.svc.cluster.local:8080 2>/dev/null
+            sleep 9
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 5m
+            memory: 8Mi
+          limits:
+            cpu: 50m
+            memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: netbird-operator-webhook-service
+  namespace: observability
+spec:
+  selector:
+    app: netbird-operator-webhook-service
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
 # platform/api-gateway: producao simulada (porta 8080) -> auth-service.identity, rate-limiter.platform
 apiVersion: apps/v1
 kind: Deployment
