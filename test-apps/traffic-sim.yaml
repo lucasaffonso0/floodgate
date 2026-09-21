@@ -172,6 +172,38 @@ spec:
             cpu: 50m
             memory: 16Mi
 ---
+# backend/report-generator: Pod solto de propósito — sem Deployment,
+# StatefulSet ou DaemonSet (nem Service). Exercita o último recurso da
+# cascata do resolvePodSelector() (k8s.ts): busca um pod pelo nome
+# normalizado e usa as labels "de identidade" dele (app.kubernetes.io/*),
+# ignorando labels geradas — mesmo caminho que um pod solto ou de
+# Job/CronJob real usaria em produção.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: report-generator
+  namespace: backend
+  labels:
+    app.kubernetes.io/name: report-generator
+spec:
+  containers:
+  - name: report-generator
+    image: busybox:1.36
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      while true; do
+        wget -qT3 -O/dev/null http://pgbouncer.database.svc.cluster.local:6432 2>/dev/null
+        sleep 10
+      done
+    resources:
+      requests:
+        cpu: 5m
+        memory: 8Mi
+      limits:
+        cpu: 50m
+        memory: 16Mi
+---
 # monitoring/grafana: dashboard (porta 3000) → scraping do backend e banco
 apiVersion: apps/v1
 kind: Deployment

@@ -6,7 +6,8 @@
 # Topology (traffic-sim.yaml):
 #   frontend/app             port 80
 #   backend/worker           port 8080
-#   backend/worker-queue     sem porta, sem Service (fila de tarefas)
+#   backend/worker-queue     sem porta, sem Service (Deployment, fila de tarefas)
+#   backend/report-generator sem porta, sem Service nem Deployment/STS/DaemonSet (Pod solto)
 #   infra/haproxy            port 80
 #   database/pgbouncer       port 6432
 #   monitoring/grafana       port 3000
@@ -446,7 +447,7 @@ test_portrange_and_allports() {
 }
 
 test_no_service_workload() {
-  header_scenario "15/15 — política com workload de origem sem Service (resolvePodSelector cascata)"
+  header_scenario "15/16 — política com workload de origem sem Service, com Deployment (resolvePodSelector cascata)"
   local r body policy_name policy_ns
 
   # backend/worker-queue não tem Service (só faz chamadas de saída, como um
@@ -480,6 +481,43 @@ test_no_service_workload() {
   cleanup
 }
 
+test_no_service_no_deployment_workload() {
+  header_scenario "16/16 — política com workload de origem sem Service nem Deployment/STS/DaemonSet (último recurso: labels do Pod)"
+  local r body policy_name policy_ns
+
+  # backend/report-generator é um Pod solto de propósito (sem Service, sem
+  # Deployment/StatefulSet/DaemonSet) — mesmo caminho que um pod de
+  # Job/CronJob ou um controller customizado usaria. resolvePodSelector()
+  # precisa chegar até o último recurso: achar o pod pelo nome e montar o
+  # selector a partir das labels "de identidade" dele (app.kubernetes.io/name
+  # aqui), sem depender de nenhum recurso "dono" existir.
+  echo "  Preview: backend/report-generator (sem Service/Deployment/STS/DaemonSet) → database/pgbouncer"
+  r=$(api POST '/api/networkpolicies/preview' \
+    '{"src_workload":"report-generator","src_namespace":"backend","dst_service":"pgbouncer","dst_namespace":"database","dst_ports":[{"port":6432,"protocol":"TCP"}],"direction":"egress"}')
+  assert_ok "preview egress report-generator→pgbouncer (sem Service/Deployment)" "$r"
+  body="${r#*|}"
+  assert_field "YAML usa a label de identidade do Pod (app.kubernetes.io/name)" \
+    "$(echo "$body" | grep -c 'app.kubernetes.io/name: report-generator' 2>/dev/null || true)" "1"
+
+  echo ""
+  echo "  Criação real: allow egress report-generator → pgbouncer"
+  r=$(api POST '/api/networkpolicies/egress' \
+    '{"src_workload":"report-generator","src_namespace":"backend","dst_service":"pgbouncer","dst_namespace":"database","dst_ports":[{"port":6432,"protocol":"TCP"}]}')
+  assert_ok "allow egress report-generator→pgbouncer (sem Service/Deployment)" "$r"
+  body="${r#*|}"
+  policy_name=$(json_get "$body" "d['name']")
+  policy_ns=$(json_get "$body" "d['namespace']")
+  if [ -n "$policy_name" ] && [ -n "$policy_ns" ]; then
+    local yaml_r yaml_body
+    yaml_r=$(api GET "/api/networkpolicies/$policy_ns/$policy_name")
+    yaml_body="${yaml_r#*|}"
+    assert_field "NetworkPolicy criada usa o selector correto" \
+      "$(echo "$yaml_body" | grep -c 'app.kubernetes.io/name: report-generator' 2>/dev/null || true)" "1"
+  fi
+  sleep "$PROPAGATION_WAIT"
+  cleanup
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -495,6 +533,7 @@ echo -e "${YELLOW}Aguardando pods de teste ficarem Ready...${NC}"
 kubectl wait --for=condition=Ready pod -l app=app        -n frontend   --timeout=60s 2>/dev/null || true
 kubectl wait --for=condition=Ready pod -l app=worker     -n backend    --timeout=60s 2>/dev/null || true
 kubectl wait --for=condition=Ready pod -l app=worker-queue -n backend  --timeout=60s 2>/dev/null || true
+kubectl wait --for=condition=Ready pod/report-generator  -n backend    --timeout=60s 2>/dev/null || true
 kubectl wait --for=condition=Ready pod -l app=haproxy    -n infra      --timeout=60s 2>/dev/null || true
 kubectl wait --for=condition=Ready pod -l app=pgbouncer  -n database   --timeout=60s 2>/dev/null || true
 kubectl wait --for=condition=Ready pod -l app=grafana    -n monitoring --timeout=60s 2>/dev/null || true
@@ -519,6 +558,7 @@ test_restrict_multiple
 test_protocol_api
 test_portrange_and_allports
 test_no_service_workload
+test_no_service_no_deployment_workload
 
 # Limpeza final
 cleanup
