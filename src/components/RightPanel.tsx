@@ -2510,6 +2510,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   const [nsFilter, setNsFilter] = useState<string>(savedFilters.nsFilter ?? 'all')
   const [verdictFilter, setVerdictFilter] = useState<'all' | 'FORWARDED' | 'DROPPED'>(savedFilters.verdictFilter ?? 'all')
   const [searchText, setSearchText] = useState<string>(savedFilters.searchText ?? '')
+  const [onlyDraftBlocked, setOnlyDraftBlocked] = useState<boolean>(!!savedFilters.onlyDraftBlocked)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [selectedProtect, setSelectedProtect] = useState<Set<string>>(new Set())
   const [hubbleAvailable, setHubbleAvailable] = useState<boolean | null>(null)
@@ -2548,8 +2549,14 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
 
   // Persiste filtros no localStorage
   React.useEffect(() => {
-    try { localStorage.setItem(DISC_FILTER_KEY, JSON.stringify({ nsFilter, verdictFilter, searchText, collapsedNs: [...collapsedNs] })) } catch { }
-  }, [nsFilter, verdictFilter, searchText, collapsedNs])
+    try { localStorage.setItem(DISC_FILTER_KEY, JSON.stringify({ nsFilter, verdictFilter, searchText, onlyDraftBlocked, collapsedNs: [...collapsedNs] })) } catch { }
+  }, [nsFilter, verdictFilter, searchText, onlyDraftBlocked, collapsedNs])
+
+  // O filtro só faz sentido com o Modo Rascunho ligado — se for desligado
+  // enquanto ativo, desliga junto em vez de esconder tudo silenciosamente.
+  React.useEffect(() => {
+    if (!draftMode) setOnlyDraftBlocked(false)
+  }, [draftMode])
 
   const visibleFlows = flows.filter(f =>
     !config.ignored_namespaces.includes(f.src_namespace) &&
@@ -2561,7 +2568,8 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   const filtered = visibleFlows.filter(f =>
     (nsFilter === 'all' || f.dst_namespace === nsFilter) &&
     (verdictFilter === 'all' || f.verdict === verdictFilter) &&
-    (!searchText || [f.src_workload, f.src_namespace, f.dst_workload, f.dst_namespace].some(s => s.toLowerCase().includes(searchText.toLowerCase())))
+    (!searchText || [f.src_workload, f.src_namespace, f.dst_workload, f.dst_namespace].some(s => s.toLowerCase().includes(searchText.toLowerCase()))) &&
+    (!onlyDraftBlocked || (draftMode && f.verdict === 'FORWARDED' && isFlowBlocked(f, effectivePolicies)))
   )
 
   const grouped = filtered.reduce<Record<string, CiliumFlowSummary[]>>((acc, f) => {
@@ -2754,6 +2762,20 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                 <option value="FORWARDED">FORWARDED</option>
                 <option value="DROPPED">DROPPED</option>
               </select>
+              {draftMode && (
+                <button
+                  onClick={() => setOnlyDraftBlocked(v => !v)}
+                  title="Mostrar só os flows que hoje funcionam mas os rascunhos atuais bloqueariam"
+                  style={{
+                    ...btn.base, fontSize: 9.5, padding: '3px 8px', whiteSpace: 'nowrap',
+                    background: onlyDraftBlocked ? '#fffbeb' : 'transparent',
+                    color: onlyDraftBlocked ? '#b45309' : '#64748b',
+                    border: `1px solid ${onlyDraftBlocked ? '#fde68a' : '#e2e8f0'}`,
+                  }}
+                >
+                  🧪 Só bloqueados pelo rascunho
+                </button>
+              )}
               <span style={{ fontSize: 10, color: '#94a3b8', whiteSpace: 'nowrap' }}>{filtered.length} flows</span>
               {(() => {
                 const groupNs = Object.keys(grouped)
