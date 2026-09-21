@@ -226,13 +226,13 @@ function ServiceNodeComponent({ data, selected }: NodeProps) {
     <div style={{
       background: selected ? '#eff6ff' : 'white',
       border: `2px solid ${selected ? '#3b82f6' : '#cbd5e1'}`,
-      borderRadius: 8, padding: '6px 10px', minWidth: 150,
+      borderRadius: 8, padding: '6px 10px', width: NODE_W, boxSizing: 'border-box',
       boxShadow: selected ? '0 0 0 3px #bfdbfe' : '0 1px 4px rgba(0,0,0,0.08)',
       transition: 'all 0.15s',
     }}>
       <Handle type="target" position={Position.Left} style={{ background: handleColor(d.ingressStatus) ?? '#94a3b8', width: 10, height: 10 }} />
-      <div style={{ fontSize: 12, fontWeight: 700, color: '#1e293b', whiteSpace: 'nowrap' }}>{d.name}</div>
-      {portList && <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1 }}>:{portList}</div>}
+      <div title={d.name} style={{ fontSize: 12, fontWeight: 700, color: '#1e293b', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{d.name}</div>
+      {portList && <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>:{portList}</div>}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
         <TrafficIndicator status={d.ingressStatus} direction="ingress" title={DOT_TITLE[d.ingressStatus].in} />
         <TrafficIndicator status={d.egressStatus}  direction="egress"  title={DOT_TITLE[d.egressStatus].out} />
