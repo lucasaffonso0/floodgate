@@ -3,10 +3,28 @@ import { explainAccess, sourceIsExempt, isDestinationExempt } from './explainAcc
 
 // Strips the ReplicaSet/StatefulSet pod suffix (-<hash10>-<hash5> or -<hash5>)
 // so a raw pod name matches the clean workload name stored on policy labels.
+//
+// Two defenses against false-positive stripping of a legitimate service name
+// whose last word happens to look like a hash:
+//
+// 1. The hash character class excludes vowels. Kubernetes generates these
+//    suffixes with utilrand.String(), whose alphabet (bcdfghjklmnpqrstvwxz +
+//    digits) never contains a/e/i/o/u — so a real hash can never collide
+//    with an ordinary English word. This is what actually saves names like
+//    "session-cache" or "email-sender": "cache"/"email" contain vowels and
+//    so never match the hash class, hash or no hash attached.
+// 2. The two patterns are tried, not chained — if the two-suffix pattern
+//    already matched, the single-suffix fallback is never applied on top of
+//    its result. (Kept as defense in depth; (1) alone already prevents the
+//    double-strip for any name that fails the vowel test, but this avoids
+//    relying on that alone.)
+const HASH = '[bcdfghjklmnpqrstvwxz0-9]'
 export function normalizeWorkload(workload: string): string {
-  return workload
-    .replace(/-[a-z0-9]{5,10}-[a-z0-9]{5}$/, '')
-    .replace(/-[a-z0-9]{5}$/, '')
+  const twoSuffix = new RegExp(`-${HASH}{5,10}-${HASH}{5}$`)
+  const oneSuffix = new RegExp(`-${HASH}{5}$`)
+  const stripped = workload.replace(twoSuffix, '')
+  if (stripped !== workload) return stripped
+  return workload.replace(oneSuffix, '')
 }
 
 // Which side is actually the reason this flow gets dropped: the

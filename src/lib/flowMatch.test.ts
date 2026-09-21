@@ -41,6 +41,28 @@ describe('normalizeWorkload', () => {
   it('leaves a multi-word service name untouched when it has no pod suffix', () => {
     expect(normalizeWorkload('api-gateway')).toBe('api-gateway')
   })
+
+  it('does not double-strip a multi-word workload whose last word is itself 5 chars', () => {
+    // Regression: "session-cache-6949b89dcc-9w42f" correctly strips the
+    // ReplicaSet+pod suffix to "session-cache" via the first pattern, but a
+    // second, chained pass used to also strip the legitimate "-cache",
+    // leaving just "session" — which then 404'd against the real Service.
+    expect(normalizeWorkload('session-cache-6949b89dcc-9w42f')).toBe('session-cache')
+    expect(normalizeWorkload('session-cache-584c8f55b5-89rdj')).toBe('session-cache')
+  })
+
+  it('leaves an already-clean multi-word name untouched even with no suffix to strip', () => {
+    // Cilium sometimes resolves the owner workload directly (no pod-hash
+    // suffix attached at all) — "session-cache" on its own used to still
+    // fall through to the single-suffix fallback, which matched "-cache"
+    // (5 chars) as if it were a random pod hash.
+    expect(normalizeWorkload('session-cache')).toBe('session-cache')
+    expect(normalizeWorkload('email-sender')).toBe('email-sender')
+  })
+
+  it('still strips a single-suffix hash even when the base name itself has vowels', () => {
+    expect(normalizeWorkload('email-sender-9w42f')).toBe('email-sender')
+  })
 })
 
 describe('flowHasPolicy', () => {
