@@ -1659,9 +1659,24 @@ function LayoutToolbar({
       const viewportEl = document.querySelector<HTMLElement>('.react-flow__viewport')
       if (!viewportEl) return
       const bounds = getNodesBounds(nodes)
-      const SCALE = 2 // high-resolution multiplier
-      const imageWidth  = Math.max(1, Math.round(bounds.width  * SCALE))
-      const imageHeight = Math.max(1, Math.round(bounds.height * SCALE))
+      // A large topology (many namespaces spread wide) can push the raw
+      // bounds well past what a browser's canvas will actually rasterize —
+      // Chrome caps a canvas at 16384px per side, and other browsers (Safari
+      // in particular) cap the total pixel area much lower still. Past that
+      // limit the canvas silently comes back blank instead of erroring, so
+      // the desired 2x multiplier is downscaled as needed to fit both caps
+      // rather than requesting a size nothing can actually draw.
+      const DESIRED_SCALE = 2
+      const MAX_CANVAS_DIMENSION = 16384
+      const MAX_CANVAS_PIXELS = 16_000_000
+      const scale = Math.max(0.05, Math.min(
+        DESIRED_SCALE,
+        MAX_CANVAS_DIMENSION / Math.max(1, bounds.width),
+        MAX_CANVAS_DIMENSION / Math.max(1, bounds.height),
+        Math.sqrt(MAX_CANVAS_PIXELS / Math.max(1, bounds.width * bounds.height)),
+      ))
+      const imageWidth  = Math.max(1, Math.round(bounds.width  * scale))
+      const imageHeight = Math.max(1, Math.round(bounds.height * scale))
       const viewport = getViewportForBounds(bounds, imageWidth, imageHeight, 0.1, 4, 0.08)
       const dataUrl = await toPng(viewportEl, {
         backgroundColor: '#f8fafc',
