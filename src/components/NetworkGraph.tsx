@@ -278,6 +278,7 @@ const PALETTE = [
 ]
 
 const LS_SHOW_INTERNET_KEY = 'floodgate-show-internet-traffic'
+const LS_SHOW_FLOW_EDGES_KEY = 'floodgate-show-flow-edges'
 
 // ─── Layout constants ──────────────────────────────────────────────────────
 const NODE_W = 160, NODE_H = 56, NODE_GAPH = 20, NODE_GAPV = 16
@@ -1948,7 +1949,19 @@ export default function NetworkGraph({
   const setSelectedNs = onSelectNamespace ?? setInternalSelectedNs
   const [editingPolicy, setEditingPolicy]   = React.useState<NetworkPolicyInfo | null>(null)
   const [selectedFlowEdge, setSelectedFlowEdge] = React.useState<Edge | null>(null)
-  const [showFlowEdges, setShowFlowEdges]   = React.useState(true)
+  const [showFlowEdges, setShowFlowEdges] = React.useState(() => {
+    try {
+      const v = localStorage.getItem(LS_SHOW_FLOW_EDGES_KEY)
+      return v === null ? true : v === '1'
+    } catch { return true }
+  })
+  const toggleFlowEdges = React.useCallback(() => {
+    setShowFlowEdges(v => {
+      const next = !v
+      try { localStorage.setItem(LS_SHOW_FLOW_EDGES_KEY, next ? '1' : '0') } catch {}
+      return next
+    })
+  }, [])
   const [showInternetTraffic, setShowInternetTraffic] = React.useState(() => {
     try { return localStorage.getItem(LS_SHOW_INTERNET_KEY) === '1' } catch { return false }
   })
@@ -2325,7 +2338,7 @@ export default function NetworkGraph({
         {(ciliumStreaming || (ciliumFlows && ciliumFlows.length > 0)) && (
           <Panel position="top-left">
             <button
-              onClick={() => setShowFlowEdges(v => !v)}
+              onClick={toggleFlowEdges}
               style={{
                 display: 'flex', alignItems: 'center', gap: 6,
                 padding: '5px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600,
