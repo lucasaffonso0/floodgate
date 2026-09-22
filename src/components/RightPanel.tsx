@@ -2508,6 +2508,11 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
     : allPolicies
   const savedFilters = (() => { try { return JSON.parse(localStorage.getItem(DISC_FILTER_KEY) ?? '{}') } catch { return {} } })()
   const [nsFilter, setNsFilter] = useState<string>(savedFilters.nsFilter ?? 'all')
+  // Once narrowed to internet-bound flows, dst_namespace is always
+  // 'internet' — the dst-namespace dropdown above has nothing left to
+  // slice by, so this filters by src_namespace instead (which namespace is
+  // actually generating that traffic).
+  const [srcNsFilter, setSrcNsFilter] = useState<string>(savedFilters.srcNsFilter ?? 'all')
   const [verdictFilter, setVerdictFilter] = useState<'all' | 'FORWARDED' | 'DROPPED'>(savedFilters.verdictFilter ?? 'all')
   const [searchText, setSearchText] = useState<string>(savedFilters.searchText ?? '')
   const [onlyDraftBlocked, setOnlyDraftBlocked] = useState<boolean>(!!savedFilters.onlyDraftBlocked)
@@ -2549,8 +2554,8 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
 
   // Persiste filtros no localStorage
   React.useEffect(() => {
-    try { localStorage.setItem(DISC_FILTER_KEY, JSON.stringify({ nsFilter, verdictFilter, searchText, onlyDraftBlocked, collapsedNs: [...collapsedNs] })) } catch { }
-  }, [nsFilter, verdictFilter, searchText, onlyDraftBlocked, collapsedNs])
+    try { localStorage.setItem(DISC_FILTER_KEY, JSON.stringify({ nsFilter, srcNsFilter, verdictFilter, searchText, onlyDraftBlocked, collapsedNs: [...collapsedNs] })) } catch { }
+  }, [nsFilter, srcNsFilter, verdictFilter, searchText, onlyDraftBlocked, collapsedNs])
 
   // O filtro só faz sentido com o Modo Rascunho ligado — se for desligado
   // enquanto ativo, desliga junto em vez de esconder tudo silenciosamente.
@@ -2564,9 +2569,14 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   )
 
   const namespaces = Array.from(new Set(visibleFlows.map(f => f.dst_namespace))).sort()
+  const hasInternetFlows = visibleFlows.some(f => f.dst_namespace === 'internet')
+  const internetSrcNamespaces = Array.from(
+    new Set(visibleFlows.filter(f => f.dst_namespace === 'internet').map(f => f.src_namespace))
+  ).sort()
 
   const filtered = visibleFlows.filter(f =>
     (nsFilter === 'all' || f.dst_namespace === nsFilter) &&
+    (nsFilter !== 'internet' || srcNsFilter === 'all' || f.src_namespace === srcNsFilter) &&
     (verdictFilter === 'all' || f.verdict === verdictFilter) &&
     (!searchText || [f.src_workload, f.src_namespace, f.dst_workload, f.dst_namespace].some(s => s.toLowerCase().includes(searchText.toLowerCase()))) &&
     (!onlyDraftBlocked || (draftMode && f.verdict === 'FORWARDED' && isFlowBlocked(f, effectivePolicies)))
@@ -2630,19 +2640,42 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
     } catch { /* silently ignore */ } finally { setLoadingYaml(null) }
   }
 
+  // A flow to the internet (dst_namespace: 'internet', dst_workload: the
+  // raw destination IP) can never become a normal allow draft — there's no
+  // K8s namespace called "internet" to create a NetworkPolicy in, and
+  // "target service" doesn't mean anything for an external IP. It needs a
+  // CIDR-egress draft instead (dst_cidr: '<ip>/32'), scoped to just the
+  // source workload. createCidrPolicy() takes the policy's own namespace as
+  // `namespace` (here: the source's, since this restricts ITS egress) and
+  // the workload to scope it to as `service_name` — matching the same
+  // dst_namespace/dst_service fields the existing manual CIDR form in this
+  // file already writes them into for an egress draft (see handleSubmit
+  // above), not a coincidence.
+  function draftForFlow(f: CiliumFlowSummary, direction: 'ingress' | 'egress' | 'both') {
+    if (f.dst_namespace === 'internet') {
+      return {
+        src_workload: f.src_workload, src_namespace: f.src_namespace,
+        dst_service: f.src_workload, dst_namespace: f.src_namespace,
+        dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }],
+        policy_direction: 'egress' as const,
+        dst_cidr: `${f.dst_workload}/32`,
+      }
+    }
+    return {
+      src_workload: f.src_workload, src_namespace: f.src_namespace,
+      dst_service: f.dst_workload, dst_namespace: f.dst_namespace,
+      dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }],
+      policy_direction: direction,
+    }
+  }
+
   function createSelectedDrafts() {
     unprotected.filter(f => selected.has(f.id)).forEach(f => {
       const gap = classifyFlowGap({
         src_workload: f.src_workload, src_namespace: f.src_namespace,
         dst_workload: f.dst_workload, dst_namespace: f.dst_namespace, dst_port: f.dst_port,
       }, allPolicies)
-      const direction = gapDirectionOf(gap)
-      onAddDraft({
-        src_workload: f.src_workload, src_namespace: f.src_namespace,
-        dst_service: f.dst_workload, dst_namespace: f.dst_namespace,
-        dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }],
-        policy_direction: direction,
-      })
+      onAddDraft(draftForFlow(f, gapDirectionOf(gap)))
     })
     setSelected(new Set())
     onSwitchTab('drafts')
@@ -2654,13 +2687,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
         src_workload: f.src_workload, src_namespace: f.src_namespace,
         dst_workload: f.dst_workload, dst_namespace: f.dst_namespace, dst_port: f.dst_port,
       }, effectivePolicies)
-      const direction = gapDirectionOf(gap)
-      onAddDraft({
-        src_workload: f.src_workload, src_namespace: f.src_namespace,
-        dst_service: f.dst_workload, dst_namespace: f.dst_namespace,
-        dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }],
-        policy_direction: direction,
-      })
+      onAddDraft(draftForFlow(f, gapDirectionOf(gap)))
     })
     setSelectedProtect(new Set())
     onSwitchTab('drafts')
@@ -2753,10 +2780,30 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                 onChange={e => setSearchText(e.target.value)}
                 style={{ ...selStyle, flex: 1, minWidth: 120, padding: '3px 7px' }}
               />
-              <select value={nsFilter} onChange={e => setNsFilter(e.target.value)} style={selStyle}>
+              <select value={nsFilter} onChange={e => { setNsFilter(e.target.value); if (e.target.value !== 'internet') setSrcNsFilter('all') }} style={selStyle}>
                 <option value="all">Todos os namespaces</option>
                 {namespaces.map(ns => <option key={ns} value={ns}>{ns}</option>)}
               </select>
+              {hasInternetFlows && (
+                <button
+                  onClick={() => { const next = nsFilter === 'internet' ? 'all' : 'internet'; setNsFilter(next); if (next !== 'internet') setSrcNsFilter('all') }}
+                  title="Mostrar só o tráfego com destino fora do cluster"
+                  style={{
+                    ...btn.base, fontSize: 9.5, padding: '3px 8px', whiteSpace: 'nowrap',
+                    background: nsFilter === 'internet' ? '#eff6ff' : 'transparent',
+                    color: nsFilter === 'internet' ? '#1d4ed8' : '#64748b',
+                    border: `1px solid ${nsFilter === 'internet' ? '#93c5fd' : '#e2e8f0'}`,
+                  }}
+                >
+                  🌐 Só internet
+                </button>
+              )}
+              {nsFilter === 'internet' && (
+                <select value={srcNsFilter} onChange={e => setSrcNsFilter(e.target.value)} style={selStyle} title="Filtrar por namespace de origem">
+                  <option value="all">Toda origem</option>
+                  {internetSrcNamespaces.map(ns => <option key={ns} value={ns}>{ns}</option>)}
+                </select>
+              )}
               <select value={verdictFilter} onChange={e => setVerdictFilter(e.target.value as typeof verdictFilter)} style={selStyle}>
                 <option value="all">Todos</option>
                 <option value="FORWARDED">FORWARDED</option>
@@ -2841,7 +2888,10 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                   dst_workload: f.dst_workload, dst_namespace: f.dst_namespace, dst_port: f.dst_port,
                 }, allPolicies) : null
                 const gapDirection = gapDirectionOf(gap)
-                const gapLabel = gapDirection === 'both' ? 'Criar política de ingress e egress' : gapDirection === 'egress' ? 'Criar política de egress' : 'Criar política de ingress'
+                // Internet só existe como CIDR-egress (draftForFlow força isso
+                // independente do gap calculado) — o rótulo precisa bater.
+                const gapLabel = f.dst_namespace === 'internet' ? 'Criar política de egress (CIDR)'
+                  : gapDirection === 'both' ? 'Criar política de ingress e egress' : gapDirection === 'egress' ? 'Criar política de egress' : 'Criar política de ingress'
 
                 // Modo Rascunho: esse flow funciona hoje, mas os rascunhos
                 // atuais (isolar/restringir ainda não aplicados) o bloqueariam.
@@ -2916,7 +2966,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                     <div style={{ display: 'flex', gap: 6, alignItems: 'center', paddingTop: 2 }}>
                       {!f.has_policy && f.verdict === 'DROPPED' && (
                         <button onClick={() => {
-                          onAddDraft({ src_workload: f.src_workload, src_namespace: f.src_namespace, dst_service: f.dst_workload, dst_namespace: f.dst_namespace, dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }], policy_direction: gapDirection })
+                          onAddDraft(draftForFlow(f, gapDirection))
                           onSwitchTab('drafts')
                         }} style={{ ...btn.base, ...btn.green }}>
                           {gapLabel}

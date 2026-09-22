@@ -8,7 +8,7 @@ export async function POST(req: NextRequest) {
   const user = await getCurrentUser()
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  const body = await parseBody<CreatePolicyRequest & { direction?: 'ingress' | 'egress' | 'both' }>(req)
+  const body = await parseBody<CreatePolicyRequest & { direction?: 'ingress' | 'egress' | 'both'; dst_cidr?: string; cidr_except?: string[] }>(req)
   if (!body) return NextResponse.json({ detail: 'Body JSON inválido' }, { status: 400 })
   const direction = body.direction ?? 'ingress'
   try {

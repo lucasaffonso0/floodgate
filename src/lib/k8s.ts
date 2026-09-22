@@ -809,9 +809,53 @@ export async function createCidrPolicy(req: CidrPolicyRequest): Promise<NetworkP
 }
 
 export async function previewPolicyYAML(
-  req: CreatePolicyRequest,
+  req: CreatePolicyRequest & { dst_cidr?: string; cidr_except?: string[] },
   direction: 'ingress' | 'egress' | 'both',
 ): Promise<string> {
+  // A CIDR-shaped request (internet-bound flows, or the CIDR creation form)
+  // has no real dst Service/workload to resolve — req.dst_service here is
+  // the SOURCE-side workload the policy's podSelector scopes to (mirrors
+  // applyDraft()'s dst_cidr handling: dst_namespace/dst_service double as
+  // the policy's own namespace/service_name for a CIDR policy). Preview-only
+  // YAML, so `from`/`to` use the real K8s API field name directly — no need
+  // for the `_from` workaround createCidrPolicy() uses to satisfy the
+  // @kubernetes/client-node model's serializer.
+  if (req.dst_cidr) {
+    const cidrDirection = direction === 'ingress' ? 'ingress' : 'egress'
+    const podSelector = req.dst_service ? await resolvePodSelector(req.dst_service, req.src_namespace) : {}
+    const kPorts = req.dst_ports.length > 0
+      ? req.dst_ports.map(p => ({
+          protocol: p.protocol as string, port: p.port as unknown as number,
+          ...(p.endPort !== undefined ? { endPort: p.endPort as unknown as number } : {}),
+        }))
+      : undefined
+    const ipBlock = { cidr: req.dst_cidr, ...(req.cidr_except?.length ? { except: req.cidr_except } : {}) }
+    const policyType = `cidr-${cidrDirection}`
+    const safeCidr = req.dst_cidr.replace(/\//g, '-').replace(/\./g, '-')
+    const policyName = sanitizeK8sName(`floodgate-cidr-${cidrDirection}-${safeCidr}${req.dst_service ? `-${req.dst_service}` : ''}`)
+    const doc = {
+      apiVersion: 'networking.k8s.io/v1',
+      kind: 'NetworkPolicy',
+      metadata: {
+        name: policyName,
+        namespace: req.src_namespace,
+        labels: {
+          'managed-by': MANAGED_BY, 'floodgate-policy-type': policyType,
+          'target-service': req.dst_service ?? '', 'target-port': String(req.dst_ports?.[0]?.port ?? 0),
+          'source-workload': '', 'source-namespace': '',
+        },
+      },
+      spec: {
+        podSelector: { matchLabels: podSelector },
+        policyTypes: [cidrDirection === 'ingress' ? 'Ingress' : 'Egress'],
+        ...(cidrDirection === 'ingress'
+          ? { ingress: [{ from: [{ ipBlock }], ...(kPorts ? { ports: kPorts } : {}) }] }
+          : { egress: [{ to: [{ ipBlock }], ...(kPorts ? { ports: kPorts } : {}) }] }),
+      },
+    }
+    return yaml.dump(doc, { lineWidth: -1 })
+  }
+
   const [srcSelector, dst] = await Promise.all([
     resolvePodSelector(req.src_workload, req.src_namespace),
     resolveWorkload(req.dst_service, req.dst_namespace),

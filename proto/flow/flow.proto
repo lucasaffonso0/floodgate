@@ -15,9 +15,25 @@ enum Verdict {
 message Flow {
   google.protobuf.Timestamp time = 1;
   Verdict verdict = 2;
+  IP ip = 5;
   Endpoint source = 8;
   Endpoint destination = 9;
   Layer4 l4 = 6;
+}
+
+// Field number 5 confirmed live against a real cluster (kind-pop-os,
+// 2026-09-22): curled 1.1.1.1 from a test pod and the decoded
+// ip.destination came back exactly "1.1.1.1". destination_names (DNS
+// names, only populated when Cilium DNS-visibility is enabled) was NOT
+// added here — this cluster doesn't have DNS-visibility on, so there was
+// no live data to verify its field number against, and guessing wrong
+// risks corrupting the whole flow stream (field 10 threw a hard decode
+// error during this same verification pass) rather than just missing a
+// bonus feature. Add it once there's a cluster with DNS-visibility on to
+// verify against, the same way this field was.
+message IP {
+  string source = 1;
+  string destination = 2;
 }
 
 message Endpoint {

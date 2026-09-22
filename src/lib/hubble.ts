@@ -7,7 +7,7 @@ import { getDb } from './db'
 import { listNetworkPolicies, checkHubbleRelayReady, listServices } from './k8s'
 import { getConfig } from './config'
 import { emit } from './sse'
-import { normalizeWorkload, flowHasPolicy } from './flowMatch'
+import { normalizeWorkload, flowHasPolicy, isWorldEndpoint } from './flowMatch'
 import type { CiliumFlowSummary, NetworkPolicyInfo } from '@/types'
 
 const PROTO_ROOT = path.join(process.cwd(), 'proto')
@@ -170,16 +170,39 @@ function processFlow(msg: unknown): void {
   if (flow.is_reply === true) return
 
   const src = extractEndpoint(flow.source)
-  const dst = extractEndpoint(flow.destination)
   const portInfo = extractPort(flow.l4)
   const rawVerdict: string = flow.verdict ?? ''
+
+  // A destination outside the cluster (reserved:world) resolves to nothing
+  // via extractEndpoint() — namespace and workload both come back empty,
+  // same as every other unresolvable "reserved:*" identity (host,
+  // unmanaged, kube-apiserver, ...). Those stay dropped exactly as before;
+  // world is the one case turned into a real row, using the actual
+  // destination IP (flow.ip.destination) as its identity — there's no
+  // in-cluster namespace/workload for it to have. dst_namespace='internet'
+  // is a sentinel, same spelling already used for the internet-egress
+  // companion policy isolateNamespace() creates (unrelated mechanism, kept
+  // consistent on purpose).
+  const dstIsWorld = isWorldEndpoint(flow.destination?.labels)
+  let dst: { workload: string; namespace: string }
+  if (dstIsWorld) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const dstIp: string = (flow as any).ip?.destination ?? ''
+    if (!dstIp) return  // nothing worth showing without an address
+    dst = { workload: dstIp, namespace: 'internet' }
+  } else {
+    dst = extractEndpoint(flow.destination)
+  }
 
   if (!src.workload || !portInfo || portInfo.port === 0) return
   if (!dst.workload && !dst.namespace) return
   if (portInfo.port === 53) return
-  if (portInfo.port >= 32768) {
+  if (portInfo.port >= 32768 && !dstIsWorld) {
     // Porta alta: só aceita se for port declarado em algum K8s Service real do destino.
     // Caso contrário, é porta efêmera de resposta TCP (Hubble captura os dois sentidos).
+    // Não faz sentido pra internet — não existe "Service" pra validar contra
+    // um IP externo, e uma porta alta ali pode perfeitamente ser real (ex:
+    // uma API de terceiro respondendo numa porta não-privilegiada).
     if (Date.now() - _svcPortCacheAt > 60_000) refreshSvcPortCache()  // refresh async em background
     if (!isKnownServicePort(dst.namespace, dst.workload, portInfo.port)) return
   }

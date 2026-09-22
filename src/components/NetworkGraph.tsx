@@ -123,6 +123,7 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
     isolatedEg: boolean
     exceptionCount: number
     virtual?: boolean
+    hideVirtualBadge?: boolean
   }
   return (
     <div style={{
@@ -150,7 +151,7 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
           <path d="M5 9l4-4 4 4M5 15l4 4 4-4M15 9l4-4 4 4M15 15l4 4 4-4" />
         </svg>
         <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.label}</span>
-        {d.virtual && (
+        {d.virtual && !d.hideVirtualBadge && (
           <span style={{ fontSize: 9, color: '#94a3b8', fontWeight: 400, whiteSpace: 'nowrap', fontStyle: 'italic' }}>descoberto</span>
         )}
         {!d.virtual && <IsolationBadge isolatedIn={d.isolatedIn} isolatedEg={d.isolatedEg} exceptionCount={d.exceptionCount} />}
@@ -275,6 +276,8 @@ const PALETTE = [
   { bg: 'rgba(236,72,153,0.06)', border: '#ec4899' },
   { bg: 'rgba(239,68,68,0.06)',  border: '#ef4444' },
 ]
+
+const LS_SHOW_INTERNET_KEY = 'floodgate-show-internet-traffic'
 
 // ─── Layout constants ──────────────────────────────────────────────────────
 const NODE_W = 160, NODE_H = 56, NODE_GAPH = 20, NODE_GAPV = 16
@@ -473,11 +476,18 @@ function buildGraph(
   ignoredNamespaces: string[] = [],
   visibleNamespaces?: Set<string>,
   draftMode = false,
+  showInternetTraffic = false,
 ): { nodes: Node[]; edges: BuiltInEdge[] } {
+  // 'internet' is a synthetic pseudo-namespace (see hubble.ts's reserved:world
+  // handling) — it never appears in the real namespace list a user hides/shows
+  // from, so it can never be a member of visibleNamespaces even when the user
+  // hasn't hidden anything else. Exempt it, or it's unconditionally filtered
+  // out the moment visibleNamespaces is non-empty, regardless of showInternetTraffic.
   const nsVisible = (ns: string) =>
-    !visibleNamespaces || visibleNamespaces.size === 0 || visibleNamespaces.has(ns)
+    ns === 'internet' || !visibleNamespaces || visibleNamespaces.size === 0 || visibleNamespaces.has(ns)
   const visibleFlows = ciliumFlows.filter(
     f => nsVisible(f.src_namespace) && nsVisible(f.dst_namespace)
+      && (showInternetTraffic || f.dst_namespace !== 'internet')
   )
 
   // Modo Rascunho: preview the graph as if the current drafts had been
@@ -506,11 +516,32 @@ function buildGraph(
     })
   }
 
+  // Virtual/synthetic namespace nodes (e.g. 'internet', or any workload
+  // namespace Hubble discovers with no matching K8s Service) never appear
+  // in nsMap — it's built only from `services`. Without this set, the
+  // stale-position cleanup right below would delete a saved/dragged
+  // position for one of these on every single buildGraph() call, since it
+  // only knows about "namespaces with Services" as ever being legitimate —
+  // so a virtual namespace's position could never survive a rebuild and
+  // always fell back to its auto-computed default. Built from the raw
+  // ciliumFlows param, not the showInternetTraffic/showFlowEdges-filtered
+  // visibleFlows: a position must survive even while its flows are
+  // currently hidden by a toggle (e.g. the DB position for 'internet'
+  // arrives and gets applied before the user has switched the toggle on
+  // for this session) — otherwise it gets garbage-collected in that
+  // window and the toggle turning on later has nothing saved to use.
+  const virtualNsCandidates = new Set<string>()
+  for (const f of ciliumFlows) {
+    virtualNsCandidates.add(f.src_namespace)
+    virtualNsCandidates.add(f.dst_namespace)
+  }
+
   {
     const tree = computeNamespaceTreeLayout([...nsMap.keys()], nsSizes, policies, drafts, showFlowEdges ? visibleFlows : [])
-    // Remove stale namespaces that no longer exist in the cluster
+    // Remove stale namespaces that no longer exist in the cluster nor in
+    // any currently visible flow.
     for (const key of [...nsPositions.keys()]) {
-      if (!nsMap.has(key)) nsPositions.delete(key)
+      if (!nsMap.has(key) && !virtualNsCandidates.has(key)) nsPositions.delete(key)
     }
     // Only assign tree positions to namespaces not already positioned (preserves manual drags)
     for (const [ns, pos] of tree) {
@@ -707,16 +738,28 @@ function buildGraph(
         if (ignoredNamespaces.includes(namespace)) continue
         seen.add(nsId)
 
+        // A internet nunca ganha um nó-filho por IP — um serviço falando
+        // com dezenas de IPs distintos criaria dezenas de nós dentro da
+        // caixa, exatamente a poluição que esse recurso existe pra evitar.
+        // Sem nó de workload pra um IP, resolveNodeId() cai de volta pro
+        // nó do próprio namespace (`ns::internet`) — o que já agrega toda
+        // aresta de fluxo por origem automaticamente, sem lógica extra.
+        const isInternet = namespace === 'internet'
+
         // Coletar workloads únicos deste namespace sem Service K8s
         const nsWorkloads = new Set<string>()
-        for (const f of visibleFlows) {
-          if (f.src_namespace === namespace && !svcSet.has(`svc::${namespace}::${f.src_workload}`))
-            nsWorkloads.add(normalizeWorkload(f.src_workload))
-          if (f.dst_namespace === namespace && !svcSet.has(`svc::${namespace}::${f.dst_workload}`))
-            nsWorkloads.add(normalizeWorkload(f.dst_workload))
+        if (!isInternet) {
+          for (const f of visibleFlows) {
+            if (f.src_namespace === namespace && !svcSet.has(`svc::${namespace}::${f.src_workload}`))
+              nsWorkloads.add(normalizeWorkload(f.src_workload))
+            if (f.dst_namespace === namespace && !svcSet.has(`svc::${namespace}::${f.dst_workload}`))
+              nsWorkloads.add(normalizeWorkload(f.dst_workload))
+          }
         }
         const workloadList = [...nsWorkloads].sort()
-        const VIRTUAL_H_DYN = NS_HEADER + NS_PAD + workloadList.length * (WORKLOAD_H + 6) + NS_PAD
+        const VIRTUAL_H_DYN = isInternet
+          ? NS_HEADER + NS_PAD * 2
+          : NS_HEADER + NS_PAD + workloadList.length * (WORKLOAD_H + 6) + NS_PAD
 
         const savedPos = nsPositions.get(namespace)
         const pos = savedPos ?? { x: vCol * (VIRTUAL_W + TREE_COL_GAP), y: maxY + TREE_ROW_GAP }
@@ -729,9 +772,9 @@ function buildGraph(
           position: pos,
           style: { width: VIRTUAL_W, height: VIRTUAL_H_DYN, padding: 0 },
           data: {
-            label: namespace,
-            color: '#f8fafc',
-            borderColor: '#94a3b8',
+            label: isInternet ? '🌐 Internet' : namespace,
+            color: isInternet ? '#eff6ff' : '#f8fafc',
+            borderColor: isInternet ? '#3b82f6' : '#94a3b8',
             locked: false,
             canToggleLock: false,
             onToggleLock: () => undefined,
@@ -739,13 +782,20 @@ function buildGraph(
             isolatedEg: false,
             exceptionCount: 0,
             virtual: true,
+            hideVirtualBadge: isInternet,
           },
           draggable: !globalLocked,
-          zIndex: 0,
+          // Every internet-bound edge converges on this one small box (by
+          // design — that's the aggregation), so flow edges (zIndex 15)
+          // would otherwise blanket its entire draggable area and steal the
+          // pointerdown before it reaches the node underneath. Any other
+          // namespace box spreads incoming edges across a much bigger
+          // footprint and doesn't need this.
+          zIndex: isInternet ? 20 : 0,
         })
         nsGroupSet.add(nsId)
 
-        // Nós de workload como filhos do grupo virtual
+        // Nós de workload como filhos do grupo virtual (não aplicável à internet, ver acima)
         workloadList.forEach((wl, i) => {
           const wlId = `work::${namespace}::${wl}`
           workloadSet.add(wlId)
@@ -1899,6 +1949,16 @@ export default function NetworkGraph({
   const [editingPolicy, setEditingPolicy]   = React.useState<NetworkPolicyInfo | null>(null)
   const [selectedFlowEdge, setSelectedFlowEdge] = React.useState<Edge | null>(null)
   const [showFlowEdges, setShowFlowEdges]   = React.useState(true)
+  const [showInternetTraffic, setShowInternetTraffic] = React.useState(() => {
+    try { return localStorage.getItem(LS_SHOW_INTERNET_KEY) === '1' } catch { return false }
+  })
+  const toggleInternetTraffic = React.useCallback(() => {
+    setShowInternetTraffic(v => {
+      const next = !v
+      try { localStorage.setItem(LS_SHOW_INTERNET_KEY, next ? '1' : '0') } catch {}
+      return next
+    })
+  }, [])
 
   const nsPositions  = useRef<Map<string, { x: number; y: number }>>(new Map())
   const nsPaletteIdx = useRef<Map<string, number>>(new Map())
@@ -1938,7 +1998,7 @@ export default function NetworkGraph({
       services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, onToggleNamespaceLock,
       nsPositions.current, nsPaletteIdx.current, canManageNamespace,
       layoutMode, globalLocked,
-      ciliumFlows ?? [], showFlowEdges, ignoredNamespaces, visibleNamespaces, draftMode,
+      ciliumFlows ?? [], showFlowEdges, ignoredNamespaces, visibleNamespaces, draftMode, showInternetTraffic,
     )
     // buildGraph() always constructs fresh node objects, so ReactFlow's own
     // click-driven `selected` highlight (the box-shadow on the open node)
@@ -1973,7 +2033,7 @@ export default function NetworkGraph({
         .map(node => ({ namespace: node.id.slice(4), x: node.position.x, y: node.position.y }))
       await onAutoLayoutServices([], movedNamespaces)
     }
-  }, [services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, canManageNamespace, onToggleNamespaceLock, onAutoLayoutServices, globalLocked, ciliumFlows, showFlowEdges, ignoredNamespaces, visibleNamespaces, selectedNodeId, selectedNs, draftMode])
+  }, [services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, canManageNamespace, onToggleNamespaceLock, onAutoLayoutServices, globalLocked, ciliumFlows, showFlowEdges, ignoredNamespaces, visibleNamespaces, selectedNodeId, selectedNs, draftMode, showInternetTraffic])
 
   useEffect(() => { rebuildRef.current = rebuildGraph }, [rebuildGraph])
   useEffect(() => { if (!isDragging.current) rebuildGraph('namespaces').catch(() => {}) }, [rebuildGraph])
@@ -2184,7 +2244,12 @@ export default function NetworkGraph({
 
   const handleNodeClick = useCallback((_: React.MouseEvent, node: Node) => {
     if (node.id.startsWith('svc::')) { setSelectedNs(null); setSelectedNodeId(node.id) }
-    if (node.id.startsWith('ns::')) { setSelectedNodeId(null); setSelectedNs(node.id.slice(4)) }
+    // 'internet' isn't a real namespace — no isolation/lock actions make
+    // sense against it, and the namespace click-panel assumes a real one
+    // (it can try to call isolateNamespace(), which would just fail
+    // against a namespace that doesn't exist). The per-source breakdown of
+    // internet destinations already lives in the Descoberta tab instead.
+    if (node.id.startsWith('ns::') && node.id !== 'ns::internet') { setSelectedNodeId(null); setSelectedNs(node.id.slice(4)) }
   }, [])
 
   const onConnect = useCallback((connection: Connection) => {
@@ -2277,6 +2342,22 @@ export default function NetworkGraph({
               }} />
               Tráfego ao vivo
             </button>
+            {showFlowEdges && ciliumFlows?.some(f => f.dst_namespace === 'internet') && (
+              <button
+                onClick={toggleInternetTraffic}
+                title="Mostra uma caixa 'Internet' agregada, com uma seta por serviço/namespace que fala com fora do cluster — sem um nó por IP, pra não poluir o grafo"
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6, marginTop: 6,
+                  padding: '5px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600,
+                  cursor: 'pointer',
+                  background: showInternetTraffic ? '#eff6ff' : '#f8fafc',
+                  border: `1px solid ${showInternetTraffic ? '#93c5fd' : '#cbd5e1'}`,
+                  color: showInternetTraffic ? '#1d4ed8' : '#64748b',
+                }}
+              >
+                🌐 Tráfego pra internet
+              </button>
+            )}
           </Panel>
         )}
       </ReactFlow>

@@ -27,6 +27,17 @@ export function normalizeWorkload(workload: string): string {
   return workload.replace(oneSuffix, '')
 }
 
+// Cilium tags a destination outside the cluster with the reserved identity
+// label "reserved:world" instead of any namespace/workload/pod_name — the
+// one case a Hubble flow endpoint has nothing extractEndpoint()-style logic
+// can resolve. Checked by label string, not the numeric reserved-identity
+// value, so this reads correctly without relying on a Cilium internal ID
+// staying stable. Used by hubble.ts to turn what used to be a silently
+// dropped flow into a dst_namespace:'internet' row instead.
+export function isWorldEndpoint(labels: string[] | undefined | null): boolean {
+  return (labels ?? []).includes('reserved:world')
+}
+
 // Which side is actually the reason this flow gets dropped: the
 // destination's ingress, the source's egress, or both. Unlike
 // flowHasPolicy() (which requires an explicit allow to call ingress
@@ -58,6 +69,25 @@ export function flowHasPolicy(
   policies: NetworkPolicyInfo[],
 ): boolean {
   const srcWorkload = normalizeWorkload(f.src_workload)
+
+  // dst_namespace='internet' is the sentinel a flow to an external IP gets
+  // (see hubble.ts's reserved:world handling) — there's no in-cluster
+  // destination to check an ingress-allow against (no real policy ever has
+  // namespace:'internet'), so only the source's own egress posture matters.
+  // Exempted via the same 'internet' sentinel isolateNamespace()'s
+  // egress-internet companion policy already uses — not the literal
+  // destination IP, which no policy created through the normal allow flow
+  // could ever target (only a cidr-egress policy could, and matching that
+  // precisely against this exact IP isn't implemented yet: a namespace
+  // protected by a narrower CIDR range, instead of the broad internet
+  // sentinel, will show as uncovered here even when the traffic is
+  // actually allowed).
+  if (f.dst_namespace === 'internet') {
+    const srcExplain = explainAccess(srcWorkload, f.src_namespace, 'egress', policies)
+    if (!srcExplain.blocked) return true
+    return isDestinationExempt(srcExplain.exceptions, 'internet', f.src_namespace, f.dst_namespace)
+  }
+
   const dstAllows = policies.some(p => {
     if (p.namespace !== f.dst_namespace || p.dst_service !== f.dst_workload) return false
     const portMatches = p.dst_ports.some(ps => ps.port === f.dst_port) || p.dst_port === f.dst_port

@@ -219,12 +219,17 @@ export const getNetworkPolicyYaml = (namespace: string, name: string): Promise<s
 export const previewDiscoveryPolicyYAML = (
   flow: CiliumFlowSummary,
   direction: 'ingress' | 'egress' | 'both' = 'ingress',
-): Promise<string> =>
-  api.post('/networkpolicies/preview', {
+): Promise<string> => {
+  // internet-bound flows have no real dst Service to resolve — preview a
+  // CIDR egress policy instead, same shape draftForFlow() builds.
+  const isInternet = flow.dst_namespace === 'internet'
+  return api.post('/networkpolicies/preview', {
     src_workload: flow.src_workload,
     src_namespace: flow.src_namespace,
-    dst_service: flow.dst_workload,
-    dst_namespace: flow.dst_namespace,
+    dst_service: isInternet ? flow.src_workload : flow.dst_workload,
+    dst_namespace: isInternet ? flow.src_namespace : flow.dst_namespace,
     dst_ports: [{ port: flow.dst_port, protocol: flow.protocol }],
-    direction,
+    direction: isInternet ? 'egress' : direction,
+    ...(isInternet ? { dst_cidr: `${flow.dst_workload}/32` } : {}),
   }, { responseType: 'text' }).then(r => r.data as string)
+}

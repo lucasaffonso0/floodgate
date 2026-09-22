@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { normalizeWorkload, flowHasPolicy, classifyFlowGap } from './flowMatch'
+import { normalizeWorkload, flowHasPolicy, classifyFlowGap, isWorldEndpoint } from './flowMatch'
 import { NetworkPolicyInfo } from '@/types'
 
 function policy(overrides: Partial<NetworkPolicyInfo>): NetworkPolicyInfo {
@@ -20,6 +20,29 @@ function policy(overrides: Partial<NetworkPolicyInfo>): NetworkPolicyInfo {
     ...overrides,
   }
 }
+
+describe('isWorldEndpoint', () => {
+  it('is true when labels include reserved:world', () => {
+    expect(isWorldEndpoint(['reserved:world'])).toBe(true)
+    expect(isWorldEndpoint(['k8s:io.kubernetes.pod.namespace=x', 'reserved:world'])).toBe(true)
+  })
+
+  it('is false for a normal in-cluster pod\'s labels', () => {
+    expect(isWorldEndpoint(['k8s:app=worker', 'k8s:io.kubernetes.pod.namespace=backend'])).toBe(false)
+  })
+
+  it('is false for other reserved identities — only world should turn into a shown flow', () => {
+    expect(isWorldEndpoint(['reserved:host'])).toBe(false)
+    expect(isWorldEndpoint(['reserved:unmanaged'])).toBe(false)
+    expect(isWorldEndpoint(['reserved:kube-apiserver'])).toBe(false)
+  })
+
+  it('is false for missing/empty labels, without throwing', () => {
+    expect(isWorldEndpoint(undefined)).toBe(false)
+    expect(isWorldEndpoint(null)).toBe(false)
+    expect(isWorldEndpoint([])).toBe(false)
+  })
+})
 
 describe('normalizeWorkload', () => {
   it('strips a ReplicaSet-style pod suffix (10-char hash + 5-char hash)', () => {
@@ -135,6 +158,48 @@ describe('flowHasPolicy', () => {
       policy({ policy_type: 'allow', namespace: 'backend', dst_service: 'worker', src_workload: 'app', src_namespace: 'frontend', dst_ports: [{ port: 8080, protocol: 'TCP' }] }),
     ]
     expect(flowHasPolicy(flow, policies)).toBe(true)
+  })
+
+  describe('internet-bound flows (dst_namespace: "internet")', () => {
+    const internetFlow = { src_workload: 'app', src_namespace: 'frontend', dst_workload: '1.1.1.1', dst_namespace: 'internet', dst_port: 443 }
+
+    it('is true when the source namespace has no egress restriction at all', () => {
+      expect(flowHasPolicy(internetFlow, [])).toBe(true)
+    })
+
+    it('is false when the source namespace has an unexempted egress-deny', () => {
+      const policies = [policy({ policy_type: 'restrict-egress', namespace: 'frontend', dst_service: '' })]
+      expect(flowHasPolicy(internetFlow, policies)).toBe(false)
+    })
+
+    it('is true when the source namespace has an egress-deny but the internet-egress companion (dst_service: "internet") exempts it', () => {
+      const policies = [
+        policy({ policy_type: 'restrict-egress', namespace: 'frontend', dst_service: '' }),
+        policy({ policy_type: 'allow-egress', namespace: 'frontend', src_workload: 'app', src_namespace: 'frontend', dst_service: 'internet' }),
+      ]
+      expect(flowHasPolicy(internetFlow, policies)).toBe(true)
+    })
+
+    it('ignores a real policy that happens to share the literal destination IP as dst_service — no create-policy flow can ever produce that', () => {
+      const policies = [
+        policy({ policy_type: 'restrict-egress', namespace: 'frontend', dst_service: '' }),
+        policy({ policy_type: 'allow-egress', namespace: 'frontend', src_workload: 'app', src_namespace: 'frontend', dst_service: '1.1.1.1' }),
+      ]
+      expect(flowHasPolicy(internetFlow, policies)).toBe(false)
+    })
+
+    it('never matches against a dst_namespace that is a real cluster namespace, even one literally named "internet"', () => {
+      // Documents the known v1 edge case rather than silently mishandling
+      // it: a real allow-namespace policy for a namespace named "internet"
+      // is NOT what dst_namespace: 'internet' means for a flow — the
+      // sentinel and a same-named real namespace are indistinguishable
+      // here on purpose (see flowHasPolicy's internet branch), since this
+      // function only ever checks the source's egress posture for it.
+      const policies = [
+        policy({ policy_type: 'allow-namespace', namespace: 'internet', dst_service: 'x', src_namespace: 'frontend', dst_ports: [{ port: 443, protocol: 'TCP' }] }),
+      ]
+      expect(flowHasPolicy(internetFlow, policies)).toBe(true) // true only because src has no egress restriction, not because of this policy
+    })
   })
 })
 
