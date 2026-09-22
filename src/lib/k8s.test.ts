@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import yaml from 'js-yaml'
 
 // 'server-only' isn't a real package — it's a Next.js build-time marker with
 // no runtime module behind it outside Next's own bundler, so importing
@@ -16,6 +17,8 @@ const listNamespacedPod = vi.fn()
 const readNamespacedDeployment = vi.fn()
 const readNamespacedStatefulSet = vi.fn()
 const readNamespacedDaemonSet = vi.fn()
+const createNamespacedNetworkPolicy = vi.fn()
+const replaceNamespacedNetworkPolicy = vi.fn()
 
 vi.mock('@kubernetes/client-node', () => {
   class KubeConfig {
@@ -23,6 +26,7 @@ vi.mock('@kubernetes/client-node', () => {
     makeApiClient(ApiClass: unknown) {
       if (ApiClass === CoreV1Api) return { readNamespacedService, listNamespacedPod }
       if (ApiClass === AppsV1Api) return { readNamespacedDeployment, readNamespacedStatefulSet, readNamespacedDaemonSet }
+      if (ApiClass === NetworkingV1Api) return { createNamespacedNetworkPolicy, replaceNamespacedNetworkPolicy }
       return {}
     }
   }
@@ -148,5 +152,94 @@ describe('resolvePodSelector', () => {
     const { resolvePodSelector } = await import('./k8s')
     await expect(resolvePodSelector('django', 'defectdojo')).rejects.toThrow('forbidden')
     expect(readNamespacedDeployment).not.toHaveBeenCalled()
+  })
+})
+
+// Real bug report: a flow discovered straight off a StatefulSet pod
+// ("howk-scheduler" -> "gl-kafka-kafka-0") 404'd on "Ver YAML" — the
+// *destination* side of every create/preview path required a Service with
+// the exact request name, with no fallback at all (unlike the source side,
+// which already had the resolveWorkload cascade). "gl-kafka-kafka-0" has no
+// Service of that name (the real Services are gl-kafka-kafka-bootstrap /
+// gl-kafka-kafka-brokers) and no StatefulSet of that name either (the real
+// StatefulSet is "gl-kafka-kafka", without the pod's "-0" ordinal) — so it
+// only resolves via the last-resort pod-label tier.
+describe('destination resolution (createNetworkPolicy / previewPolicyYAML)', () => {
+  const kafkaBrokerPod = {
+    metadata: {
+      name: 'gl-kafka-kafka-0',
+      labels: {
+        'app.kubernetes.io/name': 'kafka',
+        'app.kubernetes.io/instance': 'gl-kafka',
+        'strimzi.io/cluster': 'gl-kafka',
+        'strimzi.io/name': 'gl-kafka-kafka',
+        'controller-revision-hash': 'gl-kafka-kafka-abc123',
+        'statefulset.kubernetes.io/pod-name': 'gl-kafka-kafka-0',
+        // Auto-injected by Kubernetes 1.31+ on every StatefulSet pod — must
+        // be filtered out, or the selector would only ever match this one
+        // replica (confirmed live against a real kind cluster on 1.32).
+        'apps.kubernetes.io/pod-index': '0',
+      },
+    },
+  }
+  const request = {
+    src_workload: 'howk-scheduler', src_namespace: 'howk',
+    dst_service: 'gl-kafka-kafka-0', dst_namespace: 'kafka',
+    dst_ports: [{ port: 9092, protocol: 'TCP' as const }],
+  }
+
+  it('previewPolicyYAML falls through to the destination pod\'s identity labels and keeps the given numeric port as-is', async () => {
+    // Source resolves normally via a Service — isolates this test to the
+    // destination-side fallback specifically, which is what actually broke.
+    readNamespacedService.mockImplementation(({ name }: { name: string }) =>
+      name === 'howk-scheduler'
+        ? Promise.resolve({ spec: { selector: { app: 'howk-scheduler' } } })
+        : Promise.reject(notFound())
+    )
+    readNamespacedDeployment.mockRejectedValue(notFound())
+    readNamespacedStatefulSet.mockRejectedValue(notFound())
+    readNamespacedDaemonSet.mockRejectedValue(notFound())
+    listNamespacedPod.mockResolvedValue({ items: [kafkaBrokerPod] })
+
+    const { previewPolicyYAML } = await import('./k8s')
+    const text = await previewPolicyYAML(request, 'ingress')
+    const doc = yaml.load(text) as { spec: { podSelector: { matchLabels: Record<string, string> }; ingress: Array<{ ports: Array<{ port: number }> }> } }
+
+    expect(doc.spec.podSelector.matchLabels).toEqual({
+      'app.kubernetes.io/name': 'kafka',
+      'app.kubernetes.io/instance': 'gl-kafka',
+      'strimzi.io/cluster': 'gl-kafka',
+      'strimzi.io/name': 'gl-kafka-kafka',
+    })
+    // No Service exists to resolve a named targetPort against — the given
+    // numeric port (already the real port, straight from an observed
+    // Hubble flow) must pass through unchanged, not be dropped or error.
+    expect(doc.spec.ingress[0].ports[0].port).toBe(9092)
+  })
+
+  it('createNetworkPolicy applies the same destination fallback when actually creating the policy, not just previewing it', async () => {
+    readNamespacedService.mockImplementation(({ name }: { name: string }) =>
+      name === 'howk-scheduler'
+        ? Promise.resolve({ spec: { selector: { app: 'howk-scheduler' } } })
+        : Promise.reject(notFound())
+    )
+    readNamespacedDeployment.mockRejectedValue(notFound())
+    readNamespacedStatefulSet.mockRejectedValue(notFound())
+    readNamespacedDaemonSet.mockRejectedValue(notFound())
+    listNamespacedPod.mockResolvedValue({ items: [kafkaBrokerPod] })
+    createNamespacedNetworkPolicy.mockResolvedValue({ metadata: { name: 'floodgate-allow-x', namespace: 'kafka', creationTimestamp: new Date() } })
+
+    const { createNetworkPolicy } = await import('./k8s')
+    const result = await createNetworkPolicy(request)
+
+    expect(result.dst_service).toBe('gl-kafka-kafka-0')
+    const body = createNamespacedNetworkPolicy.mock.calls[0][0].body
+    expect(body.spec.podSelector.matchLabels).toEqual({
+      'app.kubernetes.io/name': 'kafka',
+      'app.kubernetes.io/instance': 'gl-kafka',
+      'strimzi.io/cluster': 'gl-kafka',
+      'strimzi.io/name': 'gl-kafka-kafka',
+    })
+    expect(body.spec.ingress[0].ports[0].port).toBe(9092)
   })
 })

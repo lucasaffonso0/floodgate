@@ -11,8 +11,15 @@ const GENERATED_LABEL_KEYS = new Set([
   'pod-template-hash',
   'controller-revision-hash',
   'statefulset.kubernetes.io/pod-name',
+  // Kubernetes 1.31+ auto-injects the StatefulSet ordinal onto every pod —
+  // per-replica-unique, so keeping it would narrow the selector down to
+  // just that one replica instead of every pod of the StatefulSet.
+  'apps.kubernetes.io/pod-index',
   'batch.kubernetes.io/job-name',
   'job-name',
+  // Same idea for indexed Jobs, and the per-Job-instance controller UID.
+  'batch.kubernetes.io/job-completion-index',
+  'controller-uid',
 ])
 
 export function isIdentityLabel(key: string): boolean {

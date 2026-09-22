@@ -37,6 +37,24 @@ describe('isIdentityLabel', () => {
   it('drops Job-owned pod labels — unique per Job run, not per app', () => {
     expect(isIdentityLabel('batch.kubernetes.io/job-name')).toBe(false)
     expect(isIdentityLabel('job-name')).toBe(false)
+    expect(isIdentityLabel('batch.kubernetes.io/job-completion-index')).toBe(false)
+    expect(isIdentityLabel('controller-uid')).toBe(false)
+  })
+
+  it('drops apps.kubernetes.io/pod-index — the StatefulSet ordinal Kubernetes 1.31+ auto-injects onto every pod', () => {
+    // Real bug: a Kafka StatefulSet pod ("gl-kafka-kafka-0") with no
+    // Service resolved via this last-resort tier, and this label — not
+    // filtered before this fix — narrowed the generated NetworkPolicy's
+    // selector down to just that one replica instead of every broker.
+    expect(isIdentityLabel('apps.kubernetes.io/pod-index')).toBe(false)
+  })
+
+  it('keeps apps.kubernetes.io/* labels other than pod-index (distinct prefix from app.kubernetes.io/*, not caught by that allowlist)', () => {
+    expect(isIdentityLabel('apps.kubernetes.io/pod-index')).toBe(false)
+    // Sanity: confirm the two prefixes really are handled independently —
+    // a typo collapsing "apps." into the "app." allowlist check would
+    // silently keep pod-index again.
+    expect(isIdentityLabel('app.kubernetes.io/name')).toBe(true)
   })
 
   it('drops node-topology labels — describe where the pod runs, not what it is', () => {
@@ -70,6 +88,29 @@ describe('identityLabels', () => {
       'app.kubernetes.io/name': 'defectdojo',
       'defectdojo.org/component': 'celery',
       'defectdojo.org/subcomponent': 'worker',
+    })
+  })
+
+  it('filters a real gl-kafka-kafka-0 (StatefulSet, Strimzi) label set down to just the identity labels', () => {
+    // Captured live from `kubectl get pod gl-kafka-kafka-0 --show-labels`
+    // on the exact pod from the reported bug — a Kafka broker with no
+    // matching Service (bootstrap/brokers Services have different names)
+    // and no matching StatefulSet either (the StatefulSet is
+    // "gl-kafka-kafka", without the pod's "-0" ordinal).
+    const raw = {
+      'app.kubernetes.io/instance': 'gl-kafka',
+      'app.kubernetes.io/name': 'kafka',
+      'apps.kubernetes.io/pod-index': '0',
+      'controller-revision-hash': 'gl-kafka-kafka-6d7fd75c96',
+      'statefulset.kubernetes.io/pod-name': 'gl-kafka-kafka-0',
+      'strimzi.io/cluster': 'gl-kafka',
+      'strimzi.io/name': 'gl-kafka-kafka',
+    }
+    expect(identityLabels(raw)).toEqual({
+      'app.kubernetes.io/instance': 'gl-kafka',
+      'app.kubernetes.io/name': 'kafka',
+      'strimzi.io/cluster': 'gl-kafka',
+      'strimzi.io/name': 'gl-kafka-kafka',
     })
   })
 

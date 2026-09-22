@@ -107,22 +107,34 @@ function selectorOf(svc: k8s.V1Service, name: string, namespace: string): Record
   return sel as Record<string, string>
 }
 
-// Resolves the pod selector for a workload name, trying — in order — the
-// resources that could plausibly own it: Service, Deployment, StatefulSet,
-// DaemonSet, each tried only if the previous one 404s (any other error
-// propagates immediately, never silently falls through). A workload that
-// never receives inbound traffic (a queue worker, a cron job) often has no
-// Service at all, so requiring one — the old behavior — made it impossible
-// to create any policy with that workload as the source.
+export interface ResolvedWorkload {
+  selector: Record<string, string>
+  // Non-null only when a real Service matched (the first tier below) — lets
+  // a caller that also needs port resolution reuse this same lookup instead
+  // of assuming a Service exists and re-fetching it.
+  service: k8s.V1Service | null
+}
+
+// Resolves a workload name to its pod selector (and, if one exists, its
+// Service), trying — in order — the resources that could plausibly own it:
+// Service, Deployment, StatefulSet, DaemonSet, each tried only if the
+// previous one 404s (any other error propagates immediately, never silently
+// falls through). A workload that never receives inbound traffic (a queue
+// worker, a cron job) often has no Service at all, so requiring one — the
+// old behavior — made it impossible to create any policy naming that
+// workload, as either the source OR the destination (e.g. a flow
+// discovered straight from a StatefulSet pod like "kafka-0", whose
+// StatefulSet is actually named "kafka" without the ordinal, so it doesn't
+// match by Service name OR by StatefulSet name either).
 // Last resort: no Service and no matching standard controller (a bare pod,
 // a Job/CronJob-owned pod, or a custom controller) — find a live pod whose
 // normalized name matches and use its own identity labels (see
 // isIdentityLabel in podIdentity.ts). This is a best-effort guess, not a
 // guarantee: it's only reached when nothing more authoritative exists to ask.
-export async function resolvePodSelector(name: string, namespace: string): Promise<Record<string, string>> {
+export async function resolveWorkload(name: string, namespace: string): Promise<ResolvedWorkload> {
   try {
     const svc = await core.readNamespacedService({ name, namespace })
-    return selectorOf(svc, name, namespace)
+    return { selector: selectorOf(svc, name, namespace), service: svc }
   } catch (e) {
     if (getK8sStatus(e) !== 404) throw e
   }
@@ -136,7 +148,7 @@ export async function resolvePodSelector(name: string, namespace: string): Promi
     try {
       const workload = await read()
       const sel = workload.spec?.selector?.matchLabels
-      if (sel && Object.keys(sel).length > 0) return sel
+      if (sel && Object.keys(sel).length > 0) return { selector: sel, service: null }
     } catch (e) {
       if (getK8sStatus(e) !== 404) throw e
     }
@@ -151,7 +163,24 @@ export async function resolvePodSelector(name: string, namespace: string): Promi
   if (Object.keys(labels).length === 0) {
     throw new UserFacingError(`Pod "${match.metadata?.name}" não tem labels suficientes para identificar "${namespace}/${name}" com segurança`)
   }
-  return labels
+  return { selector: labels, service: null }
+}
+
+export async function resolvePodSelector(name: string, namespace: string): Promise<Record<string, string>> {
+  return (await resolveWorkload(name, namespace)).selector
+}
+
+// Same as resolveTargetPortFromService, but for a destination resolved via
+// resolveWorkload() that might not have a Service at all (any tier past the
+// first one in resolveWorkload). A named targetPort can only be resolved by
+// looking at a Service's own port mapping — without one there's nothing to
+// resolve against, so the given port is used as-is. This is safe: unlike
+// the manual "Criar política" UI (which only ever offers services, so a
+// numeric port always maps through one), the port here can come from a
+// live-observed Hubble flow, which is already the real, concrete port in
+// use — never a named one needing resolution in the first place.
+async function resolveTargetPortMaybeService(svc: k8s.V1Service | null, namespace: string, servicePort: number): Promise<number> {
+  return svc ? resolveTargetPortFromService(svc, namespace, servicePort) : servicePort
 }
 
 // Resolves the pod port for a given service port. Named targetPorts (e.g.
@@ -182,11 +211,6 @@ async function resolveTargetPortFromService(svc: k8s.V1Service, namespace: strin
     }
   }
   throw new UserFacingError(`Não foi possível resolver a targetPort nomeada "${target}" do service ${namespace}/${svcName}: nenhum pod com containerPort correspondente`)
-}
-
-async function resolveTargetPort(svcName: string, namespace: string, servicePort: number): Promise<number> {
-  const svc = await core.readNamespacedService({ name: svcName, namespace })
-  return resolveTargetPortFromService(svc, namespace, servicePort)
 }
 
 // ── Auto-detect policy metadata from raw K8s spec ──────────────────────────
@@ -293,18 +317,18 @@ export async function listNetworkPolicies(allPolicies = false): Promise<NetworkP
 }
 
 export async function createNetworkPolicy(req: CreatePolicyRequest): Promise<NetworkPolicyInfo> {
-  const [srcSelector, dstSvc] = await Promise.all([
+  const [srcSelector, dst] = await Promise.all([
     resolvePodSelector(req.src_workload, req.src_namespace),
-    core.readNamespacedService({ name: req.dst_service, namespace: req.dst_namespace }),
+    resolveWorkload(req.dst_service, req.dst_namespace),
   ])
-  const dstSelector = selectorOf(dstSvc, req.dst_service, req.dst_namespace)
+  const dstSelector = dst.selector
 
   // A ranged port (endPort) has no single Service port to resolve against —
   // skip resolution for it and match the raw range directly on the pod.
   const resolvedPorts = await Promise.all(
     req.dst_ports.map(async ps => ps.endPort !== undefined
       ? { port: ps.port, endPort: ps.endPort, protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP' }
-      : { port: await resolveTargetPortFromService(dstSvc, req.dst_namespace, ps.port), protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP' }
+      : { port: await resolveTargetPortMaybeService(dst.service, req.dst_namespace, ps.port), protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP' }
     )
   )
 
@@ -365,16 +389,16 @@ export async function createNetworkPolicy(req: CreatePolicyRequest): Promise<Net
 }
 
 export async function createEgressNetworkPolicy(req: CreatePolicyRequest): Promise<NetworkPolicyInfo> {
-  const [srcSelector, dstSvc] = await Promise.all([
+  const [srcSelector, dst] = await Promise.all([
     resolvePodSelector(req.src_workload, req.src_namespace),
-    core.readNamespacedService({ name: req.dst_service, namespace: req.dst_namespace }),
+    resolveWorkload(req.dst_service, req.dst_namespace),
   ])
-  const dstSelector = selectorOf(dstSvc, req.dst_service, req.dst_namespace)
+  const dstSelector = dst.selector
 
   const resolvedPorts = await Promise.all(
     req.dst_ports.map(async ps => ps.endPort !== undefined
       ? { port: ps.port, endPort: ps.endPort, protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP' }
-      : { port: await resolveTargetPortFromService(dstSvc, req.dst_namespace, ps.port), protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP' }
+      : { port: await resolveTargetPortMaybeService(dst.service, req.dst_namespace, ps.port), protocol: ps.protocol as 'TCP' | 'UDP' | 'SCTP' }
     )
   )
   const firstPort = req.dst_ports[0]?.port ?? 0
@@ -539,10 +563,11 @@ export async function createNamespaceIngressPolicy(req: {
   dst_namespace: string
   dst_port: number
 }): Promise<NetworkPolicyInfo> {
-  const [dstSelector, podPort] = await Promise.all([
-    resolvePodSelector(req.dst_service, req.dst_namespace),
-    resolveTargetPort(req.dst_service, req.dst_namespace, req.dst_port),
-  ])
+  // One lookup instead of two — resolvePodSelector + resolveTargetPort used
+  // to each independently try to fetch the same Service.
+  const dst = await resolveWorkload(req.dst_service, req.dst_namespace)
+  const dstSelector = dst.selector
+  const podPort = await resolveTargetPortMaybeService(dst.service, req.dst_namespace, req.dst_port)
 
   const policyName = sanitizeK8sName(`floodgate-allow-ns-${req.src_namespace}-to-${req.dst_service}`)
 
@@ -787,16 +812,16 @@ export async function previewPolicyYAML(
   req: CreatePolicyRequest,
   direction: 'ingress' | 'egress' | 'both',
 ): Promise<string> {
-  const [srcSelector, dstSvc] = await Promise.all([
+  const [srcSelector, dst] = await Promise.all([
     resolvePodSelector(req.src_workload, req.src_namespace),
-    core.readNamespacedService({ name: req.dst_service, namespace: req.dst_namespace }),
+    resolveWorkload(req.dst_service, req.dst_namespace),
   ])
-  const dstSelector = selectorOf(dstSvc, req.dst_service, req.dst_namespace)
+  const dstSelector = dst.selector
 
   const resolvedPorts = await Promise.all(
     req.dst_ports.map(async ps => ps.endPort !== undefined
       ? { port: ps.port, endPort: ps.endPort, protocol: ps.protocol }
-      : { port: await resolveTargetPortFromService(dstSvc, req.dst_namespace, ps.port), protocol: ps.protocol }
+      : { port: await resolveTargetPortMaybeService(dst.service, req.dst_namespace, ps.port), protocol: ps.protocol }
     )
   )
 
