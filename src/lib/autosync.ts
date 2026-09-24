@@ -1,6 +1,8 @@
 import 'server-only'
 import { getDb } from './db'
 import { listNetworkPolicies, applyPolicyYAML, getPolicyYAML, listNamespaceNames, sanitizeK8sName } from './k8s'
+import { getWriteMode } from './writeMode'
+import { listPolicyFiles, hasGitOpsCredentials } from './git'
 
 // The target namespace itself (not just the policy) is gone: restoring will
 // keep failing until someone recreates it. Kept apart from a transient error
@@ -29,7 +31,7 @@ export function removeManagedPolicy(namespace: string, name: string): void {
 
 // Registers the policies isolateNamespace() creates for one direction into
 // managed_policies, reconstructing their deterministic names the same way
-// isolateNamespace() builds them — used by both the manual "Isolar
+// isolateNamespace() builds them; used by both the manual "Isolar
 // namespace" route and the auto-default-deny path so the two stay in sync.
 export function trackIsolatedPolicies(namespace: string, direction: 'ingress' | 'egress', allowIntra: boolean, allowInternet: boolean): void {
   const names = [sanitizeK8sName(`floodgate-ns-deny-${direction}-${namespace}`)]
@@ -67,6 +69,58 @@ export function getLastDriftResult(): DriftResult | null {
   return g._floodgateDriftResult ?? null
 }
 
+// GitOps mode's drift signal: not "managed_policies vs K8s" (that would
+// mean "my own write silently failed", which can't happen here, since floodgate
+// never writes to K8s in this mode) but "repo git vs K8s": exactly the
+// "has ArgoCD synced this yet" question the sync_status UI needs. Same
+// DriftEntry[] shape, same 'missing' field, new meaning: pending sync,
+// not a failure to recover from.
+// policy_yaml is left undefined here (unlike the direct-mode path below);
+// filling it in would mean one extra git.ts read per missing entry, and
+// each read re-fetches the whole repo; not worth it for what's currently
+// just a count/list, revisit if a "Ver YAML" affordance is added for these.
+async function checkDriftViaGit(): Promise<DriftResult> {
+  // Same "not configured yet" case mergeGitSyncStatus handles in
+  // k8s-gitops.ts: GET /api/autosync is polled every 15s by the main
+  // dashboard, so a repo that hasn't been connected in Config → GitOps
+  // yet must read as "nothing to report" here, not 503 the whole poll.
+  if (!hasGitOpsCredentials()) {
+    const r: DriftResult = { missing: [], timestamp: new Date().toISOString() }
+    g._floodgateDriftResult = r
+    return r
+  }
+  let files: string[]
+  try {
+    files = await listPolicyFiles()
+  } catch (e) {
+    // Configured, but the repo is unreachable right now (network blip, bad
+    // SSH auth, DNS failure, the git host down, ...), same reasoning as
+    // the not-configured case above, just a different cause. This used to
+    // reject the whole Promise.all below even though listNetworkPolicies/
+    // listNamespaceNames don't touch git at all, which meant a transient
+    // git failure broke drift reporting entirely instead of just going
+    // stale until the repo is reachable again.
+    console.error('[gitops] checkDriftViaGit: falha ao ler o repositório, reportando drift vazio:', e)
+    const r: DriftResult = { missing: [], timestamp: new Date().toISOString() }
+    g._floodgateDriftResult = r
+    return r
+  }
+  const [active, namespaces] = await Promise.all([listNetworkPolicies(false), listNamespaceNames()])
+  const activeSet = new Set(active.map(p => `${p.namespace}/${p.name}`))
+  const missing: DriftEntry[] = []
+  for (const filePath of files) {
+    const match = filePath.match(/^(.+)\/([^/]+)\.yaml$/)
+    if (!match) continue
+    const [, namespace, name] = match
+    if (!activeSet.has(`${namespace}/${name}`)) {
+      missing.push({ namespace, name, namespace_missing: !namespaces.has(namespace) })
+    }
+  }
+  const result: DriftResult = { missing, timestamp: new Date().toISOString() }
+  g._floodgateDriftResult = result
+  return result
+}
+
 export async function checkDrift(): Promise<DriftResult> {
   const db = getDb()
 
@@ -77,6 +131,8 @@ export async function checkDrift(): Promise<DriftResult> {
     g._floodgateDriftResult = r
     return r
   }
+
+  if (getWriteMode() === 'gitops') return checkDriftViaGit()
 
   const desired = db.prepare('SELECT namespace, name, policy_yaml FROM managed_policies').all() as Array<{ namespace: string; name: string; policy_yaml: string }>
   if (desired.length === 0) {
@@ -113,6 +169,10 @@ export function getLastSyncResult(): SyncResult | null {
   return g._floodgateSyncResult ?? null
 }
 
+// Logged once (not every scheduler tick) so it's clear the reapply loop is
+// dormant on purpose under GitOps, not silently doing nothing.
+let loggedGitopsAutosyncSkip = false
+
 export async function runAutosync(): Promise<SyncResult> {
   const db = getDb()
 
@@ -120,6 +180,21 @@ export async function runAutosync(): Promise<SyncResult> {
   const paused = (db.prepare('SELECT COUNT(*) as n FROM saved_policies').get() as { n: number }).n > 0
   if (paused) {
     const r: SyncResult = { checked: 0, fixed: 0, seeded: 0, drifted: [], timestamp: new Date().toISOString() }
+    g._floodgateSyncResult = r
+    return r
+  }
+
+  // ArgoCD's own selfHeal is the reapply mechanism under GitOps: running
+  // floodgate's own reapply loop at the same time is a correctness risk
+  // (it could reapply a version ArgoCD is mid-pruning). Only the read-only
+  // detection half (checkDrift, above) still runs.
+  if (getWriteMode() === 'gitops') {
+    if (!loggedGitopsAutosyncSkip) {
+      console.log('[autosync] WRITE_MODE=gitops: reapply disabled, ArgoCD selfHeal owns drift correction')
+      loggedGitopsAutosyncSkip = true
+    }
+    const drift = await checkDrift()
+    const r: SyncResult = { checked: 0, fixed: 0, seeded: 0, drifted: [], timestamp: drift.timestamp }
     g._floodgateSyncResult = r
     return r
   }

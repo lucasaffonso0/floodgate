@@ -22,6 +22,27 @@ export interface NetworkPolicyInfo {
   ingress_count: number
   egress_count: number
   created_at?: string
+  // Only set in WRITE_MODE=gitops: undefined in direct mode, where every returned policy already exists
+  // live and this distinction doesn't apply. 'pending_argocd' = tracked in
+  // git, ArgoCD hasn't applied it live yet. 'pending_delete' = still live,
+  // but its file was removed from git, waiting on ArgoCD's prune.
+  sync_status?: 'applied' | 'pending_argocd' | 'pending_delete'
+  // The floodgate-side commit+push itself is still in flight (right after
+  // clicking Aplicar/Remover, before the write settles): distinct from
+  // sync_status, which is about whether ArgoCD has caught up afterward.
+  // Persisted server-side (gitops_pending_ops), so it survives a page
+  // reload mid-write instead of the item just looking gone until it settles.
+  pending_write?: 'apply' | 'delete'
+  // GitOps mode: the last commit that touched this policy's file wasn't
+  // authored by the configured floodgate bot identity: someone edited the
+  // repo directly instead of through the app. Informational only; the app
+  // never auto-corrects this (see reapply_available below).
+  external_change?: boolean
+  // GitOps mode: this policy's file exists in the repo but couldn't be
+  // parsed (malformed YAML/missing required fields), shown instead of the
+  // entry just silently vanishing from the list. Every other field is a
+  // placeholder derived only from the file path when this is true.
+  invalid_file?: boolean
 }
 
 export interface PortSpec {
@@ -144,6 +165,25 @@ export interface BackupStatus {
   credentials_configured: boolean
 }
 
+// direct = escrita direta na API do K8s (hoje). gitops = toda escrita vira
+// commit num repositório git, ArgoCD aplica de fato. Decidido no deploy via
+// WRITE_MODE (Helm/configmap), nunca por toggle de runtime.
+export type WriteMode = 'direct' | 'gitops'
+
+// Conexão com o repositório GitOps, configurada pelo painel (aba Config),
+// não por env var: só WRITE_MODE em si é deploy-time. A chave privada SSH
+// nunca é devolvida por GET (write-only, mesmo padrão que credentials S3 já
+// usa pro backup): esse formato é o que a rota GET expõe.
+export interface GitOpsConfig {
+  repo_url: string
+  repo_branch: string
+  repo_path: string
+  commit_author_name: string
+  commit_author_email: string
+  ssh_known_hosts_configured: boolean
+  credentials_configured: boolean
+}
+
 export interface CiliumFlowSummary {
   id: string
   src_workload: string
@@ -186,6 +226,10 @@ export interface User {
   allowed_namespaces: string[]
   must_change_password?: boolean
   created_at: string
+  // Not actually a per-user property: GET /api/auth/me is just the request
+  // every client already fetches on load, so the deploy-time WRITE_MODE
+  // rides along here instead of a dedicated endpoint.
+  write_mode: WriteMode
 }
 
 export interface AuditLog {

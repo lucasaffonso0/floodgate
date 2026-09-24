@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
 import { getConfig } from '@/lib/config'
 import { runAutosync, checkDrift, getLastSyncResult, getManagedPolicyCount, removeManagedPolicy } from '@/lib/autosync'
+import { getWriteMode } from '@/lib/writeMode'
+import { deleteNetworkPolicyViaGit } from '@/lib/k8s-gitops'
 import { apiError } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 
@@ -46,9 +48,18 @@ export async function POST() {
   }
 }
 
-// Drops a managed_policies row whose target namespace no longer exists —
-// autosync can never restore it, so it's an admin-initiated cleanup, not a
-// cluster mutation (the K8s resource is already gone).
+// Direct mode: drops a managed_policies row whose target namespace no
+// longer exists. checkDrift() compares live K8s against that table, so
+// removing the row is enough; the K8s resource is already gone with its
+// namespace, nothing to delete against a live API that would just 404.
+//
+// GitOps mode: checkDriftViaGit() never reads managed_policies at all, it
+// compares the git repo's files against live K8s directly (autosync.ts).
+// Removing a managed_policies row here used to be a pure no-op under this
+// mode: the git file survived untouched, so the exact same "missing"
+// entry reappeared on the very next poll no matter how many times an
+// admin clicked "Remover órfã." The file itself is what actually needs
+// deleting, same function normal policy deletion already uses.
 export async function DELETE(req: NextRequest) {
   try {
     const user = await getCurrentUser()
@@ -65,7 +76,11 @@ export async function DELETE(req: NextRequest) {
       return NextResponse.json({ detail: 'Esta policy não está órfã (namespace ainda existe ou policy está ativa)' }, { status: 409 })
     }
 
-    removeManagedPolicy(namespace, name)
+    if (getWriteMode() === 'gitops') {
+      await deleteNetworkPolicyViaGit(namespace, name)
+    } else {
+      removeManagedPolicy(namespace, name)
+    }
     logAudit({
       user_id: user.sub, username: user.username,
       action: 'autosync_orphan_removed',

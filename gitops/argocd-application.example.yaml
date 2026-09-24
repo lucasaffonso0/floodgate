@@ -1,0 +1,46 @@
+# Example ArgoCD Application for a floodgate GitOps repository.
+#
+# Prerequisites (all outside this codebase):
+#   1. Create the git repository itself (e.g. floodgate-gitops), with a
+#      `policies/` directory at its root — empty is fine, floodgate creates
+#      files under it as policies are written.
+#   2. Register a deploy key with write access to that repo, and register
+#      the SAME key pair's private half in floodgate's Config tab (GitOps
+#      section) — floodgate pushes to this repo, ArgoCD only ever reads
+#      from it, so a single deploy key can serve both directions.
+#   3. Give ArgoCD itself read access to the repo (its own credential,
+#      registered with ArgoCD directly — e.g. `argocd repo add`), separate
+#      from floodgate's own write credential above.
+#   4. Apply this Application (edit repoURL/targetRevision first).
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: floodgate-networkpolicies
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: git@git.example.com:org/floodgate-gitops.git
+    targetRevision: main
+    path: policies
+    directory:
+      recurse: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default # irrelevant — every NetworkPolicy manifest sets its own namespace
+  syncPolicy:
+    automated:
+      # selfHeal is what makes this the GitOps equivalent of floodgate's own
+      # autosync (which is disabled in this mode) — without it, an admin
+      # editing a NetworkPolicy by hand outside floodgate would never get
+      # reverted, and drift would only be caught, never corrected.
+      selfHeal: true
+      # prune is required for floodgate's delete/unadopt-that-removes-a-file
+      # flows to actually remove the live object — but it also means
+      # anything placed in policies/ by hand, outside floodgate, is a
+      # candidate for ArgoCD to prune. Keep this path floodgate-managed
+      # only; don't hand-edit files under it.
+      prune: true
+    syncOptions:
+      - CreateNamespace=false # floodgate never creates namespaces; isolateNamespace() assumes they already exist

@@ -7,6 +7,28 @@ metadata:
     {{- include "base.labels" . | nindent 4 }}
 rules:
   {{- toYaml .Values.rbac.rules | nindent 2 }}
+  # Gated by the same WRITE_MODE the app itself reads (configmap.data,
+  # helmvalues/values.yaml), not a second RBAC-only flag, so there's no way
+  # for the infrastructure guarantee and the app's own write path to
+  # disagree about which mode is active. WRITE_MODE: gitops means this
+  # ClusterRole never has create/update/patch/delete on networkpolicies, no
+  # matter what the application code does.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs:
+      {{- if eq .Values.configmap.data.WRITE_MODE "gitops" }}
+      - get
+      - list
+      - watch
+      {{- else }}
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+      {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

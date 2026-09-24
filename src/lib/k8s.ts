@@ -5,9 +5,16 @@ import { createHash } from 'crypto'
 import { UserFacingError } from '@/lib/api-helpers'
 import { normalizeWorkload } from '@/lib/flowMatch'
 import { identityLabels } from '@/lib/podIdentity'
+import { getWriteMode } from '@/lib/writeMode'
+import {
+  createRestrictPolicyViaGit, deleteNetworkPolicyViaGit, createNetworkPolicyViaGit, createEgressNetworkPolicyViaGit,
+  createNamespaceIngressPolicyViaGit, createNamespaceRestrictPolicyViaGit, isolateNamespaceViaGit, createCidrPolicyViaGit,
+  getPolicyYAMLViaGit, applyPolicyYAMLViaGit, adoptPolicyViaGit, unadoptPolicyViaGit, patchNetworkPolicyPortViaGit,
+  mergeGitSyncStatus, deleteNetworkPoliciesBatchViaGit,
+} from '@/lib/k8s-gitops'
 import type { ServiceInfo, NetworkPolicyInfo, CreatePolicyRequest, PortSpec, RestrictPolicyRequest, IsolateNamespaceRequest, CidrPolicyRequest } from '@/types'
 
-const MANAGED_BY = 'floodgate'
+export const MANAGED_BY = 'floodgate'
 
 // DNS-1123 subdomain-safe policy name. No-op for names that are already valid
 // and ≤63 chars (keeps existing policy names stable); otherwise cleans invalid
@@ -23,7 +30,7 @@ export function sanitizeK8sName(raw: string): string {
 
 // Valid K8s label value: alphanumeric start/end, [-A-Za-z0-9_.] middle, ≤63.
 // No-op for valid values (service/namespace names always are).
-function sanitizeLabelValue(raw: string): string {
+export function sanitizeLabelValue(raw: string): string {
   return raw
     .replace(/[^A-Za-z0-9\-_.]+/g, '-')
     .slice(0, 63)
@@ -42,7 +49,7 @@ const apps = kc.makeApiClient(k8s.AppsV1Api)
 // (its JS identifier), since it's serialized back to `from` only through the
 // client's own ObjectSerializer: never when we hand the raw object to
 // yaml.dump directly. Rename before dumping any spec read from the API.
-function yamlSafeSpec(spec: k8s.V1NetworkPolicySpec | undefined): unknown {
+export function yamlSafeSpec(spec: k8s.V1NetworkPolicySpec | undefined): unknown {
   if (!spec) return spec
   const ingress = spec.ingress?.map(rule => {
     const { _from, ...rest } = rule as typeof rule & { _from?: unknown }
@@ -109,25 +116,25 @@ function selectorOf(svc: k8s.V1Service, name: string, namespace: string): Record
 
 export interface ResolvedWorkload {
   selector: Record<string, string>
-  // Non-null only when a real Service matched (the first tier below) — lets
+  // Non-null only when a real Service matched (the first tier below), letting
   // a caller that also needs port resolution reuse this same lookup instead
   // of assuming a Service exists and re-fetching it.
   service: k8s.V1Service | null
 }
 
 // Resolves a workload name to its pod selector (and, if one exists, its
-// Service), trying — in order — the resources that could plausibly own it:
+// Service), trying, in order, the resources that could plausibly own it:
 // Service, Deployment, StatefulSet, DaemonSet, each tried only if the
 // previous one 404s (any other error propagates immediately, never silently
 // falls through). A workload that never receives inbound traffic (a queue
-// worker, a cron job) often has no Service at all, so requiring one — the
-// old behavior — made it impossible to create any policy naming that
+// worker, a cron job) often has no Service at all, so requiring one (the
+// old behavior) made it impossible to create any policy naming that
 // workload, as either the source OR the destination (e.g. a flow
 // discovered straight from a StatefulSet pod like "kafka-0", whose
 // StatefulSet is actually named "kafka" without the ordinal, so it doesn't
 // match by Service name OR by StatefulSet name either).
 // Last resort: no Service and no matching standard controller (a bare pod,
-// a Job/CronJob-owned pod, or a custom controller) — find a live pod whose
+// a Job/CronJob-owned pod, or a custom controller): find a live pod whose
 // normalized name matches and use its own identity labels (see
 // isIdentityLabel in podIdentity.ts). This is a best-effort guess, not a
 // guarantee: it's only reached when nothing more authoritative exists to ask.
@@ -173,18 +180,18 @@ export async function resolvePodSelector(name: string, namespace: string): Promi
 // Same as resolveTargetPortFromService, but for a destination resolved via
 // resolveWorkload() that might not have a Service at all (any tier past the
 // first one in resolveWorkload). A named targetPort can only be resolved by
-// looking at a Service's own port mapping — without one there's nothing to
+// looking at a Service's own port mapping: without one there's nothing to
 // resolve against, so the given port is used as-is. This is safe: unlike
 // the manual "Criar política" UI (which only ever offers services, so a
 // numeric port always maps through one), the port here can come from a
 // live-observed Hubble flow, which is already the real, concrete port in
-// use — never a named one needing resolution in the first place.
-async function resolveTargetPortMaybeService(svc: k8s.V1Service | null, namespace: string, servicePort: number): Promise<number> {
+// use, never a named one needing resolution in the first place.
+export async function resolveTargetPortMaybeService(svc: k8s.V1Service | null, namespace: string, servicePort: number): Promise<number> {
   return svc ? resolveTargetPortFromService(svc, namespace, servicePort) : servicePort
 }
 
 // Resolves the pod port for a given service port. Named targetPorts (e.g.
-// "http") are resolved by inspecting containerPorts of the service's pods —
+// "http") are resolved by inspecting containerPorts of the service's pods:
 // falling back to the service port would allow the wrong port in the policy.
 async function resolveTargetPortFromService(svc: k8s.V1Service, namespace: string, servicePort: number): Promise<number> {
   const svcName = svc.metadata?.name ?? ''
@@ -259,7 +266,7 @@ export async function listNetworkPolicies(allPolicies = false): Promise<NetworkP
     labelSel ? { labelSelector: labelSel } : undefined
   )
 
-  return list.items.map((p: k8s.V1NetworkPolicy) => {
+  const result = list.items.map((p: k8s.V1NetworkPolicy) => {
     const labels = p.metadata?.labels ?? {}
     const managed = labels['managed-by'] === MANAGED_BY
     const spec = p.spec!
@@ -314,16 +321,25 @@ export async function listNetworkPolicies(allPolicies = false): Promise<NetworkP
       } satisfies NetworkPolicyInfo
     }
   })
+
+  // Live K8s state is unaffected by write mode either way: floodgate never
+  // writes there directly under GitOps, but ArgoCD still does, so `result`
+  // above is already accurate live state regardless of mode. Only the
+  // sync_status merge (what's pending ArgoCD vs already applied) is
+  // GitOps-specific: see k8s-gitops.ts's mergeGitSyncStatus.
+  if (getWriteMode() === 'gitops') return mergeGitSyncStatus(result)
+  return result
 }
 
 export async function createNetworkPolicy(req: CreatePolicyRequest): Promise<NetworkPolicyInfo> {
+  if (getWriteMode() === 'gitops') return createNetworkPolicyViaGit(req)
   const [srcSelector, dst] = await Promise.all([
     resolvePodSelector(req.src_workload, req.src_namespace),
     resolveWorkload(req.dst_service, req.dst_namespace),
   ])
   const dstSelector = dst.selector
 
-  // A ranged port (endPort) has no single Service port to resolve against —
+  // A ranged port (endPort) has no single Service port to resolve against:
   // skip resolution for it and match the raw range directly on the pod.
   const resolvedPorts = await Promise.all(
     req.dst_ports.map(async ps => ps.endPort !== undefined
@@ -389,6 +405,7 @@ export async function createNetworkPolicy(req: CreatePolicyRequest): Promise<Net
 }
 
 export async function createEgressNetworkPolicy(req: CreatePolicyRequest): Promise<NetworkPolicyInfo> {
+  if (getWriteMode() === 'gitops') return createEgressNetworkPolicyViaGit(req)
   const [srcSelector, dst] = await Promise.all([
     resolvePodSelector(req.src_workload, req.src_namespace),
     resolveWorkload(req.dst_service, req.dst_namespace),
@@ -462,6 +479,7 @@ export async function createEgressNetworkPolicy(req: CreatePolicyRequest): Promi
 }
 
 export async function createRestrictPolicy(req: RestrictPolicyRequest): Promise<NetworkPolicyInfo> {
+  if (getWriteMode() === 'gitops') return createRestrictPolicyViaGit(req)
   const svcSelector = await resolvePodSelector(req.service_name, req.namespace)
   const policyType = `restrict-${req.direction}` as 'restrict-ingress' | 'restrict-egress'
   const policyName = sanitizeK8sName(`floodgate-restrict-${req.direction}-${req.service_name}`)
@@ -515,12 +533,44 @@ export async function createRestrictPolicy(req: RestrictPolicyRequest): Promise<
 }
 
 export async function deleteNetworkPolicy(namespace: string, name: string): Promise<void> {
+  if (getWriteMode() === 'gitops') return deleteNetworkPolicyViaGit(namespace, name)
   await networking.deleteNamespacedNetworkPolicy({ name, namespace })
+}
+
+// Only for "apagar todas" (DELETE /api/networkpolicies): every other
+// delete path still goes through deleteNetworkPolicy() above one at a
+// time, on purpose (a single accidental/adopted policy failing to delete
+// shouldn't block others). In GitOps mode this batches into ONE commit
+// (deleteNetworkPoliciesBatchViaGit) instead of N, same all-or-nothing
+// semantics as any single commit: either every file is removed or the
+// thrown error means none were. Direct mode keeps today's best-effort
+// per-policy behavior (each K8s API call can fail independently; no
+// "commit" to batch there anyway).
+export async function deleteNetworkPoliciesBatch(
+  policies: Array<{ namespace: string; name: string }>,
+): Promise<{ succeeded: Array<{ namespace: string; name: string }>; failures: string[] }> {
+  if (policies.length === 0) return { succeeded: [], failures: [] }
+  if (getWriteMode() === 'gitops') {
+    await deleteNetworkPoliciesBatchViaGit(policies)
+    return { succeeded: policies, failures: [] }
+  }
+  const succeeded: Array<{ namespace: string; name: string }> = []
+  const failures: string[] = []
+  for (const p of policies) {
+    try {
+      await networking.deleteNamespacedNetworkPolicy({ name: p.name, namespace: p.namespace })
+      succeeded.push(p)
+    } catch (e) {
+      failures.push(`${p.namespace}/${p.name}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+  return { succeeded, failures }
 }
 
 export async function patchNetworkPolicyPort(
   namespace: string, name: string, newPorts: Array<{ port: number; protocol: 'TCP' | 'UDP' | 'SCTP'; endPort?: number }>,
 ): Promise<NetworkPolicyInfo> {
+  if (getWriteMode() === 'gitops') return patchNetworkPolicyPortViaGit(namespace, name, newPorts)
   const existing = await networking.readNamespacedNetworkPolicy({ name, namespace })
   const labels = existing.metadata?.labels ?? {}
   const policyType = labels['floodgate-policy-type'] ?? 'allow'
@@ -563,7 +613,8 @@ export async function createNamespaceIngressPolicy(req: {
   dst_namespace: string
   dst_port: number
 }): Promise<NetworkPolicyInfo> {
-  // One lookup instead of two — resolvePodSelector + resolveTargetPort used
+  if (getWriteMode() === 'gitops') return createNamespaceIngressPolicyViaGit(req)
+  // One lookup instead of two: resolvePodSelector + resolveTargetPort used
   // to each independently try to fetch the same Service.
   const dst = await resolveWorkload(req.dst_service, req.dst_namespace)
   const dstSelector = dst.selector
@@ -614,13 +665,14 @@ export async function createNamespaceIngressPolicy(req: {
 }
 
 // One namespace-wide restrict policy (podSelector: {} = all pods, including
-// ones with no Service in front of them — broader than createRestrictPolicy,
+// ones with no Service in front of them, broader than createRestrictPolicy,
 // which is scoped to a single service's selector). Deterministic name, fixed
 // empty-deny spec, so re-creating it is always a no-op: a 409 just means the
 // desired state already exists, not a conflict to resolve via replace.
 export async function createNamespaceRestrictPolicy(
   namespace: string, direction: 'ingress' | 'egress'
 ): Promise<{ name: string; namespace: string; created: boolean }> {
+  if (getWriteMode() === 'gitops') return createNamespaceRestrictPolicyViaGit(namespace, direction)
   const policyName = sanitizeK8sName(`floodgate-ns-deny-${direction}-${namespace}`)
   const policyType = `restrict-${direction}` as 'restrict-ingress' | 'restrict-egress'
   const spec: k8s.V1NetworkPolicySpec = {
@@ -656,6 +708,7 @@ export async function createNamespaceRestrictPolicy(
 }
 
 export async function isolateNamespace(req: IsolateNamespaceRequest): Promise<{ created: number; skipped: number }> {
+  if (getWriteMode() === 'gitops') return isolateNamespaceViaGit(req)
   let created = 0, skipped = 0
   const directions: ('ingress' | 'egress')[] = req.direction === 'both' ? ['ingress', 'egress'] : [req.direction]
 
@@ -757,6 +810,7 @@ export async function isolateNamespace(req: IsolateNamespaceRequest): Promise<{ 
 }
 
 export async function createCidrPolicy(req: CidrPolicyRequest): Promise<NetworkPolicyInfo> {
+  if (getWriteMode() === 'gitops') return createCidrPolicyViaGit(req)
   const { namespace, service_name, cidr, except, dst_ports, direction } = req
 
   const podSelector = service_name ? await resolvePodSelector(service_name, namespace) : {}
@@ -813,11 +867,11 @@ export async function previewPolicyYAML(
   direction: 'ingress' | 'egress' | 'both',
 ): Promise<string> {
   // A CIDR-shaped request (internet-bound flows, or the CIDR creation form)
-  // has no real dst Service/workload to resolve — req.dst_service here is
+  // has no real dst Service/workload to resolve: req.dst_service here is
   // the SOURCE-side workload the policy's podSelector scopes to (mirrors
   // applyDraft()'s dst_cidr handling: dst_namespace/dst_service double as
   // the policy's own namespace/service_name for a CIDR policy). Preview-only
-  // YAML, so `from`/`to` use the real K8s API field name directly — no need
+  // YAML, so `from`/`to` use the real K8s API field name directly: no need
   // for the `_from` workaround createCidrPolicy() uses to satisfy the
   // @kubernetes/client-node model's serializer.
   if (req.dst_cidr) {
@@ -878,7 +932,7 @@ export async function previewPolicyYAML(
     'target-port': String(firstPort),
   }
 
-  // Must mirror createNetworkPolicy / createEgressNetworkPolicy exactly —
+  // Must mirror createNetworkPolicy / createEgressNetworkPolicy exactly:
   // this YAML is what reviewers approve.
   if (direction === 'ingress' || direction === 'both') {
     docs.push({
@@ -922,6 +976,7 @@ export async function previewPolicyYAML(
 }
 
 export async function getPolicyYAML(namespace: string, name: string): Promise<string> {
+  if (getWriteMode() === 'gitops') return getPolicyYAMLViaGit(namespace, name)
   const policy = await networking.readNamespacedNetworkPolicy({ name, namespace })
   const clean = {
     apiVersion: 'networking.k8s.io/v1',
@@ -937,6 +992,7 @@ export async function getPolicyYAML(namespace: string, name: string): Promise<st
 }
 
 export async function applyPolicyYAML(namespace: string, yamlStr: string): Promise<void> {
+  if (getWriteMode() === 'gitops') return applyPolicyYAMLViaGit(namespace, yamlStr)
   const policy = yaml.load(yamlStr) as k8s.V1NetworkPolicy
   try {
     await networking.createNamespacedNetworkPolicy({ namespace, body: policy })
@@ -974,6 +1030,11 @@ export async function adoptPolicy(
     'target-port':           String(detected.targetPort),
   }
 
+  // The object isn't tracked in git yet (it wasn't managed until this call),
+  // so the read above is unavoidably live either way: only the final
+  // persist step differs by mode. See k8s-gitops.ts's adoptPolicyViaGit.
+  if (getWriteMode() === 'gitops') return adoptPolicyViaGit(policy)
+
   const updated = await networking.replaceNamespacedNetworkPolicy({ name, namespace, body: policy })
   const clean = {
     apiVersion: 'networking.k8s.io/v1',
@@ -989,6 +1050,7 @@ export async function adoptPolicy(
 }
 
 export async function unadoptPolicy(namespace: string, name: string): Promise<void> {
+  if (getWriteMode() === 'gitops') return unadoptPolicyViaGit(namespace, name)
   const policy = await networking.readNamespacedNetworkPolicy({ name, namespace })
 
   if (policy.metadata?.labels) {
@@ -1001,26 +1063,27 @@ export async function unadoptPolicy(namespace: string, name: string): Promise<vo
   await networking.replaceNamespacedNetworkPolicy({ name, namespace, body: policy })
 }
 
+// Goes through listNetworkPolicies() + getPolicyYAML() (both already
+// dispatch on WRITE_MODE) instead of reading the K8s API directly, unlike
+// this function used to. Reading live only meant that, under GitOps, a
+// policy already committed to git but not yet synced by ArgoCD
+// (sync_status 'pending_argocd') was silently missing from the export:
+// no error, no indication anything was left out, just fewer documents
+// than policies that actually exist. getPolicyYAML() itself already
+// switches to reading the git file for exactly that case.
 export async function exportManagedPoliciesYAML(): Promise<string> {
-  const list = await networking.listNetworkPolicyForAllNamespaces(
-    { labelSelector: `managed-by=${MANAGED_BY}` }
-  )
+  const managed = (await listNetworkPolicies(false)).filter(p => p.managed)
+  if (managed.length === 0) return '# Nenhuma NetworkPolicy gerenciada encontrada\n'
 
-  if (list.items.length === 0) return '# Nenhuma NetworkPolicy gerenciada encontrada\n'
-
-  return list.items.map((p: k8s.V1NetworkPolicy) => {
-    const clean = {
-      apiVersion: 'networking.k8s.io/v1',
-      kind: 'NetworkPolicy',
-      metadata: {
-        name: p.metadata?.name,
-        namespace: p.metadata?.namespace,
-        labels: p.metadata?.labels,
-      },
-      spec: yamlSafeSpec(p.spec),
+  const docs = await Promise.all(managed.map(async p => {
+    try {
+      return await getPolicyYAML(p.namespace, p.name)
+    } catch (e) {
+      console.error(`[floodgate] exportManagedPoliciesYAML: falha ao ler ${p.namespace}/${p.name}, pulando esta entrada:`, e)
+      return null
     }
-    return yaml.dump(clean, { lineWidth: -1 })
-  }).join('---\n')
+  }))
+  return docs.filter((d): d is string => d !== null).join('---\n')
 }
 
 export async function checkHubbleRelayReady(): Promise<boolean> {

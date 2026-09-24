@@ -173,6 +173,15 @@ configmap:
   configMapName: floodgate-config
   data:
     DB_PATH: /data/floodgate.db
+    # Dois valores possíveis, nenhum outro é válido:
+    #   direct = floodgate escreve a NetworkPolicy direto na API do K8s.
+    #   gitops = floodgate só faz commit num repo git; quem aplica de
+    #            verdade no cluster é o ArgoCD (ou outro operador GitOps)
+    #            observando esse repo. Sem esse operador rodando, nada é
+    #            aplicado de verdade, mesmo que o floodgate mostre sucesso.
+    # Também controla o RBAC (rbac.yaml): gitops tira os verbos de escrita
+    # de networkpolicies do ClusterRole sozinho.
+    WRITE_MODE: gitops
 
 # Secret to be injected via envFrom
 # JWT_SECRET must be created manually before deploy:
@@ -202,14 +211,18 @@ rbac:
       verbs: ["get", "list", "watch"]
     - apiGroups: ["apps"]
       # Fallback tiers of resolvePodSelector (src/lib/k8s.ts): a source
-      # workload with no Service (e.g. a queue worker, only ever makes
-      # outbound connections) is looked up here instead, by exact name —
+      # workload with no Service (e.g. a queue worker that only ever makes
+      # outbound connections) is looked up here instead, by exact name.
       # "get" only, no "list"/"watch" needed.
       resources: ["deployments", "statefulsets", "daemonsets"]
       verbs: ["get"]
-    - apiGroups: ["networking.k8s.io"]
-      resources: ["networkpolicies"]
-      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    # networkpolicies write verbs are NOT here. templates/rbac.yaml grants
+    # them in a separate, dedicated block, gated by configmap.data.WRITE_MODE
+    # (the same value that decides the app's own write path) instead of a
+    # second flag that could drift out of sync with it. WRITE_MODE: gitops
+    # means this ClusterRole never gets create/update/patch/delete on
+    # networkpolicies, full stop: an infrastructure guarantee, not just an
+    # app-level check.
 
 # PersistentVolumeClaim for SQLite database
 pvc:

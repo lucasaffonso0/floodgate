@@ -150,6 +150,20 @@ function initDb(): DbType {
       PRIMARY KEY (namespace, name)
     );
 
+    -- GitOps mode only: tracks a commitPolicyFiles() write while it's in
+    -- flight (fetch + reset + commit + push can take several real seconds
+    -- over SSH). Persisted, not just in-memory React state, so a page
+    -- reload mid-write still shows "aplicando/removendo" instead of the
+    -- item just disappearing until the write finishes. Row is deleted the
+    -- moment the write settles, success or failure.
+    CREATE TABLE IF NOT EXISTS gitops_pending_ops (
+      namespace TEXT NOT NULL,
+      name TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('apply','delete')),
+      started_at TEXT DEFAULT (datetime('now')),
+      PRIMARY KEY (namespace, name)
+    );
+
     CREATE TABLE IF NOT EXISTS discovered_flows (
       id           TEXT PRIMARY KEY,
       src_workload  TEXT NOT NULL,

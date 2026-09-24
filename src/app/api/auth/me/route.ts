@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
 import { getDb } from '@/lib/db'
+import { getWriteMode } from '@/lib/writeMode'
 
 export async function GET() {
   const user = await getCurrentUser()
@@ -17,5 +18,6 @@ export async function GET() {
     ...row,
     must_change_password: row.must_change_password === 1,
     allowed_namespaces: perms.map(p => p.namespace),
+    write_mode: getWriteMode(),
   })
 }

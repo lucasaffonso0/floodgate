@@ -3,7 +3,7 @@ import type {
   ServiceInfo, NetworkPolicyInfo, CreatePolicyRequest, NamespaceIngressRequest,
   PortSpec, AppConfig, User, AuditLog, ApprovalRequest, SecurityCoverage, NamespacePermission,
   ServiceLayout, AutosyncStatus, CiliumFlowsResponse, CiliumFlowSummary, CidrPolicyRequest,
-  BackupStatus, BackupResult,
+  BackupStatus, BackupResult, GitOpsConfig,
 } from '@/types'
 
 const api = axios.create({ baseURL: '/api' })
@@ -193,6 +193,32 @@ export const getBackupStatus = (): Promise<BackupStatus> =>
 export const triggerBackup = (): Promise<BackupResult> =>
   api.post('/backup').then(r => r.data)
 
+// ── GitOps ─────────────────────────────────────────────────────────────────
+export interface GitOpsConfigUpdate {
+  repo_url?: string
+  repo_branch?: string
+  repo_path?: string
+  commit_author_name?: string
+  commit_author_email?: string
+  ssh_private_key?: string
+  ssh_known_hosts?: string
+}
+
+export const getGitOpsConfig = (): Promise<GitOpsConfig> =>
+  api.get('/gitops-config').then(r => r.data)
+
+export interface GitOpsConnectionTest { ok: boolean; error?: string }
+export interface GitOpsConfigSaveResult extends GitOpsConfig { connection_test: GitOpsConnectionTest }
+
+export const saveGitOpsConfig = (update: GitOpsConfigUpdate): Promise<GitOpsConfigSaveResult> =>
+  api.put('/gitops-config', update).then(r => r.data)
+
+// Manual trigger for the periodic background repo refresh (git.ts,
+// scheduler-driven every few minutes): lets an admin see an externally
+// made change reflected right away instead of waiting out that interval.
+export const syncGitOpsRepo = (): Promise<GitOpsConnectionTest> =>
+  api.post('/gitops-config/sync').then(r => r.data)
+
 // ── Cilium Auto-Discover ───────────────────────────────────────────────────
 export const getCiliumFlows = (): Promise<CiliumFlowsResponse> =>
   api.get('/cilium/flows').then(r => r.data)
@@ -220,7 +246,7 @@ export const previewDiscoveryPolicyYAML = (
   flow: CiliumFlowSummary,
   direction: 'ingress' | 'egress' | 'both' = 'ingress',
 ): Promise<string> => {
-  // internet-bound flows have no real dst Service to resolve — preview a
+  // internet-bound flows have no real dst Service to resolve, so preview a
   // CIDR egress policy instead, same shape draftForFlow() builds.
   const isInternet = flow.dst_namespace === 'internet'
   return api.post('/networkpolicies/preview', {

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { listNetworkPolicies, createNetworkPolicy, getPolicyYAML, deleteNetworkPolicy } from '@/lib/k8s'
+import { listNetworkPolicies, createNetworkPolicy, getPolicyYAML, deleteNetworkPoliciesBatch } from '@/lib/k8s'
 import { getCurrentUser, canManageNamespace } from '@/lib/auth'
 import { isNamespaceWatched } from '@/lib/config'
 import { apiError, parseBody, invalidPortsMessage } from '@/lib/api-helpers'
@@ -48,29 +48,19 @@ export async function POST(req: NextRequest) {
   }
 }
 
-// Permanently deletes every managed NetworkPolicy from the cluster — unlike
+// Permanently deletes every managed NetworkPolicy from the cluster: unlike
 // pause (POST .../pause), there's nothing saved to restore from afterward.
 export async function DELETE() {
   const user = await getCurrentUser()
   if (!user || user.role !== 'admin') return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
   try {
     const policies = await listNetworkPolicies(false)
-    let deletedCount = 0
-    const failures: string[] = []
-    for (const p of policies) {
-      try {
-        await deleteNetworkPolicy(p.namespace, p.name)
-        removeManagedPolicy(p.namespace, p.name)
-        deletedCount++
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e)
-        console.error(`[floodgate] failed to delete policy ${p.namespace}/${p.name}:`, msg)
-        failures.push(`${p.namespace}/${p.name}: ${msg}`)
-      }
-    }
-    logAudit({ user_id: user.sub, username: user.username, action: 'delete_all_policies', details: `${deletedCount} policies deleted, ${failures.length} failed` })
+    const { succeeded, failures } = await deleteNetworkPoliciesBatch(policies.map(p => ({ namespace: p.namespace, name: p.name })))
+    for (const p of succeeded) removeManagedPolicy(p.namespace, p.name)
+    if (failures.length > 0) console.error(`[floodgate] failed to delete ${failures.length} polic(ies):`, failures)
+    logAudit({ user_id: user.sub, username: user.username, action: 'delete_all_policies', details: `${succeeded.length} policies deleted, ${failures.length} failed` })
     emit({ type: 'policy_deleted' })
-    return NextResponse.json({ deleted: deletedCount, failed: failures.length, failures })
+    return NextResponse.json({ deleted: succeeded.length, failed: failures.length, failures })
   } catch (e) {
     return apiError(e, 'Falha ao apagar policies')
   }

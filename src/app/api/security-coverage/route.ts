@@ -6,6 +6,7 @@ import { logAudit } from '@/lib/audit'
 import { getDb } from '@/lib/db'
 import { trackIsolatedPolicies } from '@/lib/autosync'
 import { getNamespaceIsolation } from '@/lib/nsIsolation'
+import { getWriteMode } from '@/lib/writeMode'
 import type { SecurityCoverage } from '@/types'
 
 const SELF_NAMESPACE = 'floodgate'
@@ -27,7 +28,7 @@ export async function GET() {
   // Don't apply auto-deny while policies are paused: cluster is intentionally empty
   const isPaused = (getDb().prepare('SELECT COUNT(*) as n FROM saved_policies').get() as { n: number }).n > 0
 
-  // Namespaces present when scope was last switched to future_only — skip
+  // Namespaces present when scope was last switched to future_only: skip
   // auto-apply for them entirely (they're the "already existing" set).
   const baseline = cfg.auto_default_deny_scope === 'future_only' ? new Set(getAutoDefaultDenyBaseline()) : null
 
@@ -49,13 +50,18 @@ export async function GET() {
     // Auto-apply only runs for admins: GET must stay side-effect-free for
     // read-only roles (viewer/audit), which the middleware does not block.
     // future_only scope: skip namespaces that were already around when that
-    // mode was last turned on — coverage is still reported, just not touched.
-    if (cfg.auto_default_deny_enabled && !isPaused && user.role === 'admin' && !baseline?.has(ns)) {
+    // mode was last turned on: coverage is still reported, just not touched.
+    // Under GitOps, this automatic trigger is disabled entirely, since an
+    // unconditional, unreviewed commit firing from inside a GET handler
+    // doesn't fit GitOps's deliberate-change model.
+    // Manual isolation (the Segurança tab's "Isolar" button) is unaffected:
+    // it still calls isolateNamespace(), which already routes to git.
+    if (cfg.auto_default_deny_enabled && !isPaused && user.role === 'admin' && !baseline?.has(ns) && getWriteMode() !== 'gitops') {
       const dir = cfg.auto_default_deny_direction
       const allowIntra = cfg.auto_default_deny_allow_intra
       const allowInternet = cfg.auto_default_deny_allow_internet
       // Re-run whenever the base deny OR any configured extra is still
-      // missing — isolateNamespace() is idempotent per-policy (409 → skip),
+      // missing: isolateNamespace() is idempotent per-policy (409 → skip),
       // so calling it again just fills in whatever's absent without
       // touching what's already there. Otherwise turning on "permitir
       // tráfego interno"/"internet" after a namespace was already denied
