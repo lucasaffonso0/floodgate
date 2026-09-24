@@ -220,17 +220,28 @@ const DOT_TITLE: Record<DotStatus, { in: string; out: string }> = {
 }
 
 function ServiceNodeComponent({ data, selected }: NodeProps) {
-  const d = data as { name: string; ports: Array<{ port: number }>; ingressStatus: DotStatus; egressStatus: DotStatus }
+  const d = data as { name: string; ports: Array<{ port: number }>; ingressStatus: DotStatus; egressStatus: DotStatus; pendingSync?: boolean }
   const portList = d.ports.slice(0, 3).map(p => p.port).join(', ')
   const handleColor = (status: DotStatus) => status === 'open' ? undefined : DOT_STYLE[status].border
   return (
     <div style={{
+      position: 'relative',
       background: selected ? '#eff6ff' : 'white',
-      border: `2px solid ${selected ? '#3b82f6' : '#cbd5e1'}`,
+      border: `2px ${d.pendingSync ? 'dashed' : 'solid'} ${selected ? '#3b82f6' : d.pendingSync ? '#f59e0b' : '#cbd5e1'}`,
       borderRadius: 8, padding: '6px 10px', width: NODE_W, boxSizing: 'border-box',
       boxShadow: selected ? '0 0 0 3px #bfdbfe' : '0 1px 4px rgba(0,0,0,0.08)',
       transition: 'all 0.15s',
     }}>
+      {d.pendingSync && (
+        <span title="Uma ou mais políticas deste serviço aguardam sincronização do ArgoCD"
+          style={{
+            position: 'absolute', top: -7, right: -7, fontSize: 8, fontWeight: 700,
+            color: '#b45309', background: '#fffbeb', border: '1px solid #f59e0b',
+            borderRadius: 999, padding: '1px 5px', lineHeight: 1.4, whiteSpace: 'nowrap',
+          }}>
+          ⏳
+        </span>
+      )}
       <Handle type="target" position={Position.Left} style={{ background: handleColor(d.ingressStatus) ?? '#94a3b8', width: 10, height: 10 }} />
       <div title={d.name} style={{ fontSize: 12, fontWeight: 700, color: '#1e293b', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{d.name}</div>
       {portList && <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>:{portList}</div>}
@@ -289,11 +300,11 @@ const TREE_COL_GAP = 130, TREE_ROW_GAP = 70
 // Used instead of a boolean overlap test to decide live drag-reorder swaps:
 // node width (160) is much bigger than the grid gap (20), so a plain "any
 // overlap" test stays true for both a sibling's old slot and its new
-// (post-swap) slot at once when they're adjacent — the cursor doesn't have
+// (post-swap) slot at once when they're adjacent: the cursor doesn't have
 // to move far to re-trigger the swap in the opposite direction, which reads
 // as flicker. Requiring most of the area to be covered means the cursor has
 // to travel past the slot's midpoint to swap, and just as far back to undo
-// it — a real dead zone instead of a hair-trigger boundary.
+// it: a real dead zone instead of a hair-trigger boundary.
 function overlapFraction(
   a: { x: number; y: number; w: number; h: number },
   b: { x: number; y: number; w: number; h: number },
@@ -350,7 +361,7 @@ function computeNamespaceTreeLayout(
 ): Map<string, { x: number; y: number }> {
   // Layered graph layout (rank assignment, cycle breaking, multi-pass
   // crossing minimization, dummy nodes for edges spanning multiple ranks)
-  // is a well-solved problem — dagre is the layout engine React Flow's own
+  // is a well-solved problem: dagre is the layout engine React Flow's own
   // examples use for exactly this, so we hand it off instead of maintaining
   // a hand-rolled version of the same algorithm.
   const nsSet = new Set(namespaces)
@@ -373,7 +384,7 @@ function computeNamespaceTreeLayout(
   }
   for (const p of policies) addEdge(p.src_namespace, p.namespace)
   for (const d of drafts)   addEdge(d.src_namespace, d.dst_namespace)
-  // Real observed traffic counts too — without it, namespaces with no
+  // Real observed traffic counts too: without it, namespaces with no
   // policy yet (only Hubble flows) have no edges at all and collapse into
   // a single rank/column, disconnected from the lines actually drawn.
   for (const f of ciliumFlows) addEdge(f.src_namespace, f.dst_namespace)
@@ -391,9 +402,9 @@ function computeNamespaceTreeLayout(
 
   // A line between two connected namespaces is drawn straight from center to
   // center. If an unrelated namespace's box happens to sit near that straight
-  // path, the line cuts right through it. Detect that directly — for every
+  // path, the line cuts right through it. Detect that directly: for every
   // namespace-pair edge, check every other box against the segment between
-  // the two endpoints — and nudge the box vertically until it's clear,
+  // the two endpoints, and nudge the box vertically until it's clear,
   // iterating since one nudge can create a new conflict with another edge.
   const rectOf = (ns: string) => {
     const pos = positions.get(ns)!
@@ -435,7 +446,7 @@ function computeNamespaceTreeLayout(
     if (!moved) break
   }
 
-  // Nudging boxes away from lines can push two of them into each other —
+  // Nudging boxes away from lines can push two of them into each other;
   // separate any that now overlap.
   for (let i = 0; i < namespaces.length; i++) {
     for (let j = i + 1; j < namespaces.length; j++) {
@@ -480,7 +491,7 @@ function buildGraph(
   showInternetTraffic = false,
 ): { nodes: Node[]; edges: BuiltInEdge[] } {
   // 'internet' is a synthetic pseudo-namespace (see hubble.ts's reserved:world
-  // handling) — it never appears in the real namespace list a user hides/shows
+  // handling): it never appears in the real namespace list a user hides/shows
   // from, so it can never be a member of visibleNamespaces even when the user
   // hasn't hidden anything else. Exempt it, or it's unconditionally filtered
   // out the moment visibleNamespaces is non-empty, regardless of showInternetTraffic.
@@ -492,10 +503,10 @@ function buildGraph(
   )
 
   // Modo Rascunho: preview the graph as if the current drafts had been
-  // applied — same computeEffectivePolicies() the Rascunhos tab's impact
+  // applied: same computeEffectivePolicies() the Rascunhos tab's impact
   // warning already uses, so the two always agree. No-op (effectivePolicies
   // === policies) outside Modo Rascunho or with no pending drafts. Gated on
-  // drafts.length, not on whether anything got fabricated — a 'toggle'
+  // drafts.length, not on whether anything got fabricated: a 'toggle'
   // 'disable' draft legitimately adds zero fabricated policies (its effect
   // is excluding a real one instead) but still needs the preview to engage.
   const hasDraftPreview = draftMode && drafts.length > 0
@@ -519,17 +530,17 @@ function buildGraph(
 
   // Virtual/synthetic namespace nodes (e.g. 'internet', or any workload
   // namespace Hubble discovers with no matching K8s Service) never appear
-  // in nsMap — it's built only from `services`. Without this set, the
+  // in nsMap: it's built only from `services`. Without this set, the
   // stale-position cleanup right below would delete a saved/dragged
   // position for one of these on every single buildGraph() call, since it
-  // only knows about "namespaces with Services" as ever being legitimate —
+  // only knows about "namespaces with Services" as ever being legitimate,
   // so a virtual namespace's position could never survive a rebuild and
   // always fell back to its auto-computed default. Built from the raw
   // ciliumFlows param, not the showInternetTraffic/showFlowEdges-filtered
   // visibleFlows: a position must survive even while its flows are
   // currently hidden by a toggle (e.g. the DB position for 'internet'
   // arrives and gets applied before the user has switched the toggle on
-  // for this session) — otherwise it gets garbage-collected in that
+  // for this session), otherwise it gets garbage-collected in that
   // window and the toggle turning on later has nothing saved to use.
   const virtualNsCandidates = new Set<string>()
   for (const f of ciliumFlows) {
@@ -551,7 +562,7 @@ function buildGraph(
   }
 
   // Order services within each namespace box by the average X position of
-  // the OTHER namespaces they connect to — same barycenter idea as the
+  // the OTHER namespaces they connect to: same barycenter idea as the
   // namespace columns above, one level deeper. Services with similar
   // connections end up next to each other instead of scattered across the
   // grid, so their edges converge on one side of the box instead of fanning
@@ -589,19 +600,29 @@ function buildGraph(
   let autoIdx = 0
 
   // Per-service node dot: reuses explainAccess() so it agrees with the "?"
-  // explain panel — 'isolated'/'isolated-exc' (an actual restrict-ingress/
+  // explain panel: 'isolated'/'isolated-exc' (an actual restrict-ingress/
   // egress applies, service- or namespace-scoped; -exc when some exception
   // still lets a specific source through), 'implicit' (no restrict at all,
   // but some allow-type policy selects this service, so Kubernetes
   // default-denies everyone else), or 'open' (nothing restricts this
   // direction).
   function serviceDotStatus(name: string, ns: string, direction: 'ingress' | 'egress'): DotStatus {
-    // effectivePolicies (real + drafts) when Modo Rascunho is previewing —
+    // effectivePolicies (real + drafts) when Modo Rascunho is previewing:
     // same "as if applied" logic as the flow edges below.
     const r = explainAccess(name, ns, direction, effectivePolicies)
     if (!r.blocked) return 'open'
     if (r.scope === 'none') return 'implicit'
     return r.exceptions.length > 0 ? 'isolated-exc' : 'isolated'
+  }
+
+  // GitOps mode only (sync_status is undefined otherwise): any policy
+  // touching this service, in either direction, that hasn't been
+  // confirmed live by ArgoCD yet.
+  function hasPendingSync(name: string, ns: string): boolean {
+    return policies.some(p =>
+      p.sync_status && p.sync_status !== 'applied' &&
+      ((p.dst_service === name && p.namespace === ns) || (p.src_workload === name && p.src_namespace === ns))
+    )
   }
   // Namespace-wide isolation: restrict policy with empty dst_service (podSelector: {})
   const nsIsolatedIngress = new Set(
@@ -645,8 +666,8 @@ function buildGraph(
 
     // Resolve every service's slot before building any node. A saved custom
     // position (from a past drag) can coincidentally collide with another
-    // service's freshly-computed default grid slot — e.g. right after
-    // autosync discovers a brand-new, never-positioned service — so each
+    // service's freshly-computed default grid slot, e.g. right after
+    // autosync discovers a brand-new, never-positioned service, so each
     // candidate is checked against every slot already resolved in this
     // namespace and nudged to the next free default slot on collision.
     // Two services must never render on top of one another.
@@ -710,6 +731,7 @@ function buildGraph(
           name: svc.name, namespace: ns, ports: svc.ports,
           ingressStatus: serviceDotStatus(svc.name, ns, 'ingress'),
           egressStatus: serviceDotStatus(svc.name, ns, 'egress'),
+          pendingSync: hasPendingSync(svc.name, ns),
         },
         draggable: !globalLocked && !nsLocked && svcs.length > 1,
         zIndex: 10,
@@ -739,11 +761,11 @@ function buildGraph(
         if (ignoredNamespaces.includes(namespace)) continue
         seen.add(nsId)
 
-        // A internet nunca ganha um nó-filho por IP — um serviço falando
+        // A internet nunca ganha um nó-filho por IP: um serviço falando
         // com dezenas de IPs distintos criaria dezenas de nós dentro da
         // caixa, exatamente a poluição que esse recurso existe pra evitar.
         // Sem nó de workload pra um IP, resolveNodeId() cai de volta pro
-        // nó do próprio namespace (`ns::internet`) — o que já agrega toda
+        // nó do próprio namespace (`ns::internet`), que já agrega toda
         // aresta de fluxo por origem automaticamente, sem lógica extra.
         const isInternet = namespace === 'internet'
 
@@ -787,7 +809,7 @@ function buildGraph(
           },
           draggable: !globalLocked,
           // Every internet-bound edge converges on this one small box (by
-          // design — that's the aggregation), so flow edges (zIndex 15)
+          // design, that's the aggregation), so flow edges (zIndex 15)
           // would otherwise blanket its entire draggable area and steal the
           // pointerdown before it reaches the node underneath. Any other
           // namespace box spreads incoming edges across a much bigger
@@ -976,7 +998,7 @@ function buildGraph(
   for (const [pairKey, { flow, srcId, dstId, ports }] of flowPairMap) {
     const reallyDropped = flow.verdict === 'DROPPED'
     // Modo Rascunho: mostra a linha como se os rascunhos atuais já tivessem
-    // sido aplicados, não o veredito real do Hubble — é exatamente o que o
+    // sido aplicados, não o veredito real do Hubble: é exatamente o que o
     // aviso de impacto da aba Rascunhos calcula, só que desenhado no grafo.
     const isDropped = hasDraftPreview ? isFlowBlocked(flow, effectivePolicies) : reallyDropped
     const previewChanged = hasDraftPreview && isDropped !== reallyDropped
@@ -1038,7 +1060,7 @@ function buildConnections(
       upsert(inbound, `${p.src_namespace}/${p.src_workload}`, `${p.src_workload} (${p.src_namespace})`, p.dst_port, 'policy')
     if (p.policy_type === 'allow-egress' && p.src_workload === name && p.src_namespace === ns) {
       // p.namespace here is the SOURCE namespace (egress policies live
-      // there), NOT the destination's — NetworkPolicyInfo has no field for
+      // there), NOT the destination's: NetworkPolicyInfo has no field for
       // it, so resolve it by looking up the real service instead of
       // mislabeling the destination with the source's own namespace.
       const dstNs = p.dst_service === 'internet' ? null : services.find(s => s.name === p.dst_service)?.namespace
@@ -1153,7 +1175,7 @@ function AccessSection({
             {blocked
               ? <button style={smallBtn(true)} onClick={onRemoveRestrict}>Remover default-deny</button>
               : draftBlocked
-                ? <span style={{ fontSize: 9, color: '#92400e' }}>Já há um rascunho pendente — veja a aba Rascunhos</span>
+                ? <span style={{ fontSize: 9, color: '#92400e' }}>Já há um rascunho pendente, veja a aba Rascunhos</span>
                 : (
                   <>
                     {isImplicitOnly && (
@@ -1220,7 +1242,7 @@ function ServiceDetailPanel({
 
   // Modo Rascunho: essa direção está liberada nas policies reais, mas um
   // isolate/restrict pendente (ainda não aplicado) vai bloqueá-la assim que
-  // for aplicado — sem isso o painel parecia "normal" mesmo com um rascunho
+  // for aplicado; sem isso o painel parecia "normal" mesmo com um rascunho
   // pendente pra esse exato serviço.
   const effectivePolicies = draftMode ? computeEffectivePolicies(policies, drafts) : policies
   const ingressDraftBlocked = !!draftMode && !ingressExplain.blocked && explainAccess(name, ns, 'ingress', effectivePolicies).blocked
@@ -1228,7 +1250,7 @@ function ServiceDetailPanel({
 
   // The allow-type policies causing an implicit lockdown (no restrict at
   // all, but Kubernetes default-denies everyone else once these select this
-  // service) — removing them is what "Remover bloqueio implícito" does.
+  // service). Removing them is what "Remover bloqueio implícito" does.
   const ingressAllows = policies.filter(p =>
     (p.policy_type === 'allow' || p.policy_type === 'allow-namespace' || p.policy_type === 'cidr-ingress') &&
     p.dst_service === name && p.namespace === ns)
@@ -1249,6 +1271,13 @@ function ServiceDetailPanel({
   }
 
   async function removeRestrict(policy: NetworkPolicyInfo) {
+    if (draftMode) {
+      onAddDraft?.({
+        kind: 'remove', remove_namespace: policy.namespace, remove_policy_names: [policy.name],
+        src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: 'both',
+      })
+      return
+    }
     await deleteNetworkPolicy(policy.namespace, policy.name)
     onPolicyChanged()
   }
@@ -1257,6 +1286,13 @@ function ServiceDetailPanel({
     if (allows.length === 0) return
     const names = allows.map(p => p.name).join(', ')
     if (!confirm(`Remover ${allows.length === 1 ? 'essa regra' : `essas ${allows.length} regras`} (${names})? Isso deixa "${name}" totalmente aberto nessa direção.`)) return
+    if (draftMode) {
+      onAddDraft?.({
+        kind: 'remove', remove_namespace: ns, remove_policy_names: allows.map(p => p.name),
+        src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: 'both',
+      })
+      return
+    }
     await Promise.all(allows.map(p => deleteNetworkPolicy(p.namespace, p.name)))
     onPolicyChanged()
   }
@@ -1340,12 +1376,12 @@ function FlowExplainPanel({ edge, policies, onClose, onExplainFlow, draftMode, o
   const dstName = dst?.name ?? normalizeWorkload(flow.dst_workload)
   const dstNs   = dst?.ns   ?? flow.dst_namespace
 
-  // "Exempt at dst" means ingress isn't what's blocking this flow — either
+  // "Exempt at dst" means ingress isn't what's blocking this flow: either
   // nothing restricts ingress here at all, or it does and this source is
   // specifically allowed through.
   const exemptAtDst = dstExplain ? (!dstExplain.blocked || sourceIsExempt(dstExplain.exceptions, srcNs, srcName, dstNs)) : false
 
-  // The destination allowing ingress isn't the whole story — the source
+  // The destination allowing ingress isn't the whole story: the source
   // namespace's own egress restrictions can block the flow independently.
   // Only worth computing once the destination side looks fine, since that's
   // the confusing case: "source is allowed in, so why is this dropped?"
@@ -1413,7 +1449,7 @@ function FlowExplainPanel({ edge, policies, onClose, onExplainFlow, draftMode, o
 
         {draftMode && onAddDraft && (() => {
           // Include the draft-fabricated policies here (not just the real
-          // ones) — a flow can be preview-blocked purely by an unapplied
+          // ones): a flow can be preview-blocked purely by an unapplied
           // isolate/restrict draft, and diagnosing direction against real
           // policies alone would default to "ingress" even when it's really
           // the source's egress being cut off by that draft.
@@ -1587,7 +1623,7 @@ function EditPolicyModal({
                   onChange={e => setPorts(prev => prev.map((p, j) => j === i ? { ...p, port: Math.min(65535, Math.max(1, parseInt(e.target.value) || 1)) } : p))}
                   style={{ flex: 1, border: '1px solid #cbd5e1', borderRadius: 6, padding: '6px 8px', fontSize: 13, boxSizing: 'border-box' }} />
                 <span style={{ fontSize: 9, color: '#94a3b8', flexShrink: 0 }}>até</span>
-                <input type="number" value={ps.endPort ?? ''} min={1} max={65535} placeholder="—"
+                <input type="number" value={ps.endPort ?? ''} min={1} max={65535} placeholder="-"
                   onChange={e => {
                     const v = e.target.value === '' ? undefined : Math.min(65535, Math.max(1, parseInt(e.target.value) || 1))
                     setPorts(prev => prev.map((p, j) => j === i ? { ...p, endPort: v } : p))
@@ -1663,11 +1699,11 @@ interface Props {
   ignoredNamespaces?: string[]
   visibleNamespaces?: Set<string>
   // Controlled from outside (e.g. the Segurança tab's "Isolar" button opens
-  // this same floating panel) — falls back to internal state when omitted.
+  // this same floating panel); falls back to internal state when omitted.
   selectedNamespace?: string | null
   onSelectNamespace?: (ns: string | null) => void
   // Lets the "Abrir na Descoberta" button inside FlowExplainPanel jump to
-  // that flow's card in the Descoberta tab — owned by page.tsx, which knows
+  // that flow's card in the Descoberta tab: owned by page.tsx, which knows
   // how to switch RightPanel's active tab.
   onExplainFlow?: (flowId: string) => void
   // Modo Rascunho: "Aplicar default-deny" no painel do serviço vira
@@ -1694,7 +1730,7 @@ function LayoutToolbar({
   // only the hook version resolves that via the internal nodeLookup to give
   // correct absolute bounds.
   const { fitView, getNodes, getNodesBounds } = useReactFlow()
-  // Reactive count, unlike getNodes() above — lets the button disable itself
+  // Reactive count, unlike getNodes() above: lets the button disable itself
   // while the graph is still loading instead of silently doing nothing when
   // clicked too early (nodes.length === 0 right after navigating in).
   const nodeCount = useNodes().length
@@ -1711,7 +1747,7 @@ function LayoutToolbar({
       if (!viewportEl) return
       const bounds = getNodesBounds(nodes)
       // A large topology (many namespaces spread wide) can push the raw
-      // bounds well past what a browser's canvas will actually rasterize —
+      // bounds well past what a browser's canvas will actually rasterize:
       // Chrome caps a canvas at 16384px per side, and other browsers (Safari
       // in particular) cap the total pixel area much lower still. Past that
       // limit the canvas silently comes back blank instead of erroring, so
@@ -1977,7 +2013,7 @@ export default function NetworkGraph({
   const nsPaletteIdx = useRef<Map<string, number>>(new Map())
   const dragStartPos = useRef<Map<string, { x: number; y: number }>>(new Map())
   // Mirrors `nodes` for the drag handlers below. They must read fresh node
-  // data but stay referentially STABLE across renders (deps: []) — React
+  // data but stay referentially STABLE across renders (deps: []): React
   // Flow re-runs its own internal drag setup whenever onNodeDragStart /
   // onNodeDragStop change identity, and `nodes` updates on every pointermove
   // during a drag, so depending on `nodes` directly there tore down and
@@ -1991,12 +2027,12 @@ export default function NetworkGraph({
   const transitioning = useRef<Set<string>>(new Set())
   // Guards the auto-rebuild effects below from firing mid-drag. Those effects
   // re-run whenever live data changes identity (services/policies/cilium
-  // flows/etc — cilium flows in particular can update very frequently once
+  // flows/etc, cilium flows in particular can update very frequently once
   // Hubble is actually streaming), and a rebuild reconstructs every node's
   // position from the last DB-persisted layout. A drag's new position is
   // only persisted on drop, so a rebuild mid-drag would snap the dragged
   // node back to its old position and then jump back to the cursor on the
-  // next pointer move — a visible "goes back, then returns" flicker.
+  // next pointer move: a visible "goes back, then returns" flicker.
   const isDragging = useRef(false)
   const transitionClearTimers = useRef<ReturnType<typeof setTimeout>[]>([])
   useEffect(() => () => { transitionClearTimers.current.forEach(clearTimeout) }, [])
@@ -2015,7 +2051,7 @@ export default function NetworkGraph({
     )
     // buildGraph() always constructs fresh node objects, so ReactFlow's own
     // click-driven `selected` highlight (the box-shadow on the open node)
-    // doesn't survive a rebuild — it silently disappears on the next 15s
+    // doesn't survive a rebuild: it silently disappears on the next 15s
     // poll even though the detail panel is still open. Re-derive it here
     // from our own selection state instead of relying on ReactFlow's.
     const withSelection = n.map(node =>
@@ -2098,7 +2134,7 @@ export default function NetworkGraph({
         // Live reorder: while actively dragging, passing more than halfway
         // over a sibling bumps it into whichever slot the dragged node last
         // vacated, instead of waiting for drop to resolve the swap. The 50%
-        // threshold (not "any overlap") is what keeps this stable — see
+        // threshold (not "any overlap") is what keeps this stable: see
         // overlapFraction() above for why a boolean test flickers here.
         if (change.dragging) {
           const candidate = { x: clamped.x, y: clamped.y, w: NODE_W, h: NODE_H }
@@ -2190,9 +2226,9 @@ export default function NetworkGraph({
     if (node.id.startsWith('svc::')) {
       // If hovering over a sibling during the drag already bumped it into a
       // vacated slot (handleNodesChange), that slot is the dragged node's
-      // final home — ease into it rather than teleporting, since it can
+      // final home: ease into it rather than teleporting, since it can
       // differ from the exact point the cursor released at. Otherwise it was
-      // never dragged over anything — fall back to free placement, clamped
+      // never dragged over anything, so fall back to free placement, clamped
       // to the namespace box, no settle animation needed since it already
       // tracked the cursor exactly.
       const reorderedSlot = reorderSlot.current.get(node.id)
@@ -2219,7 +2255,7 @@ export default function NetworkGraph({
         ? { ...n, position: clamped, style: reorderedSlot ? { ...n.style, transition: 'transform 150ms ease-out' } : n.style }
         : n))
 
-      // A single drag gesture can bump more than one sibling on its way — persist
+      // A single drag gesture can bump more than one sibling on its way, so persist
       // every service in this namespace whose position actually changed, not just
       // the dragged one.
       const siblingsStart = dragSiblingsStart.current.get(node.id)
@@ -2239,7 +2275,7 @@ export default function NetworkGraph({
 
       // The transition styles applied during this gesture (bumped siblings,
       // plus the dragged node's own settle just above) need to actually play
-      // before being cleared — clearing them synchronously here, in the same
+      // before being cleared: clearing them synchronously here, in the same
       // update as the one that just set them, would strip the style before
       // the browser ever renders a frame with it. Give it a beat past the
       // 150ms duration, then clear so an unrelated later move (e.g. dragging
@@ -2257,7 +2293,7 @@ export default function NetworkGraph({
 
   const handleNodeClick = useCallback((_: React.MouseEvent, node: Node) => {
     if (node.id.startsWith('svc::')) { setSelectedNs(null); setSelectedNodeId(node.id) }
-    // 'internet' isn't a real namespace — no isolation/lock actions make
+    // 'internet' isn't a real namespace: no isolation/lock actions make
     // sense against it, and the namespace click-panel assumes a real one
     // (it can try to call isolateNamespace(), which would just fail
     // against a namespace that doesn't exist). The per-source breakdown of
@@ -2271,7 +2307,7 @@ export default function NetworkGraph({
     const dst = connection.target?.split('::')
     if (!src || !dst || src.length < 3 || dst.length < 3) return
     // A graph connection always creates a 'both'-direction draft, so both
-    // ends need to be manageable — not just the destination — otherwise
+    // ends need to be manageable, not just the destination, otherwise
     // the egress half silently fails to apply later (createEgressNetworkPolicy
     // checks src_namespace server-side) with no warning at draft-creation time.
     if (typeof canManageNamespace === 'function' && (!canManageNamespace(dst[1]) || !canManageNamespace(src[1]))) return
@@ -2285,7 +2321,7 @@ export default function NetworkGraph({
       const flow = edge.data.flow as CiliumFlowSummary
       // No Modo Rascunho, uma linha só fica vermelha por causa dos
       // rascunhos atuais (previewBlocked) mesmo sem ter sido dropada de
-      // verdade — precisa abrir o painel dos dois jeitos.
+      // verdade, precisa abrir o painel dos dois jeitos.
       if (flow.verdict === 'DROPPED' || edge.data?.previewBlocked) setSelectedFlowEdge(edge)
       return
     }
@@ -2358,7 +2394,7 @@ export default function NetworkGraph({
             {showFlowEdges && ciliumFlows?.some(f => f.dst_namespace === 'internet') && (
               <button
                 onClick={toggleInternetTraffic}
-                title="Mostra uma caixa 'Internet' agregada, com uma seta por serviço/namespace que fala com fora do cluster — sem um nó por IP, pra não poluir o grafo"
+                title="Mostra uma caixa 'Internet' agregada, com uma seta por serviço/namespace que fala com fora do cluster, sem um nó por IP, pra não poluir o grafo"
                 style={{
                   display: 'flex', alignItems: 'center', gap: 6, marginTop: 6,
                   padding: '5px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600,

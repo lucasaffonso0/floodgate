@@ -69,6 +69,7 @@ const DEFAULT_CONFIG: AppConfig = {
   autosync_interval_s: 60,
   hubble_discovery_enabled: false,
   hubble_flow_retention_days: 7,
+  hubble_internet_flow_retention_days: 1,
   backup_enabled: false,
   backup_cron: '0 3 * * *',
   backup_s3_bucket: '',
@@ -109,6 +110,15 @@ export default function App() {
   const [services, setServices] = useState<ServiceInfo[]>([])
   const [policies, setPolicies] = useState<NetworkPolicyInfo[]>([])
   const [allPolicies, setAllPolicies] = useState<NetworkPolicyInfo[]>([])
+  // Last-known-good snapshots for refresh()'s per-call .catch() fallbacks
+  // below: a transient failure on ONE of these reads (e.g. a GitOps write
+  // racing a concurrent read's file listing) must not blank out data the
+  // others already fetched successfully.
+  const servicesRef = useRef<ServiceInfo[]>([])
+  const policiesRef = useRef<NetworkPolicyInfo[]>([])
+  const allPoliciesRef = useRef<NetworkPolicyInfo[]>([])
+  const serviceLayoutRef = useRef<Awaited<ReturnType<typeof getServiceLayout>> | null>(null)
+  const hasLoadedOnce = useRef(false)
   const [allNamespaces, setAllNamespaces] = useState<string[]>([])
   const [visibleNamespaces, setVisibleNamespaces] = useState<Set<string>>(new Set())
   const [drafts, setDrafts] = useState<Draft[]>([])
@@ -127,7 +137,7 @@ export default function App() {
   const [layoutResetKey, setLayoutResetKey] = useState(0)
   const [layoutSaveStatus, setLayoutSaveStatus] = useState<'idle' | 'saving' | 'draft' | 'saved' | 'error'>('idle')
   // Default must match the server render (no localStorage access during the
-  // initial render) — reading it happens in the mount effect below, otherwise
+  // initial render); reading it happens in the mount effect below, otherwise
   // the server-rendered HTML and the client's first render disagree and React
   // throws a hydration mismatch (#418) whenever a user has saved 'false'.
   const [autosave, setAutosave] = useState<boolean>(true)
@@ -141,7 +151,7 @@ export default function App() {
   const [showApprovalToast, setShowApprovalToast] = useState(false)
   const [openPasswordModal, setOpenPasswordModal] = useState(false)
   const [requestTab, setRequestTab] = useState<'aprovacoes' | 'drafts' | 'descoberta' | null>(null)
-  // "Abrir na Descoberta" (FlowExplainPanel no gráfico) — token muda a cada
+  // "Abrir na Descoberta" (FlowExplainPanel no gráfico): token muda a cada
   // clique, mesmo pro mesmo flow, pra sempre re-disparar o scroll/destaque.
   const [focusFlow, setFocusFlow] = useState<{ flowId: string; token: number } | null>(null)
   function handleExplainFlow(flowId: string) {
@@ -153,7 +163,7 @@ export default function App() {
   const [selectedNamespace, setSelectedNamespace] = useState<string | null>(null)
   const [ciliumFlows, setCiliumFlows] = useState<CiliumFlowSummary[]>([])
   // Modo Rascunho: enquanto ativo, isolar/restringir vira rascunho em vez
-  // de aplicar direto — draftModeFlows é a foto congelada da Descoberta
+  // de aplicar direto; draftModeFlows é a foto congelada da Descoberta
   // tirada na ativação (comparação de impacto, nunca escrita de volta).
   const [draftMode, setDraftMode] = useState(false)
   const [draftModeFlows, setDraftModeFlows] = useState<CiliumFlowSummary[]>([])
@@ -180,16 +190,30 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try {
+      // Each of these four used to have no per-call fallback: one
+      // transient failure (a GitOps read racing a concurrent write's file
+      // rewrite, a brief network blip) rejected the whole Promise.all,
+      // discarding every OTHER read that had already succeeded. On a page
+      // reload that lands mid-write, that meant the entire graph, even
+      // services, which never touches git at all, blanked out until the
+      // failing read finally succeeded again. Falling back to the last
+      // known-good snapshot keeps whatever was already on screen instead;
+      // only the very first load (nothing to fall back to yet) still
+      // surfaces the failure, via the outer catch below.
       const [svcs, pols, allPols, layoutData, sync, approvals, ciliumData] = await Promise.all([
-        getServices(), getNetworkPolicies(), getAllNetworkPolicies(), getServiceLayout(),
+        getServices().catch(e => { if (!hasLoadedOnce.current) throw e; return servicesRef.current }),
+        getNetworkPolicies().catch(e => { if (!hasLoadedOnce.current) throw e; return policiesRef.current }),
+        getAllNetworkPolicies().catch(e => { if (!hasLoadedOnce.current) throw e; return allPoliciesRef.current }),
+        getServiceLayout().catch(e => { if (!hasLoadedOnce.current || !serviceLayoutRef.current) throw e; return serviceLayoutRef.current }),
         getAutosyncStatus().catch(() => null),
         getApprovalRequests('pending').catch(() => [] as ApprovalRequest[]),
         getCiliumFlows().catch(() => ({ available: false, streaming: false, flows: [] as CiliumFlowSummary[] })),
       ])
       setAutosyncStatus(sync)
-      setServices(svcs)
-      setPolicies(pols)
-      setAllPolicies(allPols)
+      setServices(svcs); servicesRef.current = svcs
+      setPolicies(pols); policiesRef.current = pols
+      setAllPolicies(allPols); allPoliciesRef.current = allPols
+      serviceLayoutRef.current = layoutData
       setPendingApprovals(approvals)
       setCiliumFlows(ciliumData.flows)
       setCiliumStreaming(ciliumData.streaming)
@@ -243,6 +267,7 @@ export default function App() {
       }
       setLastUpdate(new Date())
       setError(null)
+      hasLoadedOnce.current = true
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Erro ao conectar ao backend')
     }
@@ -357,9 +382,18 @@ export default function App() {
       es = new EventSource('/api/events')
       es.onmessage = (e) => {
         retryDelay = 1000
-        refresh()
         try {
           const event = JSON.parse(e.data)
+          // hubble_flow_new fires as often as every 3s while Descoberta is
+          // actively capturing traffic (throttled server-side, hubble.ts).
+          // Triggering the full 7-endpoint refresh() on every single one of
+          // those (instead of just the normal 15s poll everything else
+          // already uses) was the main thing making the whole app feel
+          // like it froze under heavy discovery traffic. New flows still
+          // land in the DB in real time; they just show up on the next
+          // regular poll instead of instantly, same cadence as
+          // services/policies already have.
+          if (event.type !== 'hubble_flow_new') refresh()
           if (event.type === 'approval_created') {
             const user = currentUserRef.current
             if (!user || event.created_by === user.id) return
@@ -376,7 +410,7 @@ export default function App() {
               })
             }
           }
-        } catch {}
+        } catch { refresh() /* unparseable payload: refresh defensively, same as before this handler started reading event.type */ }
       }
       es.onerror = () => {
         es.close()
@@ -411,17 +445,18 @@ export default function App() {
 
   // isolate/restrict-kind drafts share the same placeholder connection
   // fields ('') by design (see types.ts), so the dedup check below can't
-  // just compare src/dst fields directly — every isolate/restrict draft
+  // just compare src/dst fields directly: every isolate/restrict draft
   // would collide with the first one ever added, silently dropping any
   // later one (a different namespace, or even the other direction).
   function draftKey(d: Omit<Draft, 'id'> | Draft): string {
     if (d.kind === 'isolate') return `isolate|${d.isolate_namespace}|${d.isolate_direction}`
     if (d.kind === 'restrict') return `restrict|${d.restrict_service}|${d.restrict_namespace}|${d.restrict_direction}`
-    // Keyed by namespace+option only (not action) — a second click on the
+    // Keyed by namespace+option only (not action); a second click on the
     // same toggle while one is already pending is a no-op in the UI, not a
     // second draft, so there's never two contradicting toggle drafts queued
     // for the same thing.
     if (d.kind === 'toggle') return `toggle|${d.toggle_namespace}|${d.toggle_option}`
+    if (d.kind === 'remove') return `remove|${d.remove_namespace}|${(d.remove_policy_names ?? []).slice().sort().join(',')}`
     return `connection|${d.src_workload}|${d.src_namespace}|${d.dst_service}|${d.dst_namespace}`
   }
 
@@ -468,7 +503,7 @@ export default function App() {
   }
 
   async function applyDraft(draft: Draft, allowedApprovers: Array<{ id: string; username: string }> = []) {
-    // Isolar/restringir/toggle nunca passaram pelo fluxo de aprovação — mesmo
+    // Isolar/restringir/toggle nunca passaram pelo fluxo de aprovação: mesmo
     // comportamento de hoje, só que agora podem ficar em rascunho antes.
     if (draft.kind === 'isolate') {
       await isolateNamespace({
@@ -487,6 +522,13 @@ export default function App() {
     }
     if (draft.kind === 'toggle') {
       await applyToggleDraft(draft)
+      removeDraft(draft.id)
+      await refresh()
+      return
+    }
+    if (draft.kind === 'remove') {
+      const ns = draft.remove_namespace!
+      await Promise.all((draft.remove_policy_names ?? []).map(name => deleteNetworkPolicy(ns, name).catch(() => {})))
       removeDraft(draft.id)
       await refresh()
       return
@@ -529,7 +571,7 @@ export default function App() {
     // the approval_enabled branch for connection drafts) instead of
     // re-implementing the same branching here a second time. Uses
     // allSettled, not all: these are independent operations against
-    // independent drafts — one failing (e.g. a real 404/409 from the
+    // independent drafts: one failing (e.g. a real 404/409 from the
     // cluster) must not stop the rest from applying and being cleared from
     // the list, which is what left already-applied drafts stuck showing as
     // "still pending" before, tempting a retry that re-applies them and
@@ -843,6 +885,22 @@ export default function App() {
             </svg>
           </button>
 
+          {/* Modo de escrita: somente leitura, decidido no deploy (WRITE_MODE), nunca um toggle aqui */}
+          {currentUser && (
+            <div title={currentUser.write_mode === 'gitops'
+              ? 'Toda escrita de política vira um commit no repositório GitOps, que o ArgoCD aplica de fato'
+              : 'Escrita direta na API do Kubernetes'}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5, marginLeft: 8,
+                padding: '3px 9px', borderRadius: 999, fontSize: 10, fontWeight: 700,
+                background: currentUser.write_mode === 'gitops' ? '#eff6ff' : '#f8fafc',
+                border: `1px solid ${currentUser.write_mode === 'gitops' ? '#93c5fd' : '#e2e8f0'}`,
+                color: currentUser.write_mode === 'gitops' ? '#1d4ed8' : '#94a3b8',
+              }}>
+              {currentUser.write_mode === 'gitops' ? '⑂ Modo GitOps' : 'Escrita direta'}
+            </div>
+          )}
+
           {/* User section */}
           {currentUser && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 8, paddingLeft: 14, borderLeft: '1px solid #e2e8f0' }}>
@@ -948,7 +1006,7 @@ export default function App() {
           background: '#fef3c7', borderBottom: '1px solid #f59e0b', padding: '6px 20px',
           fontSize: 11.5, fontWeight: 700, color: '#92400e', textAlign: 'center',
         }}>
-          🧪 MODO RASCUNHO ATIVO — isolar/restringir vira rascunho, nada é aplicado no cluster até você clicar em Aplicar
+          🧪 MODO RASCUNHO ATIVO: isolar/restringir vira rascunho, nada é aplicado no cluster até você clicar em Aplicar
         </div>
       )}
 

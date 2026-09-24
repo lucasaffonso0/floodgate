@@ -1,8 +1,8 @@
 'use client'
 
-import React, { useState, useEffect, useCallback, useRef } from 'react'
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import PasswordModal from '@/components/PasswordModal'
-import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, AppConfig, User, ApprovalRequest, AutosyncStatus, BackupStatus, CiliumFlowSummary, CidrPolicyRequest } from '@/types'
+import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, AppConfig, User, ApprovalRequest, AutosyncStatus, BackupStatus, CiliumFlowSummary, CidrPolicyRequest, WriteMode, GitOpsConfig } from '@/types'
 import {
   deleteNetworkPolicy, deleteAllPolicies, importPolicies, patchNetworkPolicyPort,
   getApprovalRequests, voteApprovalRequest, applyApprovalRequest, cancelApprovalRequest, getApprovalRequestYAML,
@@ -11,6 +11,7 @@ import {
   getAutosyncStatus, triggerAutosync, removeOrphanedManagedPolicy, removeOrphanedPausedPolicy, updateUserPassword, listUsers,
   adoptPolicy, unadoptPolicy, checkHubble, previewDiscoveryPolicyYAML, createCidrPolicy,
   getBackupStatus, triggerBackup,
+  getGitOpsConfig, saveGitOpsConfig, syncGitOpsRepo, type GitOpsConfigUpdate, type GitOpsConnectionTest,
 } from '@/api/client'
 import { normalizeWorkload, classifyFlowGap } from '@/lib/flowMatch'
 import { simulateImpact, isFlowBlocked, computeEffectivePolicies } from '@/lib/simulate'
@@ -378,7 +379,7 @@ function NewDraftModal({ services, ciliumFlows, onAdd, onClose }: {
                     <input value={srcSvc} onChange={e => setSrcSvc(e.target.value)} placeholder="nome exato" style={inputStyle} autoFocus />
                   ) : (
                     <select value={srcSvc} onChange={e => { if (e.target.value === '__manual__') { setSrcManual(true); setSrcSvc('') } else setSrcSvc(e.target.value) }} style={selectStyle}>
-                      <option value="">— selecione —</option>
+                      <option value="">Selecione...</option>
                       {workloadOptions(srcNs).map(w => <option key={w} value={w}>{w}</option>)}
                       <option value="__manual__">Digitar manualmente…</option>
                     </select>
@@ -441,7 +442,7 @@ function NewDraftModal({ services, ciliumFlows, onAdd, onClose }: {
                     <input value={dstSvc} onChange={e => setDstSvc(e.target.value)} placeholder="nome exato" style={inputStyle} autoFocus />
                   ) : (
                     <select value={dstSvc} onChange={e => { if (e.target.value === '__manual__') { setDstManual(true); setDstSvc('') } else setDstSvc(e.target.value) }} style={selectStyle}>
-                      <option value="">— selecione —</option>
+                      <option value="">Selecione...</option>
                       {workloadOptions(dstNs).map(w => <option key={w} value={w}>{w}</option>)}
                       <option value="__manual__">Digitar manualmente…</option>
                     </select>
@@ -466,7 +467,7 @@ function NewDraftModal({ services, ciliumFlows, onAdd, onClose }: {
                   onChange={e => setPorts(prev => prev.map((p, j) => j === i ? { ...p, port: Math.min(65535, Math.max(1, parseInt(e.target.value) || 1)) } : p))}
                   style={{ ...inputStyle, width: 70 }} />
                 <span style={{ fontSize: 10, color: '#94a3b8' }}>até</span>
-                <input type="number" value={ps.endPort ?? ''} min={1} max={65535} placeholder="—"
+                <input type="number" value={ps.endPort ?? ''} min={1} max={65535} placeholder="-"
                   title="Faixa de portas opcional: deixe em branco pra porta única"
                   onChange={e => {
                     const v = e.target.value === '' ? undefined : Math.min(65535, Math.max(1, parseInt(e.target.value) || 1))
@@ -507,6 +508,22 @@ function NewDraftModal({ services, ciliumFlows, onAdd, onClose }: {
   )
 }
 
+// Mesmo padrão de frames giratórios do SaveSpinner (src/app/page.tsx),
+// aqui como hook pra reusar no botão "Aplicar" (individual e em massa) da
+// aba Rascunhos: em modo GitOps, aplicar um rascunho é um commit + push
+// real (pode levar mais que um clique instantâneo), então o botão precisa
+// deixar isso visível em vez de só travar sem feedback.
+const SPINNER_FRAMES = ['⠋', '⠙', '⠸', '⠴', '⠦', '⠇']
+function useSpinnerFrame(active: boolean): string {
+  const [tick, setTick] = useState(0)
+  useEffect(() => {
+    if (!active) return
+    const id = setInterval(() => setTick(t => t + 1), 160)
+    return () => clearInterval(id)
+  }, [active])
+  return SPINNER_FRAMES[tick % SPINNER_FRAMES.length]
+}
+
 function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemove, onApply, onApplyAll, onDiscardAll, onUpdatePort, onAddDraft, allPolicies, draftMode, draftModeFlows }: {
   drafts: Draft[]; services: ServiceInfo[]; ciliumFlows: CiliumFlowSummary[]; config: AppConfig; currentUser: User | null
   onRemove: (id: string) => void
@@ -516,15 +533,26 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
   allPolicies?: NetworkPolicyInfo[]; draftMode?: boolean; draftModeFlows?: CiliumFlowSummary[]
 }) {
   const impact = draftMode ? simulateImpact(draftModeFlows ?? [], allPolicies ?? [], drafts) : null
+  const writeMode = currentUser?.write_mode ?? 'direct'
   const [expanded, setExpanded] = useState<string | null>(null)
   const [applying, setApplying] = useState<string | null>(null)
   const [applyingAll, setApplyingAll] = useState(false)
+  const applySpinnerFrame = useSpinnerFrame(applying !== null || applyingAll)
+  const applyingLabel = `${applySpinnerFrame} Enviando para o repositório…`
+  const applyingLabelShort = `${applySpinnerFrame} Enviando…`
   const [applyAllError, setApplyAllError] = useState<string | null>(null)
   const [pickerDraft, setPickerDraft] = useState<string | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [approverSearch, setApproverSearch] = useState('')
   const [users, setUsers] = useState<User[]>([])
   const [showNewModal, setShowNewModal] = useState(false)
+  // Com muitos rascunhos de uma vez, essas listas de impacto podem ter
+  // dezenas de flows: uma parede de texto que toma a tela inteira antes
+  // mesmo de ver os próprios rascunhos. Recolhidas por padrão quando
+  // passam de um punhado, só a contagem some pra fora do colapsável.
+  const IMPACT_LIST_COLLAPSE_THRESHOLD = 5
+  const [showBreakingDetails, setShowBreakingDetails] = useState(false)
+  const [showFixedDetails, setShowFixedDetails] = useState(false)
 
   useEffect(() => {
     if (config.approval_enabled) listUsers().then(setUsers).catch(() => {})
@@ -532,6 +560,16 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
 
   function toggleUser(id: string) {
     setSelectedIds(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
+  }
+
+  // Sem isso, uma falha no meio da escrita (ex: em modo GitOps, push
+  // rejeitado, host inacessível) só derrubava o spinner em silêncio: o
+  // rascunho ficava intacto na lista (removeDraft só roda depois de sucesso
+  // em applyDraft), mas nada explicava por quê, e parecia que a política
+  // tinha "sumido" no meio do processo.
+  function extractApplyErrorMessage(e: unknown): string {
+    const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+    return detail ?? 'Falha ao aplicar o rascunho. Confira a aba Policies antes de tentar de novo.'
   }
 
   async function handleApply(d: Draft) {
@@ -544,20 +582,20 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
       )
       setPickerDraft(d.id); setSelectedIds(defaultIds); setApproverSearch(''); return
     }
-    setApplying(d.id)
-    try { await onApply(d, []) } finally { setApplying(null) }
+    setApplying(d.id); setApplyAllError(null)
+    try { await onApply(d, []) } catch (e) { setApplyAllError(extractApplyErrorMessage(e)) } finally { setApplying(null) }
   }
 
   async function confirmApply(d: Draft) {
     const approvers = users.filter(u => selectedIds.has(u.id)).map(u => ({ id: u.id, username: u.username }))
     setPickerDraft(null)
-    setApplying(d.id)
-    try { await onApply(d, approvers) } finally { setApplying(null) }
+    setApplying(d.id); setApplyAllError(null)
+    try { await onApply(d, approvers) } catch (e) { setApplyAllError(extractApplyErrorMessage(e)) } finally { setApplying(null) }
   }
 
   // Sem isso, clicar de novo antes da primeira leva concluir dispara uma
   // segunda applyAllDrafts() em paralelo, contra os MESMOS rascunhos ainda
-  // não removidos do estado — a segunda tenta apagar/criar as mesmas
+  // não removidos do estado: a segunda tenta apagar/criar as mesmas
   // policies de novo e quebra com 404/409 no meio do caminho.
   async function handleApplyAll() {
     if (applyingAll) return
@@ -565,7 +603,7 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
     try {
       await onApplyAll()
     } catch {
-      setApplyAllError('Erro ao aplicar um ou mais rascunhos — confira a aba Policies antes de tentar de novo.')
+      setApplyAllError('Erro ao aplicar um ou mais rascunhos. Confira a aba Policies antes de tentar de novo.')
     } finally {
       setApplyingAll(false)
     }
@@ -576,7 +614,7 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
     .filter(u => !approverSearch || u.username.toLowerCase().includes(approverSearch.toLowerCase()))
 
   // Restrict which namespaces show up as options in the "Nova política" modal
-  // to ones this user can actually manage — otherwise a draft could be built
+  // to ones this user can actually manage: otherwise a draft could be built
   // for a namespace that will only ever fail at "Aplicar" (or worse, get
   // submitted into an approval request for a namespace outside their scope).
   const manageableServices = currentUser?.role === 'admin'
@@ -584,13 +622,13 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
     : services.filter(s => (currentUser?.allowed_namespaces ?? []).includes(s.namespace))
 
   // Modo Rascunho: Hubble nunca captura tráfego de/para uma namespace
-  // ignorada — nem grava no discovered_flows, então a foto do Modo Rascunho
+  // ignorada, nem grava no discovered_flows, então a foto do Modo Rascunho
   // não tem como saber se um isolate/restrict pendente afeta o que passa por
   // ela. Sem esse aviso, o impacto real só aparece depois, quando alguém
   // remove a namespace de "Ignoradas" e os fluxos bloqueados começam a
-  // chegar — tarde demais pra ter servido de aviso. Mostrado mesmo sem
+  // chegar, tarde demais pra ter servido de aviso. Mostrado mesmo sem
   // nenhum rascunho ainda (não é sobre um rascunho específico, é sobre uma
-  // lacuna estrutural da simulação) — por isso fica fora do early-return de
+  // lacuna estrutural da simulação); por isso fica fora do early-return de
   // "Nenhum rascunho" abaixo, chamado nos dois ramos.
   function ignoredNamespacesWarning() {
     if (!draftMode) return null
@@ -599,7 +637,7 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
     return (
       <div style={{ margin: '10px 14px 0', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8, padding: '10px 12px' }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: '#92400e' }}>
-          🧪 {customIgnored.length === 1 ? `A namespace "${customIgnored[0]}" está ignorada` : `${customIgnored.length} namespaces estão ignoradas (${customIgnored.join(', ')})`} — a Descoberta não captura tráfego dela(s), então o impacto dos rascunhos aí não aparece nesta análise.
+          🧪 {customIgnored.length === 1 ? `A namespace "${customIgnored[0]}" está ignorada` : `${customIgnored.length} namespaces estão ignoradas (${customIgnored.join(', ')})`}, a Descoberta não captura tráfego dela(s), então o impacto dos rascunhos aí não aparece nesta análise.
         </div>
       </div>
     )
@@ -627,16 +665,16 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-      <div style={{ padding: '10px 14px 8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #f1f5f9', flexShrink: 0 }}>
+      <div style={{ padding: '10px 14px 8px', display: 'flex', flexWrap: 'wrap', rowGap: 6, justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #f1f5f9', flexShrink: 0 }}>
         <span style={{ fontSize: 11, color: '#94a3b8' }}>{drafts.length} rascunho(s)</span>
-        <div style={{ display: 'flex', gap: 6 }}>
-          <button style={{ ...btn.base, ...btn.blue }} onClick={() => setShowNewModal(true)}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          <button style={{ ...btn.base, ...btn.blue, whiteSpace: 'nowrap', flexShrink: 0 }} onClick={() => setShowNewModal(true)}>
             <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
             Nova
           </button>
-          <button style={{ ...btn.base, ...btn.red }} onClick={onDiscardAll} disabled={applyingAll} title={applyingAll ? 'Aguarde a aplicação terminar' : undefined}><Icon.Trash /> Descartar todos</button>
-          <button style={{ ...btn.base, ...btn.green, opacity: applyingAll ? 0.6 : 1 }} onClick={handleApplyAll} disabled={applyingAll}>
-            <Icon.Check /> {applyingAll ? 'Aplicando…' : 'Aplicar todos'}
+          <button style={{ ...btn.base, ...btn.red, whiteSpace: 'nowrap', flexShrink: 0 }} onClick={onDiscardAll} disabled={applyingAll} title={applyingAll ? 'Aguarde a aplicação terminar' : undefined}><Icon.Trash /> Descartar todos</button>
+          <button style={{ ...btn.base, ...btn.green, whiteSpace: 'nowrap', flexShrink: 0, opacity: applyingAll ? 0.6 : 1 }} onClick={handleApplyAll} disabled={applyingAll}>
+            {applyingAll ? (writeMode === 'gitops' ? applyingLabel : <><Icon.Check /> Aplicando…</>) : <><Icon.Check /> Aplicar todos</>}
           </button>
         </div>
       </div>
@@ -649,26 +687,48 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
       {ignoredNamespacesWarning()}
       {impact && impact.breaking.length > 0 && (
         <div style={{ margin: '10px 14px 0', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 8, padding: '10px 12px' }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: '#991b1b', marginBottom: 4 }}>
-            ⚠ Aplicar esses rascunhos vai bloquear {impact.breaking.length === 1 ? '1 fluxo que hoje funciona' : `${impact.breaking.length} fluxos que hoje funcionam`}:
-          </div>
-          {impact.breaking.map(f => (
-            <div key={f.id} style={{ fontSize: 10.5, color: '#7f1d1d' }}>
-              {f.src_workload} ({f.src_namespace}) → {f.dst_workload} ({f.dst_namespace}) :{f.dst_port}/{f.protocol}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: '#991b1b' }}>
+              ⚠ Aplicar esses rascunhos vai bloquear {impact.breaking.length === 1 ? '1 fluxo que hoje funciona' : `${impact.breaking.length} fluxos que hoje funcionam`}
             </div>
-          ))}
+            {impact.breaking.length > IMPACT_LIST_COLLAPSE_THRESHOLD && (
+              <button onClick={() => setShowBreakingDetails(v => !v)} style={{ ...btn.base, ...btn.red, fontSize: 9, padding: '2px 7px', flexShrink: 0 }}>
+                {showBreakingDetails ? 'Ocultar' : 'Ver detalhes'}
+              </button>
+            )}
+          </div>
+          {(showBreakingDetails || impact.breaking.length <= IMPACT_LIST_COLLAPSE_THRESHOLD) && (
+            <div style={{ marginTop: 6, maxHeight: 160, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 3 }}>
+              {impact.breaking.map(f => (
+                <div key={f.id} style={{ fontSize: 10.5, color: '#7f1d1d' }}>
+                  {f.src_workload} ({f.src_namespace}) → {f.dst_workload} ({f.dst_namespace}) :{f.dst_port}/{f.protocol}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
       {impact && impact.fixed.length > 0 && (
         <div style={{ margin: '10px 14px 0', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '10px 12px' }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: '#166534', marginBottom: 4 }}>
-            ✓ Vai liberar {impact.fixed.length === 1 ? '1 fluxo hoje bloqueado' : `${impact.fixed.length} fluxos hoje bloqueados`}:
-          </div>
-          {impact.fixed.map(f => (
-            <div key={f.id} style={{ fontSize: 10.5, color: '#14532d' }}>
-              {f.src_workload} ({f.src_namespace}) → {f.dst_workload} ({f.dst_namespace}) :{f.dst_port}/{f.protocol}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: '#166534' }}>
+              ✓ Vai liberar {impact.fixed.length === 1 ? '1 fluxo hoje bloqueado' : `${impact.fixed.length} fluxos hoje bloqueados`}
             </div>
-          ))}
+            {impact.fixed.length > IMPACT_LIST_COLLAPSE_THRESHOLD && (
+              <button onClick={() => setShowFixedDetails(v => !v)} style={{ ...btn.base, ...btn.green, fontSize: 9, padding: '2px 7px', flexShrink: 0 }}>
+                {showFixedDetails ? 'Ocultar' : 'Ver detalhes'}
+              </button>
+            )}
+          </div>
+          {(showFixedDetails || impact.fixed.length <= IMPACT_LIST_COLLAPSE_THRESHOLD) && (
+            <div style={{ marginTop: 6, maxHeight: 160, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 3 }}>
+              {impact.fixed.map(f => (
+                <div key={f.id} style={{ fontSize: 10.5, color: '#14532d' }}>
+                  {f.src_workload} ({f.src_namespace}) → {f.dst_workload} ({f.dst_namespace}) :{f.dst_port}/{f.protocol}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
       {showNewModal && <NewDraftModal services={manageableServices} ciliumFlows={ciliumFlows} onAdd={onAddDraft} onClose={() => setShowNewModal(false)} />}
@@ -677,19 +737,22 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
           const isExpanded = expanded === draft.id
           const isPicker   = pickerDraft === draft.id
 
-          if (draft.kind === 'isolate' || draft.kind === 'restrict' || draft.kind === 'toggle') {
+          if (draft.kind === 'isolate' || draft.kind === 'restrict' || draft.kind === 'toggle' || draft.kind === 'remove') {
             const toggleOptionLabel = draft.toggle_option === 'intra' ? 'Tráfego interno' : 'Saída para internet'
             const label = draft.kind === 'isolate'
               ? `Isolar ${draft.isolate_namespace} (${draft.isolate_direction})`
               : draft.kind === 'restrict'
                 ? `Restringir ${draft.restrict_service} (${draft.restrict_namespace}, ${draft.restrict_direction})`
-                : `${draft.toggle_action === 'enable' ? 'Ligar' : 'Desligar'} "${toggleOptionLabel}" (${draft.toggle_namespace})`
+                : draft.kind === 'toggle'
+                  ? `${draft.toggle_action === 'enable' ? 'Ligar' : 'Desligar'} "${toggleOptionLabel}" (${draft.toggle_namespace})`
+                  : `Remover ${(draft.remove_policy_names ?? []).length} política(s) (${draft.remove_namespace})`
             return (
               <div key={draft.id} style={{ borderBottom: '1px solid #f9fafb', padding: '10px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
                 <span style={{ fontSize: 11, fontWeight: 600, color: '#92400e', background: '#fffbeb', borderRadius: 4, padding: '2px 8px' }}>🧪 {label}</span>
                 <div style={{ display: 'flex', gap: 5 }}>
-                  <button style={{ ...btn.base, ...btn.green, opacity: applying === draft.id ? 0.6 : 1 }} onClick={() => handleApply(draft)} disabled={applying === draft.id}>
-                    <Icon.Check /> {applying === draft.id ? '…' : 'Aplicar'}
+                  <button style={{ ...btn.base, ...btn.green, opacity: applying === draft.id ? 0.6 : 1 }} onClick={() => handleApply(draft)} disabled={applying === draft.id}
+                    title={applying === draft.id && writeMode === 'gitops' ? 'Enviando para o repositório…' : undefined}>
+                    {applying === draft.id ? (writeMode === 'gitops' ? applyingLabelShort : '…') : <><Icon.Check /> Aplicar</>}
                   </button>
                   <button style={{ ...btn.base, ...btn.red }} onClick={() => onRemove(draft.id)}><Icon.Trash /></button>
                 </div>
@@ -722,7 +785,7 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
                         onUpdatePort(draft.id, next)
                       }} style={{ width: 55, border: '1px solid #cbd5e1', borderRadius: 5, padding: '3px 6px', fontSize: 11 }} />
                       <span style={{ fontSize: 9, color: '#94a3b8' }}>até</span>
-                      <input type="number" value={ps.endPort ?? ''} min={1} max={65535} placeholder="—" onChange={e => {
+                      <input type="number" value={ps.endPort ?? ''} min={1} max={65535} placeholder="-" onChange={e => {
                         const v = e.target.value === '' ? undefined : Math.min(65535, Math.max(1, parseInt(e.target.value) || 1))
                         const next = draft.dst_ports.map((p, j) => j === i ? { ...p, endPort: v } : p)
                         onUpdatePort(draft.id, next)
@@ -743,8 +806,11 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
                 </div>
                 <div style={{ display: 'flex', gap: 5 }}>
                   <button style={{ ...btn.base, ...btn.blue }} onClick={() => setExpanded(isExpanded ? null : draft.id)}><Icon.Eye /> {isExpanded ? 'Ocultar' : 'YAML'}</button>
-                  <button style={{ ...btn.base, ...btn.green, opacity: applying === draft.id ? 0.6 : 1 }} onClick={() => handleApply(draft)} disabled={applying === draft.id}>
-                    <Icon.Check /> {applying === draft.id ? '…' : config.approval_enabled ? 'Enviar para aprovação' : 'Aplicar'}
+                  <button style={{ ...btn.base, ...btn.green, opacity: applying === draft.id ? 0.6 : 1 }} onClick={() => handleApply(draft)} disabled={applying === draft.id}
+                    title={applying === draft.id && writeMode === 'gitops' && !config.approval_enabled ? 'Enviando para o repositório…' : undefined}>
+                    {applying === draft.id
+                      ? (writeMode === 'gitops' && !config.approval_enabled ? applyingLabelShort : '…')
+                      : <><Icon.Check /> {config.approval_enabled ? 'Enviar para aprovação' : 'Aplicar'}</>}
                   </button>
                   <button style={{ ...btn.base, ...btn.red }} onClick={() => onRemove(draft.id)}><Icon.Trash /></button>
                 </div>
@@ -860,7 +926,7 @@ function PolicyEditModal({ policy, onClose, onSaved }: {
                   onChange={e => setPorts(prev => prev.map((p, j) => j === i ? { ...p, port: Math.min(65535, Math.max(1, parseInt(e.target.value) || 1)) } : p))}
                   style={{ ...inputStyle, flex: 1 }} />
                 <span style={{ fontSize: 9, color: '#94a3b8', flexShrink: 0 }}>até</span>
-                <input type="number" value={ps.endPort ?? ''} min={1} max={65535} placeholder="—"
+                <input type="number" value={ps.endPort ?? ''} min={1} max={65535} placeholder="-"
                   onChange={e => {
                     const v = e.target.value === '' ? undefined : Math.min(65535, Math.max(1, parseInt(e.target.value) || 1))
                     setPorts(prev => prev.map((p, j) => j === i ? { ...p, endPort: v } : p))
@@ -929,9 +995,11 @@ const POLICIES_COLLAPSED_KEY = 'floodgate-policies-collapsed-ns'
 const ORPHANED_MANAGED_KEY = '__orphaned-managed__'
 const ORPHANED_PAUSED_KEY = '__orphaned-paused__'
 
-function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canManageNamespace, onDelete, onRefresh }: {
+function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canManageNamespace, onDelete, onRefresh, currentUser }: {
   policies: NetworkPolicyInfo[]; allPolicies: NetworkPolicyInfo[]; services: ServiceInfo[]; isAdmin?: boolean; isViewer?: boolean; canManageNamespace?: (namespace: string) => boolean; onDelete: () => void; onRefresh: () => void
+  currentUser?: User | null
 }) {
+  const writeMode = currentUser?.write_mode ?? 'direct'
   const [expandedYAML, setExpandedYAML] = useState<string | null>(null)
   // Empty set = nothing collapsed = everything open (same as the old default),
   // so no separate "expand all on first load" effect is needed.
@@ -954,6 +1022,17 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   const [orphanedManaged, setOrphanedManaged] = useState<Array<{ namespace: string; name: string; policy_yaml?: string }>>([])
   const [removingOrphan, setRemovingOrphan] = useState<string | null>(null)
   const [removingOrphanPaused, setRemovingOrphanPaused] = useState<string | null>(null)
+  const [deletingPolicy, setDeletingPolicy] = useState<string | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  const [reapplyingPolicy, setReapplyingPolicy] = useState<string | null>(null)
+  const [syncingGitOps, setSyncingGitOps] = useState(false)
+  const [syncGitOpsError, setSyncGitOpsError] = useState<string | null>(null)
+  const deleteSpinnerFrame = useSpinnerFrame(deletingPolicy !== null)
+  const reapplySpinnerFrame = useSpinnerFrame(reapplyingPolicy !== null)
+  // pending_write vem do servidor (gitops_pending_ops, via GET
+  // /api/networkpolicies): ao contrário de deletingPolicy/applying (estado
+  // local do React), sobrevive a um reload no meio de um commit+push.
+  const pendingWriteFrame = useSpinnerFrame(policies.some(p => p.pending_write))
 
   function toggleYAML(key: string) { setExpandedYAML(prev => prev === key ? null : key) }
 
@@ -1018,6 +1097,16 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
     return !!p.dst_service && !serviceSet.has(`${p.namespace}/${p.dst_service}`)
   }
   const orphaned = policies.filter(isOrphaned)
+  // pending_write vem do servidor (gitops_pending_ops): sobrevive a um
+  // reload, ao contrário do estado local deletingAll/deletingPolicy. Usado
+  // pra: (a) manter o botão "Apagar todas" desabilitado/rotulado
+  // corretamente mesmo após um F5 no meio da operação, e (b) mostrar UM
+  // banner agregado quando várias políticas estão sendo escritas ao mesmo
+  // tempo, em vez de só N badges soltos por linha. "Apagar todas" dispara
+  // N deletes/commits individuais (um por policy, não um commit só), então
+  // sem isso parecia N operações desconexas em vez de uma ação em massa.
+  const pendingDeletes = policies.filter(p => p.pending_write === 'delete')
+  const pendingApplies = policies.filter(p => p.pending_write === 'apply')
 
   async function handleCleanupOrphaned() {
     if (!confirm(`Remover ${orphaned.length} policy(s) obsoleta(s)?`)) return
@@ -1110,7 +1199,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
 
   async function handleDeleteAll() {
     if (!confirm(
-      `Apagar ${policies.length} policies definitivamente? Isso remove TODAS do cluster agora — diferente de pausar, não há como desfazer nem restaurar depois.`
+      `Apagar ${policies.length} policies definitivamente? Isso remove TODAS do cluster agora, diferente de pausar: não há como desfazer nem restaurar depois.`
     )) return
     setDeletingAll(true)
     // Failures are logged server-side (console.error), not popped up here.
@@ -1148,7 +1237,66 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
 
   async function handleDelete(ns: string, name: string) {
     if (!confirm('Remover esta NetworkPolicy?')) return
-    await deleteNetworkPolicy(ns, name); onDelete()
+    const key = `${ns}/${name}`
+    setDeletingPolicy(key); setDeleteError(null)
+    try {
+      await deleteNetworkPolicy(ns, name)
+      onDelete()
+    } catch (e: unknown) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      setDeleteError(detail ?? `Falha ao remover ${ns}/${name}.`)
+    } finally {
+      setDeletingPolicy(null)
+    }
+  }
+
+  // "Reaplicar via floodgate": não é uma rota nova: PATCH .../[ns]/[name]
+  // (edição de porta) já faz exatamente o que precisamos aqui: relê os
+  // labels conhecidos (source-workload, target-service etc, gravados pelo
+  // próprio floodgate) e regera o YAML do zero a partir deles, re-assinado
+  // com a identidade do floodgate. Isso restaura o FORMATO/estrutura
+  // canônica (labels, spec gerado do zero) mas NÃO reverte o conteúdo em
+  // si: como é chamado com as portas que p.dst_ports já mostra agora
+  // (que já refletem a edição externa, se foi isso que mudou), uma porta
+  // adulterada continua exatamente como está, só re-commitada sob o nome
+  // do floodgate. Não existe hoje um jeito de recuperar "qual era o valor
+  // antes" sem vasculhar o histórico do git por uma versão anterior
+  // realmente assinada pelo floodgate; não implementado. Só funciona pros
+  // tipos que essa rota já suporta (allow/allow-egress); o botão já é
+  // escondido pra outros tipos no JSX.
+  async function handleReapply(p: NetworkPolicyInfo) {
+    if (!confirm(
+      'Isso regrava o arquivo com a identidade do floodgate, mas usando a configuração ATUAL (porta/destino): se a edição externa mudou esses valores, eles continuam como estão, só deixam de aparecer como "editado fora do floodgate". Confirma?'
+    )) return
+    const key = `${p.namespace}/${p.name}`
+    setReapplyingPolicy(key); setDeleteError(null)
+    try {
+      await patchNetworkPolicyPort(p.namespace, p.name, p.dst_ports)
+      onRefresh()
+    } catch (e: unknown) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      setDeleteError(detail ?? `Falha ao reaplicar ${p.namespace}/${p.name}.`)
+    } finally {
+      setReapplyingPolicy(null)
+    }
+  }
+
+  // Manual trigger for the same background fetch+reset the scheduler
+  // already runs every few minutes (git.ts's refreshRepoInBackground);
+  // this is the tab where an admin actually watches sync_status/pending
+  // badges, so it's more useful here than tucked away in Config.
+  async function handleSyncGitOpsNow() {
+    setSyncingGitOps(true); setSyncGitOpsError(null)
+    try {
+      const result = await syncGitOpsRepo()
+      if (!result.ok) setSyncGitOpsError(result.error ?? 'Falha ao sincronizar.')
+      onRefresh()
+    } catch (e: unknown) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      setSyncGitOpsError(detail ?? 'Falha ao sincronizar.')
+    } finally {
+      setSyncingGitOps(false)
+    }
   }
 
   async function handlePauseOne(ns: string, name: string) {
@@ -1180,7 +1328,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   }
 
   // Group filtered paused policies by namespace (exclude any that also appear as active: pause deletion
-  // failed — and exclude orphans, which get their own section below since their namespace doesn't exist)
+  // failed; and exclude orphans, which get their own section below since their namespace doesn't exist)
   const pausedByNs = new Map<string, PausedPolicy[]>()
   for (const p of paused.filter(matchPaused).filter(p => !activePolicyKeys.has(`${p.namespace}/${p.name}`)).filter(p => !p.namespace_missing)) {
     if (!pausedByNs.has(p.namespace)) pausedByNs.set(p.namespace, [])
@@ -1208,13 +1356,20 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
       )}
       {/* Header */}
       <div style={{ padding: '10px 14px 8px', borderBottom: '1px solid #f1f5f9', flexShrink: 0 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', rowGap: 6, justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
           <div style={{ fontSize: 11, color: '#94a3b8' }}>
             <span style={{ fontWeight: 600, color: '#1e293b' }}>{policies.length}</span> ativas
             {totalPaused > 0 && <span style={{ marginLeft: 6, color: '#94a3b8', fontWeight: 600 }}>· {totalPaused} pausadas</span>}
             {external.length > 0 && <span style={{ marginLeft: 6 }}>· {external.length} ext.</span>}
           </div>
-          <div style={{ display: 'flex', gap: 5 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+            {isAdmin && writeMode === 'gitops' && (
+              <button onClick={handleSyncGitOpsNow} disabled={syncingGitOps}
+                title="O floodgate já confere o repositório sozinho a cada poucos minutos em segundo plano. Use isso pra não esperar, ex: depois de editar algo direto no repositório."
+                style={{ ...btn.base, ...btn.gray, fontSize: 10, whiteSpace: 'nowrap', flexShrink: 0, opacity: syncingGitOps ? 0.6 : 1 }}>
+                🔄 {syncingGitOps ? 'Sincronizando…' : 'Sincronizar'}
+              </button>
+            )}
             {!isViewer && (
               <>
                 <input ref={importFileRef} type="file" accept=".yaml,.yml,text/yaml" onChange={handleImportFile} style={{ display: 'none' }} />
@@ -1242,10 +1397,32 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
               </button>
             )}
             {policies.length > 0 && (
-              <button style={{ ...btn.base, ...btn.red, fontSize: 10 }} onClick={handleDeleteAll} disabled={deletingAll}>
-                <Icon.Trash /> {deletingAll ? 'Apagando…' : 'Apagar todas'}
+              <button style={{ ...btn.base, ...btn.red, fontSize: 10 }} onClick={handleDeleteAll} disabled={deletingAll || pendingDeletes.length > 0}>
+                <Icon.Trash /> {(deletingAll || pendingDeletes.length > 0) ? 'Apagando…' : 'Apagar todas'}
               </button>
             )}
+          </div>
+        )}
+        {pendingDeletes.length > 1 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#eff6ff', border: '1px dashed #bfdbfe', borderRadius: 6, padding: '6px 8px', marginBottom: 6, fontSize: 10.5, fontWeight: 600, color: '#1d4ed8' }}>
+            {pendingWriteFrame} Removendo {pendingDeletes.length} política(s) do repositório GitOps…
+          </div>
+        )}
+        {pendingApplies.length > 1 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#eff6ff', border: '1px dashed #bfdbfe', borderRadius: 6, padding: '6px 8px', marginBottom: 6, fontSize: 10.5, fontWeight: 600, color: '#1d4ed8' }}>
+            {pendingWriteFrame} Enviando {pendingApplies.length} política(s) para o repositório GitOps…
+          </div>
+        )}
+        {deleteError && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, padding: '5px 8px', marginBottom: 6 }}>
+            <span style={{ fontSize: 10, color: '#b91c1c', fontWeight: 600 }}>{deleteError}</span>
+            <button style={{ ...btn.base, ...btn.gray, padding: '2px 7px', fontSize: 9 }} onClick={() => setDeleteError(null)}>Ok</button>
+          </div>
+        )}
+        {syncGitOpsError && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, padding: '5px 8px', marginBottom: 6 }}>
+            <span style={{ fontSize: 10, color: '#b91c1c', fontWeight: 600 }}>Falha ao sincronizar: {syncGitOpsError}</span>
+            <button style={{ ...btn.base, ...btn.gray, padding: '2px 7px', fontSize: 9 }} onClick={() => setSyncGitOpsError(null)}>Ok</button>
           </div>
         )}
         {/* Orphan banner */}
@@ -1337,6 +1514,52 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
                               {orphan && (
                                 <span style={{ fontSize: 8, fontWeight: 700, color: '#dc2626', background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>OBSOLETA</span>
                               )}
+                              {/* Quando faz parte de uma operação em massa (>1 ao mesmo tempo), o
+                                  banner agregado acima já cobre isso: o badge individual aqui
+                                  só soma ruído linha a linha ("apagando uma por uma") em vez de
+                                  deixar claro que é uma ação só. */}
+                              {p.pending_write === 'apply' && pendingApplies.length <= 1 && (
+                                <span
+                                  title="Enviando para o repositório GitOps…"
+                                  style={{ fontSize: 8, fontWeight: 700, color: '#1d4ed8', background: '#eff6ff', border: '1px dashed #bfdbfe', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
+                                  {pendingWriteFrame} APLICANDO
+                                </span>
+                              )}
+                              {p.pending_write === 'delete' && pendingDeletes.length <= 1 && (
+                                <span
+                                  title="Removendo do repositório GitOps…"
+                                  style={{ fontSize: 8, fontWeight: 700, color: '#1d4ed8', background: '#eff6ff', border: '1px dashed #bfdbfe', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
+                                  {pendingWriteFrame} REMOVENDO
+                                </span>
+                              )}
+                              {!p.pending_write && p.sync_status === 'pending_argocd' && (
+                                <span
+                                  title="Commitada no repositório GitOps, aguardando o ArgoCD aplicar no cluster"
+                                  style={{ fontSize: 8, fontWeight: 700, color: '#b45309', background: '#fffbeb', border: '1px dashed #fde68a', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
+                                  ⏳ AGUARDANDO APLICAR
+                                </span>
+                              )}
+                              {!p.pending_write && p.sync_status === 'pending_delete' && (
+                                <span
+                                  title="Removida do repositório GitOps, aguardando o ArgoCD remover do cluster"
+                                  style={{ fontSize: 8, fontWeight: 700, color: '#b45309', background: '#fffbeb', border: '1px dashed #fde68a', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
+                                  ⏳ AGUARDANDO REMOÇÃO DO CLUSTER
+                                </span>
+                              )}
+                              {p.invalid_file && (
+                                <span
+                                  title="O arquivo desta policy no repositório GitOps não pôde ser lido (YAML malformado ou campo obrigatório faltando)"
+                                  style={{ fontSize: 8, fontWeight: 700, color: '#b91c1c', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
+                                  ⚠️ ARQUIVO INVÁLIDO
+                                </span>
+                              )}
+                              {p.external_change && !p.invalid_file && (
+                                <span
+                                  title="O último commit que alterou este arquivo não foi feito pelo floodgate: alguém editou o repositório diretamente"
+                                  style={{ fontSize: 8, fontWeight: 700, color: '#b91c1c', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
+                                  ⚠️ EDITADO FORA DO FLOODGATE
+                                </span>
+                              )}
                             </div>
                             <div style={{ fontSize: 9, color: orphan ? '#fca5a5' : '#94a3b8', marginTop: 1 }}>{m.label}</div>
                           </div>
@@ -1347,13 +1570,28 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
                                 {(p.policy_type === 'allow' || p.policy_type === 'allow-egress') && (
                                   <button style={{ ...btn.base, ...btn.gray, padding: '3px 7px', fontSize: 10 }} title="Editar portas" onClick={() => setEditingPolicy(p)}><Icon.Edit /></button>
                                 )}
+                                {p.external_change && !p.invalid_file && (p.policy_type === 'allow' || p.policy_type === 'allow-egress') && (
+                                  <button style={{ ...btn.base, ...btn.red, padding: '3px 7px', fontSize: 10, opacity: reapplyingPolicy === `${p.namespace}/${p.name}` ? 0.6 : 1 }}
+                                    disabled={reapplyingPolicy === `${p.namespace}/${p.name}`}
+                                    title="Regrava o arquivo com a identidade do floodgate, restaurando o formato canônico. NÃO reverte porta/destino se foi isso que a edição externa mudou: o valor atual é o que fica."
+                                    onClick={() => handleReapply(p)}>
+                                    {reapplyingPolicy === `${p.namespace}/${p.name}` ? `${reapplySpinnerFrame} Reaplicando…` : 'Reaplicar via floodgate'}
+                                  </button>
+                                )}
                                 {p.adopted && (
                                   <button style={{ ...btn.base, ...btn.orange, padding: '3px 7px', fontSize: 10 }} title="Desadotar: remove do Floodgate mas mantém no cluster" onClick={() => handleUnadopt(p)}>↩ Desadotar</button>
                                 )}
                                 {isAdmin && (
                                   <button style={{ ...btn.base, ...btn.orange, padding: '3px 7px', fontSize: 10 }} title="Pausar: salva no DB e remove do cluster" onClick={() => handlePauseOne(p.namespace, p.name)}>⏸</button>
                                 )}
-                                <button style={{ ...btn.base, ...btn.red, padding: '3px 7px' }} onClick={() => handleDelete(p.namespace, p.name)}><Icon.Trash /></button>
+                                <button style={{ ...btn.base, ...btn.red, padding: '3px 7px', opacity: deletingPolicy === `${p.namespace}/${p.name}` ? 0.6 : 1 }}
+                                  disabled={deletingPolicy === `${p.namespace}/${p.name}`}
+                                  title={deletingPolicy === `${p.namespace}/${p.name}` && writeMode === 'gitops' ? 'Removendo do repositório…' : undefined}
+                                  onClick={() => handleDelete(p.namespace, p.name)}>
+                                  {deletingPolicy === `${p.namespace}/${p.name}`
+                                    ? (writeMode === 'gitops' ? `${deleteSpinnerFrame} Removendo…` : '…')
+                                    : <Icon.Trash />}
+                                </button>
                               </>
                             )}
                           </div>
@@ -1551,13 +1789,30 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
 }
 
 // ─── Security tab ──────────────────────────────────────────────────────────
+const SEGURANCA_EXPANDED_KEY = 'floodgate-seguranca-expanded-section'
+
 function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace, onRefresh, onViewNamespace, draftMode, onAddDraft }: {
   services: ServiceInfo[]; policies: NetworkPolicyInfo[]; config: AppConfig; isAdmin: boolean; canManageNamespace?: (namespace: string) => boolean; onRefresh: () => void
   onViewNamespace?: (ns: string) => void
   draftMode?: boolean; onAddDraft?: (d: Omit<Draft, 'id'>) => void
 }) {
   const [coverageLoaded, setCoverageLoaded] = useState(false)
-  const [expandedSection, setExpandedSection] = useState<'exposed' | 'partial' | 'protected' | null>('exposed')
+  // Persisted (not just component state): the Segurança tab is conditionally
+  // rendered ({activeTab === 'seguranca' && <SegurancaTab .../>}), so it
+  // fully unmounts on every tab switch: without this, whichever section a
+  // user collapsed/expanded would silently reset back to "Expostos" open the
+  // moment they navigated away and back, making it look like that section
+  // could never be collapsed at all. Same localStorage pattern the Policies
+  // and Descoberta tabs already use for their own collapsed-state.
+  const [expandedSection, setExpandedSection] = useState<'exposed' | 'partial' | 'protected' | null>(() => {
+    try {
+      const saved = localStorage.getItem(SEGURANCA_EXPANDED_KEY)
+      if (saved === 'exposed' || saved === 'partial' || saved === 'protected' || saved === 'null') {
+        return saved === 'null' ? null : saved
+      }
+    } catch {}
+    return 'exposed'
+  })
   const [bulkBusy, setBulkBusy] = useState<'exposed' | 'partial' | null>(null)
   const [expShowOpts, setExpShowOpts] = useState(false)
   const [expDirection, setExpDirection] = useState<'ingress' | 'egress' | 'both'>('both')
@@ -1569,8 +1824,11 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
   useEffect(() => {
     getSecurityCoverage().then(() => setCoverageLoaded(true)).catch(() => setCoverageLoaded(true))
   }, [])
+  useEffect(() => {
+    try { localStorage.setItem(SEGURANCA_EXPANDED_KEY, expandedSection ?? 'null') } catch {}
+  }, [expandedSection])
 
-  // Namespace is the only unit of isolation status/action — a single source
+  // Namespace is the only unit of isolation status/action: a single source
   // of truth (getNamespaceIsolation) shared with the graph's namespace
   // panel, so the two never disagree about what's covered.
   const nsBuckets = [...new Set(services.map(s => s.namespace))].sort().map(ns => ({
@@ -1778,6 +2036,8 @@ function ApprovacoesTab({ currentUser, config, onRefresh, pendingApprovals }: { 
   const [yamlOpen, setYamlOpen] = useState<string | null>(null)
   const [yamlContent, setYamlContent] = useState<Record<string, string>>({})
   const [applyErrors, setApplyErrors] = useState<Record<string, string>>({})
+  const [voting, setVoting] = useState<Record<string, 'approve' | 'reject'>>({})
+  const [retrying, setRetrying] = useState<Record<string, boolean>>({})
 
   const loadHistory = useCallback(async () => {
     if (!showHistory) return
@@ -1929,14 +2189,46 @@ function ApprovacoesTab({ currentUser, config, onRefresh, pendingApprovals }: { 
                   <div style={{ height: 4, borderRadius: 2, background: '#e2e8f0', overflow: 'hidden' }}>
                     <div style={{ height: '100%', width: `${pct}%`, background: barColor, borderRadius: 2, transition: 'width 0.3s' }} />
                   </div>
-                  {/* Auto-apply error banner */}
-                  {applyErrors[req.id] && (
-                    <div style={{ marginTop: 5, padding: '5px 8px', background: '#fff1f2', border: '1px solid #fecdd3', borderRadius: 6, fontSize: 10, color: '#dc2626' }}>
-                      <strong>Erro ao aplicar automaticamente:</strong><br />{applyErrors[req.id]}
+                  {/* Applying: server-persisted state, so it survives a reload and
+                      shows the same for every viewer, not just an "it's probably
+                      running" guess from quorum being met. */}
+                  {req.applying && (
+                    <div style={{ marginTop: 5, display: 'flex', alignItems: 'center', gap: 6, padding: '5px 8px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 6, fontSize: 10, color: '#92400e', fontWeight: 600 }}>
+                      <span style={{ width: 10, height: 10, border: '2px solid #fde68a', borderTopColor: '#d97706', borderRadius: '50%', animation: 'spin 0.7s linear infinite', flexShrink: 0 }} />
+                      Aplicando…
                     </div>
                   )}
-                  {/* Quorum met but not applied yet (other user's perspective before SSE arrives) */}
-                  {applicable && !applyErrors[req.id] && (
+                  {/* Auto-apply error banner: server-persisted (last_apply_error)
+                      merged with the immediate local response, so it's visible
+                      even after a reload or to a different viewer. */}
+                  {!req.applying && (req.last_apply_error || applyErrors[req.id]) && (
+                    <div style={{ marginTop: 5, padding: '5px 8px', background: '#fff1f2', border: '1px solid #fecdd3', borderRadius: 6, fontSize: 10, color: '#dc2626', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <div><strong>Erro ao aplicar automaticamente:</strong><br />{req.last_apply_error ?? applyErrors[req.id]}</div>
+                      {!isViewer && (
+                        <button
+                          style={{ ...btn.base, ...btn.red, fontSize: 10, alignSelf: 'flex-start', opacity: retrying[req.id] ? 0.6 : 1 }}
+                          disabled={!!retrying[req.id]}
+                          onClick={async () => {
+                            setRetrying(prev => ({ ...prev, [req.id]: true }))
+                            try {
+                              await applyApprovalRequest(req.id)
+                              setApplyErrors(prev => { const next = { ...prev }; delete next[req.id]; return next })
+                              onRefresh()
+                            } catch (e: unknown) {
+                              const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Falha ao reaplicar'
+                              setApplyErrors(prev => ({ ...prev, [req.id]: msg }))
+                            } finally {
+                              setRetrying(prev => { const next = { ...prev }; delete next[req.id]; return next })
+                            }
+                          }}
+                        >
+                          {retrying[req.id] ? 'Reaplicando…' : 'Reaplicar'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {/* Quorum met but the claim hasn't landed yet (brief window right after voting) */}
+                  {applicable && !req.applying && !req.last_apply_error && !applyErrors[req.id] && (
                     <div style={{ marginTop: 4, fontSize: 9, color: '#6b7280' }}>Aplicação automática em andamento…</div>
                   )}
                 </div>
@@ -2001,12 +2293,29 @@ function ApprovacoesTab({ currentUser, config, onRefresh, pendingApprovals }: { 
                 <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
                   {allowed ? (
                     <>
-                      <button style={{ ...btn.base, ...btn.green, fontSize: 10, opacity: voted ? 0.5 : 1 }} onClick={async () => {
-                        const result = await voteApprovalRequest(req.id, 'approve')
-                        if (result.auto_apply_error) setApplyErrors(prev => ({ ...prev, [req.id]: result.auto_apply_error! }))
-                        onRefresh()
-                      }} disabled={voted}><Icon.Check /> Aprovar</button>
-                      <button style={{ ...btn.base, ...btn.red, fontSize: 10, opacity: voted ? 0.5 : 1 }} onClick={async () => { await voteApprovalRequest(req.id, 'reject'); onRefresh() }} disabled={voted}>Rejeitar</button>
+                      <button style={{ ...btn.base, ...btn.green, fontSize: 10, opacity: (voted || req.applying) ? 0.5 : 1 }} onClick={async () => {
+                        setVoting(prev => ({ ...prev, [req.id]: 'approve' }))
+                        try {
+                          // The apply itself (if this vote reaches quorum) now
+                          // runs detached server-side: this response only
+                          // confirms the vote landed. `req.applying`/
+                          // `req.last_apply_error`, refreshed below, are what
+                          // report how the apply actually turns out.
+                          await voteApprovalRequest(req.id, 'approve')
+                          onRefresh()
+                        } finally {
+                          setVoting(prev => { const next = { ...prev }; delete next[req.id]; return next })
+                        }
+                      }} disabled={voted || req.applying || !!voting[req.id]}>
+                        {voting[req.id] === 'approve' ? 'Enviando…' : <><Icon.Check /> Aprovar</>}
+                      </button>
+                      <button style={{ ...btn.base, ...btn.red, fontSize: 10, opacity: (voted || req.applying) ? 0.5 : 1 }} onClick={async () => {
+                        setVoting(prev => ({ ...prev, [req.id]: 'reject' }))
+                        try { await voteApprovalRequest(req.id, 'reject'); onRefresh() }
+                        finally { setVoting(prev => { const next = { ...prev }; delete next[req.id]; return next }) }
+                      }} disabled={voted || req.applying || !!voting[req.id]}>
+                        {voting[req.id] === 'reject' ? 'Enviando…' : 'Rejeitar'}
+                      </button>
                     </>
                   ) : (
                     <span style={{ fontSize: 10, color: '#94a3b8', fontStyle: 'italic' }}>
@@ -2015,7 +2324,7 @@ function ApprovacoesTab({ currentUser, config, onRefresh, pendingApprovals }: { 
                         : 'Você não está na lista de aprovadores'}
                     </span>
                   )}
-                  {(currentUser?.username === req.created_by_username || isAdmin) && <button style={{ ...btn.base, ...btn.gray, fontSize: 10 }} onClick={() => cancelApprovalRequest(req.id).then(onRefresh)}>Cancelar</button>}
+                  {!req.applying && (currentUser?.username === req.created_by_username || isAdmin) && <button style={{ ...btn.base, ...btn.gray, fontSize: 10 }} onClick={() => cancelApprovalRequest(req.id).then(onRefresh)}>Cancelar</button>}
                 </div>
               )}
             </div>
@@ -2027,7 +2336,7 @@ function ApprovacoesTab({ currentUser, config, onRefresh, pendingApprovals }: { 
 }
 
 // ─── Config tab ───────────────────────────────────────────────────────────
-function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfig) => Promise<void> }) {
+function ConfigTab({ config, onSave, writeMode }: { config: AppConfig; onSave: (c: AppConfig) => Promise<void>; writeMode: WriteMode }) {
   const [local, setLocal] = useState<AppConfig>(config)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -2041,6 +2350,20 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
   const [expandedPolicy, setExpandedPolicy] = useState<string | null>(null)
   const [allUsers, setAllUsers] = useState<User[]>([])
   const [approverSearch, setApproverSearch] = useState('')
+  const [gitopsConfig, setGitopsConfig] = useState<GitOpsConfig | null>(null)
+  const [gitopsForm, setGitopsForm] = useState<GitOpsConfigUpdate>({})
+  const [gitopsSaving, setGitopsSaving] = useState(false)
+  const [gitopsSaved, setGitopsSaved] = useState(false)
+  const [gitopsError, setGitopsError] = useState<string | null>(null)
+  const [gitopsConnectionTest, setGitopsConnectionTest] = useState<GitOpsConnectionTest | null>(null)
+  // A saved SSH key/known_hosts never comes back from the server (write-only
+  // by design), but showing an always-open, always-empty textarea right
+  // next to "· configurada" reads as an invitation to retype it "just in
+  // case", when nothing needs to change. Collapsed behind an explicit
+  // "Atualizar" button instead: the textarea (and the risk of an accidental
+  // edit) only appears once the admin deliberately asks to replace it.
+  const [editingSshKey, setEditingSshKey] = useState(false)
+  const [editingKnownHosts, setEditingKnownHosts] = useState(false)
   useEffect(() => { setLocal(config) }, [config])
   useEffect(() => { listUsers().then(setAllUsers).catch(() => {}) }, [])
   useEffect(() => {
@@ -2059,6 +2382,10 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
     const id = setInterval(refresh, 15_000)
     return () => clearInterval(id)
   }, [])
+  useEffect(() => {
+    if (writeMode !== 'gitops') return
+    getGitOpsConfig().then(c => { setGitopsConfig(c); setGitopsForm({}) }).catch(() => {})
+  }, [writeMode])
 
   function getErrors(): string[] {
     const errs: string[] = []
@@ -2102,7 +2429,7 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
   }
 
   // "Fazer backup agora" runs server-side against the SAVED config, not
-  // whatever is currently typed in these fields — if bucket/cron/prefix
+  // whatever is currently typed in these fields: if bucket/cron/prefix
   // were just edited but not saved yet, triggering now would silently use
   // the old (possibly empty) values. Block it until there's nothing pending.
   const backupConfigDirty =
@@ -2121,6 +2448,29 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
     }
   }
 
+  async function handleSaveGitOps() {
+    setGitopsSaving(true)
+    setGitopsError(null)
+    setGitopsConnectionTest(null)
+    try {
+      const updated = await saveGitOpsConfig(gitopsForm)
+      setGitopsConfig(updated)
+      setGitopsForm({})
+      setEditingSshKey(false)
+      setEditingKnownHosts(false)
+      setGitopsConnectionTest(updated.connection_test)
+      if (updated.connection_test.ok) {
+        setGitopsSaved(true)
+        setTimeout(() => setGitopsSaved(false), 2000)
+      }
+    } catch (e: unknown) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      setGitopsError(detail ?? 'Falha ao salvar configuração do GitOps.')
+    } finally {
+      setGitopsSaving(false)
+    }
+  }
+
   return (
     <div style={{ flex: 1, overflowY: 'auto', padding: 14 }}>
       <div style={{ marginBottom: 14 }}>
@@ -2129,6 +2479,15 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
           Retenção de flows
           <select value={local.hubble_flow_retention_days ?? 7}
             onChange={e => setLocal(p => ({ ...p, hubble_flow_retention_days: Number(e.target.value) }))}
+            style={{ fontSize: 11, border: '1px solid #e2e8f0', borderRadius: 5, padding: '3px 6px', color: '#334155', background: 'white' }}>
+            {[1, 3, 7, 14, 30].map(d => <option key={d} value={d}>{d} dias</option>)}
+          </select>
+        </label>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: '#475569', marginTop: 8 }}
+          title="Cada IP externo diferente vira uma linha própria, separado da retenção geral porque costuma crescer muito mais rápido.">
+          Retenção de flows de internet
+          <select value={local.hubble_internet_flow_retention_days ?? 1}
+            onChange={e => setLocal(p => ({ ...p, hubble_internet_flow_retention_days: Number(e.target.value) }))}
             style={{ fontSize: 11, border: '1px solid #e2e8f0', borderRadius: 5, padding: '3px 6px', color: '#334155', background: 'white' }}>
             {[1, 3, 7, 14, 30].map(d => <option key={d} value={d}>{d} dias</option>)}
           </select>
@@ -2212,6 +2571,7 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
           </div>
         )}
       </div>
+      {writeMode !== 'gitops' && (
       <div style={{ marginBottom: 14, borderTop: '1px solid #f1f5f9', paddingTop: 14 }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 10 }}>Default-deny automático</div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
@@ -2246,7 +2606,7 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
               </select>
               {local.auto_default_deny_scope === 'future_only' && (
                 <div style={{ fontSize: 9.5, color: '#94a3b8', marginTop: 4, lineHeight: 1.4 }}>
-                  Ao salvar, os namespaces que existem agora ficam de fora pra sempre — só as criadas depois entram na regra. Desligar e ligar essa opção de novo atualiza esse corte.
+                  Ao salvar, os namespaces que existem agora ficam de fora pra sempre: só as criadas depois entram na regra. Desligar e ligar essa opção de novo atualiza esse corte.
                 </div>
               )}
             </div>
@@ -2256,6 +2616,7 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
           O sistema aplica deny automaticamente a cada polling (15s) quando habilitado.
         </div>
       </div>
+      )}
       <div style={{ marginBottom: 14, borderTop: '1px solid #f1f5f9', paddingTop: 14 }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 10 }}>Autosync</div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
@@ -2358,6 +2719,7 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
           </div>
         )}
       </div>
+      {writeMode !== 'gitops' && (
       <div style={{ marginBottom: 14, borderTop: '1px solid #f1f5f9', paddingTop: 14 }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 10 }}>Backup</div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
@@ -2433,13 +2795,124 @@ function ConfigTab({ config, onSave }: { config: AppConfig; onSave: (c: AppConfi
               <div style={{ fontSize: 9.5, color: backupStatus.last_result.ok ? '#94a3b8' : '#b91c1c', padding: '0 8px' }}>
                 {backupStatus.last_result.ok
                   ? `Última execução: ok · ${((backupStatus.last_result.size ?? 0) / 1024).toFixed(1)} KB`
-                  : `Última execução: falhou — ${backupStatus.last_result.error}`}
+                  : `Última execução: falhou (${backupStatus.last_result.error})`}
                 {' '}· {new Date(backupStatus.last_result.timestamp).toLocaleTimeString()}
               </div>
             )}
           </div>
         )}
       </div>
+      )}
+      {writeMode === 'gitops' && gitopsConfig && (
+        <div style={{ marginBottom: 14, borderTop: '1px solid #f1f5f9', paddingTop: 14 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 10 }}>GitOps</div>
+          <div style={{ fontSize: 10, color: '#94a3b8', marginBottom: 10, lineHeight: 1.5 }}>
+            Conexão com o repositório git que o ArgoCD sincroniza.
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>URL do repositório (SSH)</label>
+              <input type="text"
+                value={gitopsForm.repo_url ?? gitopsConfig.repo_url}
+                onChange={e => setGitopsForm(p => ({ ...p, repo_url: e.target.value }))}
+                placeholder="git@git.example.com:org/floodgate-gitops.git"
+                style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 11, fontFamily: 'ui-monospace, monospace', boxSizing: 'border-box' }} />
+            </div>
+            <div style={{ display: 'flex', gap: 10 }}>
+              <div style={{ flex: 1 }}>
+                <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>Branch</label>
+                <input type="text"
+                  value={gitopsForm.repo_branch ?? gitopsConfig.repo_branch}
+                  onChange={e => setGitopsForm(p => ({ ...p, repo_branch: e.target.value }))}
+                  style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 11, boxSizing: 'border-box' }} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>Subpasta das políticas</label>
+                <input type="text"
+                  value={gitopsForm.repo_path ?? gitopsConfig.repo_path}
+                  onChange={e => setGitopsForm(p => ({ ...p, repo_path: e.target.value }))}
+                  style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 11, boxSizing: 'border-box' }} />
+              </div>
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>
+                Chave privada SSH {gitopsConfig.credentials_configured && <span style={{ color: '#16a34a', fontWeight: 400 }}>· configurada</span>}
+              </label>
+              {gitopsConfig.credentials_configured && !editingSshKey ? (
+                <button type="button" onClick={() => setEditingSshKey(true)} style={{ ...btn.base, ...btn.gray, fontSize: 10.5 }}>
+                  Atualizar chave…
+                </button>
+              ) : (
+                <textarea
+                  value={gitopsForm.ssh_private_key ?? ''}
+                  onChange={e => setGitopsForm(p => ({ ...p, ssh_private_key: e.target.value }))}
+                  placeholder={gitopsConfig.credentials_configured ? 'Deixe em branco para manter a chave atual' : '-----BEGIN OPENSSH PRIVATE KEY-----\n...'}
+                  rows={4}
+                  autoFocus={editingSshKey}
+                  style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 10.5, fontFamily: 'ui-monospace, monospace', boxSizing: 'border-box', resize: 'vertical' }} />
+              )}
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>
+                known_hosts (opcional) {gitopsConfig.ssh_known_hosts_configured && <span style={{ color: '#16a34a', fontWeight: 400 }}>· configurado</span>}
+              </label>
+              {gitopsConfig.ssh_known_hosts_configured && !editingKnownHosts ? (
+                <button type="button" onClick={() => setEditingKnownHosts(true)} style={{ ...btn.base, ...btn.gray, fontSize: 10.5 }}>
+                  Atualizar known_hosts…
+                </button>
+              ) : (
+                <textarea
+                  value={gitopsForm.ssh_known_hosts ?? ''}
+                  onChange={e => setGitopsForm(p => ({ ...p, ssh_known_hosts: e.target.value }))}
+                  placeholder={gitopsConfig.ssh_known_hosts_configured ? 'Deixe em branco para manter o known_hosts atual' : 'Sem isso, confia no host no primeiro uso (accept-new)'}
+                  rows={2}
+                  autoFocus={editingKnownHosts}
+                  style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 10.5, fontFamily: 'ui-monospace, monospace', boxSizing: 'border-box', resize: 'vertical' }} />
+              )}
+            </div>
+            <div style={{ display: 'flex', gap: 10 }}>
+              <div style={{ flex: 1 }}>
+                <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>Nome do autor do commit</label>
+                <input type="text"
+                  value={gitopsForm.commit_author_name ?? gitopsConfig.commit_author_name}
+                  onChange={e => setGitopsForm(p => ({ ...p, commit_author_name: e.target.value }))}
+                  style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 11, boxSizing: 'border-box' }} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>E-mail do autor do commit</label>
+                <input type="text"
+                  value={gitopsForm.commit_author_email ?? gitopsConfig.commit_author_email}
+                  onChange={e => setGitopsForm(p => ({ ...p, commit_author_email: e.target.value }))}
+                  style={{ width: '100%', border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 11, boxSizing: 'border-box' }} />
+              </div>
+            </div>
+            {!gitopsConfig.credentials_configured && (
+              <div style={{ background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8, padding: 10, fontSize: 10.5, color: '#92400e', lineHeight: 1.5 }}>
+                ⚠ Repositório ainda não configurado. Toda escrita de política vai falhar até a URL e a chave SSH serem salvas aqui.
+              </div>
+            )}
+            {gitopsError && (
+              <div style={{ fontSize: 10.5, color: '#b91c1c' }}>{gitopsError}</div>
+            )}
+            {gitopsConnectionTest && !gitopsConnectionTest.ok && (
+              <div style={{ background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 8, padding: 10, fontSize: 10.5, color: '#b91c1c', lineHeight: 1.5 }}>
+                ✗ Configuração salva, mas a conexão com o repositório falhou. Confira URL, branch e chave SSH.
+                <div style={{ marginTop: 4, fontFamily: 'ui-monospace, monospace', fontSize: 9.5, color: '#991b1b', wordBreak: 'break-word' }}>
+                  {gitopsConnectionTest.error}
+                </div>
+              </div>
+            )}
+            {gitopsConnectionTest?.ok && (
+              <div style={{ fontSize: 10, color: '#16a34a' }}>✓ Conexão com o repositório testada com sucesso.</div>
+            )}
+            <button
+              onClick={handleSaveGitOps} disabled={gitopsSaving}
+              style={{ ...btn.base, ...(gitopsSaved ? btn.green : btn.blue), width: '100%', justifyContent: 'center', padding: '7px', fontSize: 11, opacity: gitopsSaving ? 0.6 : 1 }}>
+              {gitopsSaving ? 'Salvando e testando conexão…' : gitopsSaved ? '✓ Salvo' : 'Salvar conexão GitOps'}
+            </button>
+          </div>
+        </div>
+      )}
       {(() => {
         const errs = getErrors()
         return (
@@ -2500,16 +2973,20 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   drafts?: Draft[]
 }) {
   // Modo Rascunho: as policies que os rascunhos atuais criariam se
-  // aplicados, somadas às reais — usadas só para detectar flows hoje OK que
+  // aplicados, somadas às reais: usadas só para detectar flows hoje OK que
   // passariam a ser bloqueados, sem mexer no cálculo "Sem política" acima
   // (esse continua contra o cluster real).
-  const effectivePolicies = draftMode && drafts && drafts.length > 0
-    ? computeEffectivePolicies(allPolicies, drafts)
-    : allPolicies
+  // Memoizado: sem isso, teria identidade nova a cada render mesmo com
+  // allPolicies/drafts inalterados, o que anularia o useMemo do pipeline
+  // de filtro abaixo (que depende deste valor).
+  const effectivePolicies = useMemo(
+    () => (draftMode && drafts && drafts.length > 0 ? computeEffectivePolicies(allPolicies, drafts) : allPolicies),
+    [draftMode, drafts, allPolicies],
+  )
   const savedFilters = (() => { try { return JSON.parse(localStorage.getItem(DISC_FILTER_KEY) ?? '{}') } catch { return {} } })()
   const [nsFilter, setNsFilter] = useState<string>(savedFilters.nsFilter ?? 'all')
   // Once narrowed to internet-bound flows, dst_namespace is always
-  // 'internet' — the dst-namespace dropdown above has nothing left to
+  // 'internet': the dst-namespace dropdown above has nothing left to
   // slice by, so this filters by src_namespace instead (which namespace is
   // actually generating that traffic).
   const [srcNsFilter, setSrcNsFilter] = useState<string>(savedFilters.srcNsFilter ?? 'all')
@@ -2527,8 +3004,24 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   function toggleDiscNs(ns: string) {
     setCollapsedNs(prev => { const n = new Set(prev); n.has(ns) ? n.delete(ns) : n.add(ns); return n })
   }
+  // Cada card é um bloco de UI rico (múltiplas linhas, badges, botões
+  // condicionais); um namespace com milhares de flows renderizando todos
+  // de uma vez pesa no commit do React mesmo com o pipeline de filtro já
+  // memoizado acima. Mostra só os N mais recentes por namespace por
+  // padrão, com um botão pra revelar mais sob demanda (por namespace).
+  // Ambientes reais chegaram a ter >10k flows num único namespace
+  // ("internet"), então o incremento é maior que o primeiro instinto de
+  // 100-200, senão "Mostrar mais" precisaria de dezenas de cliques.
+  const DISC_ROWS_PER_PAGE = 300
+  const [shownPerNs, setShownPerNs] = useState<Record<string, number>>({})
+  function showMoreForNs(ns: string) {
+    setShownPerNs(prev => ({ ...prev, [ns]: (prev[ns] ?? DISC_ROWS_PER_PAGE) + DISC_ROWS_PER_PAGE }))
+  }
+  function showAllForNs(ns: string, total: number) {
+    setShownPerNs(prev => ({ ...prev, [ns]: total }))
+  }
 
-  // "Abrir na Descoberta" (clicado no aviso de fluxo bloqueado do gráfico) —
+  // "Abrir na Descoberta" (clicado no aviso de fluxo bloqueado do gráfico):
   // acha o card do flow, força namespace/filtros que o esconderiam a
   // aparecer, rola até ele e pisca um destaque.
   const [highlightedFlowId, setHighlightedFlowId] = useState<string | null>(null)
@@ -2541,6 +3034,9 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
     setNsFilter('all')
     setVerdictFilter('all')
     setCollapsedNs(prev => { if (!prev.has(flow.dst_namespace)) return prev; const n = new Set(prev); n.delete(flow.dst_namespace); return n })
+    // O flow pode estar além do limite "mostrar mais" do seu namespace:
+    // sem isso, o ref nunca existe e o scroll/destaque abaixo não acha nada.
+    setShownPerNs(prev => ({ ...prev, [flow.dst_namespace]: Number.MAX_SAFE_INTEGER }))
     setHighlightedFlowId(focusFlow.flowId)
     requestAnimationFrame(() => cardRefs.current[focusFlow.flowId]?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
     const t = setTimeout(() => setHighlightedFlowId(null), 2200)
@@ -2557,42 +3053,52 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
     try { localStorage.setItem(DISC_FILTER_KEY, JSON.stringify({ nsFilter, srcNsFilter, verdictFilter, searchText, onlyDraftBlocked, collapsedNs: [...collapsedNs] })) } catch { }
   }, [nsFilter, srcNsFilter, verdictFilter, searchText, onlyDraftBlocked, collapsedNs])
 
-  // O filtro só faz sentido com o Modo Rascunho ligado — se for desligado
+  // O filtro só faz sentido com o Modo Rascunho ligado: se for desligado
   // enquanto ativo, desliga junto em vez de esconder tudo silenciosamente.
   React.useEffect(() => {
     if (!draftMode) setOnlyDraftBlocked(false)
   }, [draftMode])
 
-  const visibleFlows = flows.filter(f =>
-    !config.ignored_namespaces.includes(f.src_namespace) &&
-    !config.ignored_namespaces.includes(f.dst_namespace)
-  )
+  // Todo esse pipeline (filtrar → agrupar → derivar as listas auxiliares)
+  // recalculava do zero em TODO render do componente, inclusive quando o
+  // motivo do render não tinha nada a ver com flows (ex: marcar um
+  // checkbox, expandir/recolher um namespace). Com milhares de flows isso
+  // é o que mais pesava no thread principal do navegador. Memoizado pelos
+  // inputs reais: só recalcula quando flows/policies/filtros de fato mudam.
+  const { visibleFlows, namespaces, hasInternetFlows, internetSrcNamespaces, filtered, grouped, unprotected, previewBlockedFlows } = useMemo(() => {
+    const visibleFlows = flows.filter(f =>
+      !config.ignored_namespaces.includes(f.src_namespace) &&
+      !config.ignored_namespaces.includes(f.dst_namespace)
+    )
 
-  const namespaces = Array.from(new Set(visibleFlows.map(f => f.dst_namespace))).sort()
-  const hasInternetFlows = visibleFlows.some(f => f.dst_namespace === 'internet')
-  const internetSrcNamespaces = Array.from(
-    new Set(visibleFlows.filter(f => f.dst_namespace === 'internet').map(f => f.src_namespace))
-  ).sort()
+    const namespaces = Array.from(new Set(visibleFlows.map(f => f.dst_namespace))).sort()
+    const hasInternetFlows = visibleFlows.some(f => f.dst_namespace === 'internet')
+    const internetSrcNamespaces = Array.from(
+      new Set(visibleFlows.filter(f => f.dst_namespace === 'internet').map(f => f.src_namespace))
+    ).sort()
 
-  const filtered = visibleFlows.filter(f =>
-    (nsFilter === 'all' || f.dst_namespace === nsFilter) &&
-    (nsFilter !== 'internet' || srcNsFilter === 'all' || f.src_namespace === srcNsFilter) &&
-    (verdictFilter === 'all' || f.verdict === verdictFilter) &&
-    (!searchText || [f.src_workload, f.src_namespace, f.dst_workload, f.dst_namespace].some(s => s.toLowerCase().includes(searchText.toLowerCase()))) &&
-    (!onlyDraftBlocked || (draftMode && f.verdict === 'FORWARDED' && isFlowBlocked(f, effectivePolicies)))
-  )
+    const filtered = visibleFlows.filter(f =>
+      (nsFilter === 'all' || f.dst_namespace === nsFilter) &&
+      (nsFilter !== 'internet' || srcNsFilter === 'all' || f.src_namespace === srcNsFilter) &&
+      (verdictFilter === 'all' || f.verdict === verdictFilter) &&
+      (!searchText || [f.src_workload, f.src_namespace, f.dst_workload, f.dst_namespace].some(s => s.toLowerCase().includes(searchText.toLowerCase()))) &&
+      (!onlyDraftBlocked || (draftMode && f.verdict === 'FORWARDED' && isFlowBlocked(f, effectivePolicies)))
+    )
 
-  const grouped = filtered.reduce<Record<string, CiliumFlowSummary[]>>((acc, f) => {
-    ;(acc[f.dst_namespace] ??= []).push(f)
-    return acc
-  }, {})
+    const grouped = filtered.reduce<Record<string, CiliumFlowSummary[]>>((acc, f) => {
+      ;(acc[f.dst_namespace] ??= []).push(f)
+      return acc
+    }, {})
 
-  const unprotected = filtered.filter(f => !f.has_policy && f.verdict === 'DROPPED')
+    const unprotected = filtered.filter(f => !f.has_policy && f.verdict === 'DROPPED')
 
-  // Modo Rascunho: flows que funcionam hoje mas os rascunhos atuais
-  // bloqueariam — mesma lista usada linha a linha, elevada aqui pra
-  // alimentar a seleção em massa (espelha o "Sem política" acima).
-  const previewBlockedFlows = draftMode ? filtered.filter(f => f.verdict === 'FORWARDED' && isFlowBlocked(f, effectivePolicies)) : []
+    // Modo Rascunho: flows que funcionam hoje mas os rascunhos atuais
+    // bloqueariam; mesma lista usada linha a linha, elevada aqui pra
+    // alimentar a seleção em massa (espelha o "Sem política" acima).
+    const previewBlockedFlows = draftMode ? filtered.filter(f => f.verdict === 'FORWARDED' && isFlowBlocked(f, effectivePolicies)) : []
+
+    return { visibleFlows, namespaces, hasInternetFlows, internetSrcNamespaces, filtered, grouped, unprotected, previewBlockedFlows }
+  }, [flows, config.ignored_namespaces, nsFilter, srcNsFilter, verdictFilter, searchText, onlyDraftBlocked, draftMode, effectivePolicies])
 
   function toggleSelect(id: string) {
     setSelected(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
@@ -2641,13 +3147,13 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   }
 
   // A flow to the internet (dst_namespace: 'internet', dst_workload: the
-  // raw destination IP) can never become a normal allow draft — there's no
+  // raw destination IP) can never become a normal allow draft: there's no
   // K8s namespace called "internet" to create a NetworkPolicy in, and
   // "target service" doesn't mean anything for an external IP. It needs a
   // CIDR-egress draft instead (dst_cidr: '<ip>/32'), scoped to just the
   // source workload. createCidrPolicy() takes the policy's own namespace as
   // `namespace` (here: the source's, since this restricts ITS egress) and
-  // the workload to scope it to as `service_name` — matching the same
+  // the workload to scope it to as `service_name`, matching the same
   // dst_namespace/dst_service fields the existing manual CIDR form in this
   // file already writes them into for an egress draft (see handleSubmit
   // above), not a coincidence.
@@ -2729,7 +3235,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
         {isOn && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
             <span style={{ fontSize: 11, color: '#64748b' }}>
-              Flows salvos por <strong>{config.hubble_flow_retention_days ?? 7} dias</strong> · configure em <em>Config</em>
+              Flows salvos por <strong>{config.hubble_flow_retention_days ?? 7} dias</strong> (internet: <strong>{config.hubble_internet_flow_retention_days ?? 1} dia(s)</strong>) · configure em <em>Config</em>
             </span>
             <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
               <span style={{ width: 8, height: 8, borderRadius: '50%', display: 'inline-block', background: streaming ? '#10b981' : '#f59e0b' }} />
@@ -2879,9 +3385,12 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
               <span style={{ fontSize: 11, fontWeight: 700, color: '#334155', flex: 1 }}>{ns}</span>
               <span style={{ fontSize: 10, color: '#94a3b8', background: '#e2e8f0', borderRadius: 10, padding: '1px 7px', fontWeight: 600 }}>{nsFlows.length}</span>
             </button>
-            {isOpen && (
+            {isOpen && (() => {
+              const shownCount = shownPerNs[ns] ?? DISC_ROWS_PER_PAGE
+              const visibleNsFlows = nsFlows.slice(0, shownCount)
+              return (
             <div style={{ padding: '8px 14px', display: 'flex', flexDirection: 'column', gap: 6 }}>
-              {nsFlows.map(f => {
+              {visibleNsFlows.map(f => {
                 const matchedPolicy = findMatchedPolicy(f)
                 const gap = !f.has_policy && f.verdict === 'DROPPED' ? classifyFlowGap({
                   src_workload: f.src_workload, src_namespace: f.src_namespace,
@@ -2889,7 +3398,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                 }, allPolicies) : null
                 const gapDirection = gapDirectionOf(gap)
                 // Internet só existe como CIDR-egress (draftForFlow força isso
-                // independente do gap calculado) — o rótulo precisa bater.
+                // independente do gap calculado); o rótulo precisa bater.
                 const gapLabel = f.dst_namespace === 'internet' ? 'Criar política de egress (CIDR)'
                   : gapDirection === 'both' ? 'Criar política de ingress e egress' : gapDirection === 'egress' ? 'Criar política de egress' : 'Criar política de ingress'
 
@@ -2986,7 +3495,7 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                             setPolicyYaml({ name: title, content: yaml })
                           } catch (e: unknown) {
                             const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-                            setPolicyYaml({ name: title, content: `# Erro ao gerar YAML\n# ${detail ?? 'motivo desconhecido — confira o console do navegador'}` })
+                            setPolicyYaml({ name: title, content: `# Erro ao gerar YAML\n# ${detail ?? 'motivo desconhecido, confira o console do navegador'}` })
                           } finally {
                             setLoadingYaml(null)
                           }
@@ -3012,8 +3521,19 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
                   </div>
                 )
               })}
+              {nsFlows.length > shownCount && (
+                <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
+                  <button onClick={() => showMoreForNs(ns)} style={{ ...btn.base, ...btn.gray, fontSize: 10.5 }}>
+                    Mostrar mais {Math.min(DISC_ROWS_PER_PAGE, nsFlows.length - shownCount)} (de {nsFlows.length - shownCount} restantes)
+                  </button>
+                  <button onClick={() => showAllForNs(ns, nsFlows.length)} style={{ ...btn.base, ...btn.gray, fontSize: 10.5 }} title="Pode deixar a lista pesada com muitos flows">
+                    Mostrar todos
+                  </button>
+                </div>
+              )}
             </div>
-            )}
+              )
+            })()}
           </div>
           )
         })}
@@ -3064,7 +3584,7 @@ interface Props {
   pendingApprovals?: ApprovalRequest[]
   requestTab?: 'aprovacoes' | 'drafts' | 'descoberta' | null
   onTabOpened?: () => void
-  // "Abrir na Descoberta" (FlowExplainPanel, no gráfico) — flowId + token
+  // "Abrir na Descoberta" (FlowExplainPanel, no gráfico): flowId + token
   // (token changes every click, even for the same flow, to re-trigger the
   // scroll/highlight in DescobertaTab)
   focusFlow?: { flowId: string; token: number } | null
@@ -3096,7 +3616,7 @@ export default function RightPanel({
   draftMode = false, draftModeFlows = [],
 }: Props) {
   // Defaults here must match what the server renders (no localStorage access
-  // during the initial render) — reading it happens in the mount effect
+  // during the initial render); reading it happens in the mount effect
   // below, otherwise the server-rendered HTML and the client's first render
   // disagree and React throws a hydration mismatch (#418) whenever a user
   // has a non-default value saved.
@@ -3120,7 +3640,7 @@ export default function RightPanel({
 
   const allowedNamespaces = new Set(currentUser?.allowed_namespaces ?? [])
   // Granted namespaces (has_ns_permissions) make someone ns_admin-equivalent
-  // regardless of the literal role string — role and namespace_permissions
+  // regardless of the literal role string: role and namespace_permissions
   // can drift out of sync (e.g. an admin setting a user's role dropdown back
   // to 'viewer' without first clearing their granted namespaces), and these
   // checks should stay correct either way, matching the server-side
@@ -3354,12 +3874,12 @@ export default function RightPanel({
               onUnignore={isAdmin ? (ns) => onSaveConfig({ ...config, ignored_namespaces: config.ignored_namespaces.filter(x => x !== ns) }) : undefined}
             />}
             {activeTab === 'drafts' && !isViewer && <DraftsTab drafts={drafts} services={services} ciliumFlows={ciliumFlows} config={config} currentUser={currentUser} onRemove={onRemoveDraft} onApply={onApplyDraft} onApplyAll={onApplyAllDrafts} onDiscardAll={onDiscardAllDrafts} onUpdatePort={onUpdateDraftPort} onAddDraft={onAddDraft} allPolicies={allPolicies} draftMode={draftMode} draftModeFlows={draftModeFlows} />}
-            {activeTab === 'policies' && <PoliciesTab policies={policies} allPolicies={allPolicies} services={services} isAdmin={isAdmin} isViewer={isViewer} canManageNamespace={canManageNamespace} onDelete={onPoliciesChanged} onRefresh={onPoliciesChanged} />}
+            {activeTab === 'policies' && <PoliciesTab policies={policies} allPolicies={allPolicies} services={services} isAdmin={isAdmin} isViewer={isViewer} canManageNamespace={canManageNamespace} onDelete={onPoliciesChanged} onRefresh={onPoliciesChanged} currentUser={currentUser} />}
             {activeTab === 'aprovacoes' && <ApprovacoesTab key={approvalTabKey} currentUser={currentUser} config={config} onRefresh={onPoliciesChanged} pendingApprovals={pendingApprovals} />}
             {activeTab === 'seguranca' && <SegurancaTab services={services} policies={policies} config={config} isAdmin={isAdmin} canManageNamespace={canManageNamespace} onRefresh={onPoliciesChanged} onViewNamespace={onViewNamespace} draftMode={draftMode} onAddDraft={onAddDraft} />}
             {activeTab === 'descoberta' && isAdmin && <DescobertaTab flows={ciliumFlows} config={config} streaming={ciliumStreaming} allPolicies={allPolicies} onClear={onClearCiliumFlows} onAddDraft={onAddDraft} onSaveConfig={onSaveConfig} onSwitchTab={(tab) => setActiveTab(tab)} focusFlow={focusFlow} draftMode={draftMode} drafts={drafts} />}
             {activeTab === 'descoberta' && !isAdmin && <Forbidden />}
-            {activeTab === 'config' && isAdmin && <ConfigTab config={config} onSave={onSaveConfig} />}
+            {activeTab === 'config' && isAdmin && <ConfigTab config={config} onSave={onSaveConfig} writeMode={currentUser?.write_mode ?? 'direct'} />}
             {activeTab === 'config' && !isAdmin && <Forbidden />}
           </div>
         </div>
