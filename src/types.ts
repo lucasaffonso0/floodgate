@@ -81,13 +81,13 @@ export interface IsolateNamespaceRequest {
 
 export interface Draft {
   id: string
-  // Absent = 'connection' (allow/egress/CIDR) — the original, only kind
+  // Absent = 'connection' (allow/egress/CIDR): the original, only kind
   // this used to represent, so every existing call site that only ever
   // built/read connection drafts keeps working unchanged. 'isolate'/
   // 'restrict' stage a namespace/service default-deny instead, via their
-  // own fields below — the connection fields above are left at inert
+  // own fields below; the connection fields above are left at inert
   // defaults ('', []) for those two kinds, never read for them.
-  kind?: 'connection' | 'isolate' | 'restrict' | 'toggle'
+  kind?: 'connection' | 'isolate' | 'restrict' | 'toggle' | 'remove'
   src_workload: string
   src_namespace: string
   dst_service: string
@@ -105,7 +105,7 @@ export interface Draft {
   restrict_namespace?: string
   restrict_direction?: 'ingress' | 'egress'
   // 'toggle': liga/desliga o companion (allow-intranamespace ou
-  // allow-egress-internet) de um namespace JÁ isolado de verdade — diferente
+  // allow-egress-internet) de um namespace JÁ isolado de verdade, diferente
   // de 'isolate', que cria o isolamento do zero. toggle_directions só se
   // aplica a 'intra' (o companion de internet é sempre só egress): captura
   // quais direções o isolamento real já cobre no momento em que o rascunho
@@ -115,6 +115,14 @@ export interface Draft {
   toggle_option?: 'intra' | 'internet'
   toggle_action?: 'enable' | 'disable'
   toggle_directions?: ('ingress' | 'egress')[]
+  // 'remove': apaga uma ou mais policies REAIS existentes (por nome);
+  // conta como um rascunho igual a qualquer outro: fabrica nada em
+  // draftToPolicies() (mesma ideia do toggle+disable), só some da view
+  // efetiva até ser de fato aplicado. Cobre remoção de isolamento
+  // (namespace inteiro + companions), default-deny de serviço, e bloqueio
+  // implícito (allow rules cuja remoção reabre o serviço).
+  remove_namespace?: string
+  remove_policy_names?: string[]
 }
 
 export interface CidrPolicyRequest {

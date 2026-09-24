@@ -102,8 +102,13 @@ describe('draftToPolicies', () => {
     expect(result).toEqual([expect.objectContaining({ policy_type: 'allow-egress', namespace: 'backend', dst_service: 'internet' })])
   })
 
-  it('fabricates nothing for a "disable" toggle — its effect is excluding a real policy, not adding one', () => {
+  it('fabricates nothing for a "disable" toggle: its effect is excluding a real policy, not adding one', () => {
     const d = draft({ kind: 'toggle', toggle_namespace: 'backend', toggle_option: 'intra', toggle_action: 'disable' })
+    expect(draftToPolicies(d)).toEqual([])
+  })
+
+  it('fabricates nothing for a "remove" draft: its effect is excluding real policies, not adding one', () => {
+    const d = draft({ kind: 'remove', remove_namespace: 'backend', remove_policy_names: ['floodgate-ns-deny-ingress-backend'] })
     expect(draftToPolicies(d)).toEqual([])
   })
 })
@@ -130,6 +135,23 @@ describe('computeEffectivePolicies', () => {
     expect(result).toHaveLength(2)
     expect(result.some(p => p.policy_type === 'allow-egress' && p.dst_service === 'internet')).toBe(true)
   })
+
+  it('excludes the real policies named by a "remove" draft: e.g. undoing namespace isolation must not apply live while staged', () => {
+    const real = [
+      policy({ name: 'floodgate-ns-deny-ingress-backend', policy_type: 'restrict-ingress', namespace: 'backend', dst_service: '' }),
+      policy({ name: 'floodgate-intra-ingress-backend', policy_type: 'allow-intranamespace', namespace: 'backend' }),
+      policy({ name: 'unrelated', policy_type: 'allow', namespace: 'backend', dst_service: 'worker' }),
+    ]
+    const drafts = [draft({ kind: 'remove', remove_namespace: 'backend', remove_policy_names: ['floodgate-ns-deny-ingress-backend', 'floodgate-intra-ingress-backend'] })]
+    const result = computeEffectivePolicies(real, drafts)
+    expect(result).toEqual([real[2]])
+  })
+
+  it('leaves unrelated real policies untouched by a "remove" draft for a different namespace', () => {
+    const real = [policy({ name: 'p', policy_type: 'restrict-ingress', namespace: 'frontend', dst_service: '' })]
+    const drafts = [draft({ kind: 'remove', remove_namespace: 'backend', remove_policy_names: ['p'] })]
+    expect(computeEffectivePolicies(real, drafts)).toEqual(real)
+  })
 })
 
 describe('simulateImpact', () => {
@@ -138,7 +160,7 @@ describe('simulateImpact', () => {
     const realPolicies: NetworkPolicyInfo[] = []
     const drafts = [draft({ kind: 'isolate', isolate_namespace: 'backend', isolate_direction: 'egress', isolate_allow_intra: false, isolate_allow_internet: false })]
     // isolating backend's egress doesn't block this ingress flow (backend is
-    // the destination here, not the source) — use frontend instead to break it
+    // the destination here, not the source); use frontend instead to break it
     const drafts2 = [draft({ kind: 'isolate', isolate_namespace: 'frontend', isolate_direction: 'egress', isolate_allow_intra: false, isolate_allow_internet: false })]
     expect(simulateImpact(flows, realPolicies, drafts).breaking).toEqual([])
     expect(simulateImpact(flows, realPolicies, drafts2).breaking.map(f => f.id)).toEqual(['f1'])
@@ -164,7 +186,7 @@ describe('simulateImpact', () => {
 
   it('flags a flow as breaking when a "disable intra" toggle draft removes the exception it depends on', () => {
     // Same-namespace flow that only passes today because of the intra-namespace
-    // exception on top of a namespace-wide restrict — same shape as
+    // exception on top of a namespace-wide restrict, same shape as
     // auth-service -> session-cache inside "identity".
     const flows = [flow({ src_workload: 'auth', src_namespace: 'identity', dst_workload: 'cache', dst_namespace: 'identity' })]
     const realPolicies = [

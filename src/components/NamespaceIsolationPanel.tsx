@@ -58,14 +58,14 @@ function NsDirRow({
           <div style={{ fontSize: 9.5, fontWeight: 700, color: '#b45309', background: '#fef3c7', borderRadius: 5, padding: '3px 7px', display: 'inline-block', alignSelf: 'flex-start' }}>
             🧪 Seria isolado pelo rascunho
           </div>
-          <div style={{ fontSize: 9, color: '#92400e' }}>Já há um rascunho pendente — veja a aba Rascunhos</div>
+          <div style={{ fontSize: 9, color: '#92400e' }}>Já há um rascunho pendente: veja a aba Rascunhos</div>
         </div>
       )}
     </div>
   )
 }
 
-// The interactive body of namespace isolation — status per direction, live
+// The interactive body of namespace isolation: status per direction, live
 // intra/internet toggles, exceptions list, apply/remove. No outer chrome
 // (no card, no header, no close button): the caller supplies that context.
 // Shared between NetworkGraph's namespace panel and the Segurança tab so
@@ -89,7 +89,7 @@ export function NamespaceIsolationPanel({
 
   // Modo Rascunho: essa direção está aberta nas policies reais, mas um
   // isolate (ou restrict de algum service dela) pendente vai fechá-la assim
-  // que for aplicado — sem isso o painel de namespace parecia "normal" com
+  // que for aplicado; sem isso o painel de namespace parecia "normal" com
   // um rascunho pendente pra ela, igual ao que já foi corrigido no painel
   // de serviço.
   const effectivePolicies = draftMode && drafts ? computeEffectivePolicies(policies, drafts) : policies
@@ -102,7 +102,7 @@ export function NamespaceIsolationPanel({
   const hasInternetPolicy = policies.some(p => p.namespace === namespace && p.policy_type === 'allow-egress' && p.dst_service === 'internet')
 
   // Modo Rascunho: reflete no switch o estado que valeria DEPOIS de aplicar
-  // o rascunho pendente (se houver um), não o real — e trava o switch nesse
+  // o rascunho pendente (se houver um), não o real; e trava o switch nesse
   // meio tempo pra não empilhar um segundo rascunho contraditório em cima.
   const intraDraftPending    = !!draftMode && !!drafts?.some(d => d.kind === 'toggle' && d.toggle_namespace === namespace && d.toggle_option === 'intra')
   const internetDraftPending = !!draftMode && !!drafts?.some(d => d.kind === 'toggle' && d.toggle_namespace === namespace && d.toggle_option === 'internet')
@@ -148,23 +148,33 @@ export function NamespaceIsolationPanel({
     const companions = otherRestrict ? [] : allCompanions
 
     // Qualquer outra policy que sobrar continua restringindo implicitamente
-    // o que ela seleciona, mesmo sem o restrict — avisa antes de deixar o
+    // o que ela seleciona, mesmo sem o restrict; avisa antes de deixar o
     // namespace "parecendo aberto" sem estar de verdade. O restrict da OUTRA
     // direção fica de fora: é isolamento próprio dela, não uma regra
     // residual, e remover só uma direção não pode apagar a outra também. Se
     // a outra direção sobrevive, os companions dela (intra/internet) também
-    // ficam de fora — ainda servem pra isolação que continua ativa.
+    // ficam de fora: ainda servem pra isolação que continua ativa.
     const excludeNames = [p.name, ...companions.map(c => c.name)]
     if (otherRestrict) excludeNames.push(otherRestrict.name, ...allCompanions.map(c => c.name))
     const others = getOtherPoliciesInNamespace(namespace, excludeNames, policies)
-    // Cancelar aqui precisa abortar a ação inteira — não só a parte de
-    // remover as "outras" regras — senão o isolamento (e os companions dele)
+    // Cancelar aqui precisa abortar a ação inteira, não só a parte de
+    // remover as "outras" regras: senão o isolamento (e os companions dele)
     // são removidos de qualquer forma, mesmo com o usuário clicando Cancelar.
     if (others.length > 0) {
       const confirmed = confirm(
         `Remover o isolamento de "${namespace}" também remove ${others.length === 1 ? 'esta outra regra' : `estas outras ${others.length} regras`} (${others.map(o => o.name).join(', ')}), que ficariam sem função e continuariam restringindo o que elas selecionam.\n\nRemover tudo?`
       )
       if (!confirmed) return
+    }
+
+    if (draftMode) {
+      onAddDraft?.({
+        kind: 'remove', remove_namespace: namespace,
+        remove_policy_names: [p.name, ...companions.map(c => c.name), ...others.map(o => o.name)],
+        src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: 'both',
+      })
+      setResult('Adicionado aos rascunhos')
+      return
     }
 
     setApplying(true); setResult(null)
@@ -310,7 +320,7 @@ export function NamespaceIsolationPanel({
                 <button
                   disabled={applying || intraDraftPending}
                   onClick={toggleIntra}
-                  title={intraDraftPending ? 'Já há um rascunho pendente pra esse toggle — veja a aba Rascunhos' : undefined}
+                  title={intraDraftPending ? 'Já há um rascunho pendente pra esse toggle: veja a aba Rascunhos' : undefined}
                   style={{
                     width: 36, height: 20, borderRadius: 10, border: 'none', cursor: (applying || intraDraftPending) ? 'not-allowed' : 'pointer',
                     background: effectiveHasIntraPolicy ? '#10b981' : '#cbd5e1', position: 'relative', flexShrink: 0, transition: 'background 0.2s', padding: 0,
@@ -322,7 +332,7 @@ export function NamespaceIsolationPanel({
                 </button>
               </div>
               {intraDraftPending && (
-                <div style={{ fontSize: 9, color: '#92400e', marginTop: -3 }}>🧪 Rascunho pendente — veja a aba Rascunhos</div>
+                <div style={{ fontSize: 9, color: '#92400e', marginTop: -3 }}>🧪 Rascunho pendente: veja a aba Rascunhos</div>
               )}
               {/* Internet egress toggle: only relevant when egress is isolated */}
               {nsIsolatedEg && (
@@ -334,7 +344,7 @@ export function NamespaceIsolationPanel({
                   <button
                     disabled={applying || internetDraftPending}
                     onClick={toggleInternet}
-                    title={internetDraftPending ? 'Já há um rascunho pendente pra esse toggle — veja a aba Rascunhos' : undefined}
+                    title={internetDraftPending ? 'Já há um rascunho pendente pra esse toggle: veja a aba Rascunhos' : undefined}
                     style={{
                       width: 36, height: 20, borderRadius: 10, border: 'none', cursor: (applying || internetDraftPending) ? 'not-allowed' : 'pointer',
                       background: effectiveHasInternetPolicy ? '#10b981' : '#cbd5e1', position: 'relative', flexShrink: 0, transition: 'background 0.2s', padding: 0,
@@ -347,7 +357,7 @@ export function NamespaceIsolationPanel({
                 </div>
               )}
               {internetDraftPending && (
-                <div style={{ fontSize: 9, color: '#92400e', marginTop: -3 }}>🧪 Rascunho pendente — veja a aba Rascunhos</div>
+                <div style={{ fontSize: 9, color: '#92400e', marginTop: -3 }}>🧪 Rascunho pendente: veja a aba Rascunhos</div>
               )}
             </div>
           )}
@@ -355,13 +365,13 @@ export function NamespaceIsolationPanel({
           {/* Pre-apply options: shown only when not fully isolated yet. Once
               both directions already have a pending draft, neither this
               button nor the individual "Isolar ingress/egress" ones below
-              are actionable anymore — hide the toggles too, since nothing
+              are actionable anymore; hide the toggles too, since nothing
               left in this panel would consume them. */}
           {!fullyIsolated && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {ingressDraftBlocked && egressDraftBlocked ? (
                 <div style={{ fontSize: 9, color: '#92400e', textAlign: 'center' }}>
-                  🧪 Já há um rascunho pendente pras duas direções — veja a aba Rascunhos
+                  🧪 Já há um rascunho pendente pras duas direções: veja a aba Rascunhos
                 </div>
               ) : (
                 <>
@@ -415,16 +425,29 @@ export function NamespaceIsolationPanel({
             <button
               disabled={applying}
               onClick={async () => {
+                // Companion policies created by isolateNamespace (intra-namespace allow + internet egress)
+                const companions = policies.filter(p =>
+                  p.namespace === namespace &&
+                  (p.policy_type === 'allow-intranamespace' ||
+                   (p.policy_type === 'allow-egress' && p.dst_service === 'internet'))
+                )
+                if (draftMode) {
+                  onAddDraft?.({
+                    kind: 'remove', remove_namespace: namespace,
+                    remove_policy_names: [
+                      ...(nsIngressPolicy ? [nsIngressPolicy.name] : []),
+                      ...(nsEgressPolicy ? [nsEgressPolicy.name] : []),
+                      ...companions.map(c => c.name),
+                    ],
+                    src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: 'both',
+                  })
+                  setResult('Adicionado aos rascunhos')
+                  return
+                }
                 setApplying(true); setResult(null)
                 try {
                   if (nsIngressPolicy) await deleteNetworkPolicy(nsIngressPolicy.namespace, nsIngressPolicy.name)
                   if (nsEgressPolicy)  await deleteNetworkPolicy(nsEgressPolicy.namespace, nsEgressPolicy.name)
-                  // Remove companion policies created by isolateNamespace (intra-namespace allow + internet egress)
-                  const companions = policies.filter(p =>
-                    p.namespace === namespace &&
-                    (p.policy_type === 'allow-intranamespace' ||
-                     (p.policy_type === 'allow-egress' && p.dst_service === 'internet'))
-                  )
                   for (const c of companions) await deleteNetworkPolicy(c.namespace, c.name)
                   onPolicyChanged()
                 } catch {

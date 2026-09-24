@@ -32,7 +32,7 @@ export function isFlowBlocked(
   return !exemptAtSrc
 }
 
-// The NetworkPolicy objects a draft *would* create if applied — mirrors
+// The NetworkPolicy objects a draft *would* create if applied: mirrors
 // k8s.ts's createNetworkPolicy()/createEgressNetworkPolicy()/
 // createCidrPolicy()/isolateNamespace()/restrictService(), but only builds
 // the plain objects in memory. No Kubernetes API call, nothing persisted.
@@ -66,8 +66,13 @@ export function draftToPolicies(draft: Draft): NetworkPolicyInfo[] {
     })]
   }
 
+  // 'remove': apaga policy(ies) reais existentes. Mesma ideia do
+  // toggle+disable: não fabrica nada aqui, a remoção é modelada como
+  // exclusão em computeEffectivePolicies().
+  if (draft.kind === 'remove') return []
+
   // 'toggle': liga/desliga o companion de um isolamento JÁ real. 'disable'
-  // não fabrica nada aqui — a remoção é modelada como exclusão da policy
+  // não fabrica nada aqui: a remoção é modelada como exclusão da policy
   // real correspondente em computeEffectivePolicies(), não como uma policy
   // fabricada a mais.
   if (draft.kind === 'toggle') {
@@ -84,7 +89,7 @@ export function draftToPolicies(draft: Draft): NetworkPolicyInfo[] {
     })]
   }
 
-  // 'connection' (allow/egress/CIDR) — the kind every draft used to be.
+  // 'connection' (allow/egress/CIDR): the kind every draft used to be.
   const out: NetworkPolicyInfo[] = []
   const isCidr = !!draft.src_cidr || !!draft.dst_cidr
   const wantsIngress = draft.policy_direction === 'ingress' || draft.policy_direction === 'both'
@@ -132,21 +137,27 @@ function matchesToggleTarget(p: NetworkPolicyInfo, d: Draft): boolean {
   return p.policy_type === 'allow-egress' && p.dst_service === 'internet'
 }
 
+function matchesRemoveTarget(p: NetworkPolicyInfo, d: Draft): boolean {
+  if (d.kind !== 'remove') return false
+  if (p.namespace !== d.remove_namespace) return false
+  return !!d.remove_policy_names?.includes(p.name)
+}
+
 // The single "real + drafts" view every consumer (graph preview, Descoberta,
 // impact banner, panel status) should render against. Additive for every
-// draft kind except 'toggle'+'disable', which instead EXCLUDES the matching
-// real companion policy — the one case where a draft's effect is "this real
-// policy stops existing" rather than "this new policy gets added".
+// draft kind except 'toggle'+'disable' and 'remove', which instead EXCLUDE
+// the matching real policy: the one case where a draft's effect is "this
+// real policy stops existing" rather than "this new policy gets added".
 export function computeEffectivePolicies(realPolicies: NetworkPolicyInfo[], drafts: Draft[]): NetworkPolicyInfo[] {
-  const disableDrafts = drafts.filter(d => d.kind === 'toggle' && d.toggle_action === 'disable')
-  const base = disableDrafts.length === 0
+  const exclusionDrafts = drafts.filter(d => (d.kind === 'toggle' && d.toggle_action === 'disable') || d.kind === 'remove')
+  const base = exclusionDrafts.length === 0
     ? realPolicies
-    : realPolicies.filter(p => !disableDrafts.some(d => matchesToggleTarget(p, d)))
+    : realPolicies.filter(p => !exclusionDrafts.some(d => matchesToggleTarget(p, d) || matchesRemoveTarget(p, d)))
   return [...base, ...drafts.flatMap(draftToPolicies)]
 }
 
 // Compares "real policies" against "real policies + what these drafts
-// would create", against real observed traffic (Descoberta) — which flows
+// would create", against real observed traffic (Descoberta): which flows
 // that work today would start failing, and which ones that fail today
 // would start working, if every current draft got applied.
 export function simulateImpact(
