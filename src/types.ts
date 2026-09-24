@@ -141,6 +141,13 @@ export interface AppConfig {
   autosync_interval_s: number
   hubble_discovery_enabled: boolean
   hubble_flow_retention_days: number
+  // Shorter, separate retention for internet-bound flows (dst_namespace
+  // 'internet'): every distinct external IP a pod talks to becomes its
+  // own permanent row, unlike in-cluster traffic which collapses onto a
+  // stable service identity, so this is the main driver of unbounded
+  // discovered_flows growth. Kept apart from hubble_flow_retention_days,
+  // which still governs in-cluster flow history.
+  hubble_internet_flow_retention_days: number
   backup_enabled: boolean
   backup_cron: string
   backup_s3_bucket: string

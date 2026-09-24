@@ -179,7 +179,7 @@ function initDb(): DbType {
       last_seen    TEXT NOT NULL
     );
 
-    -- Snapshot of discovered_flows taken when Modo Rascunho is activated —
+    -- Snapshot of discovered_flows taken when Modo Rascunho is activated:
     -- a frozen copy to compare drafts against, never written back into
     -- discovered_flows/managed_policies or the cluster.
     CREATE TABLE IF NOT EXISTS draft_mode_flows (
@@ -197,7 +197,7 @@ function initDb(): DbType {
       last_seen    TEXT NOT NULL
     );
 
-    -- Flows capturados de/para uma namespace que está em "Ignoradas" —
+    -- Flows capturados de/para uma namespace que está em "Ignoradas",
     -- mesmo formato de discovered_flows, mas guardados à parte em vez de
     -- descartados, pra migrar de volta se a namespace deixar de ser
     -- ignorada (ver migrateUnignoredFlows em hubble.ts).
@@ -219,6 +219,12 @@ function initDb(): DbType {
     CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
     CREATE INDEX IF NOT EXISTS idx_approval_votes_request_id ON approval_votes(request_id);
     CREATE INDEX IF NOT EXISTS idx_discovered_flows_flow_count ON discovered_flows(flow_count);
+    -- last_seen: runRetentionCleanup()'s DELETE ... WHERE last_seen < ?
+    -- first_seen: getDiscoveredFlows()/getDraftModeFlows()'s ORDER BY first_seen DESC
+    CREATE INDEX IF NOT EXISTS idx_discovered_flows_last_seen ON discovered_flows(last_seen);
+    CREATE INDEX IF NOT EXISTS idx_discovered_flows_first_seen ON discovered_flows(first_seen);
+    CREATE INDEX IF NOT EXISTS idx_ignored_flows_last_seen ON ignored_flows(last_seen);
+    CREATE INDEX IF NOT EXISTS idx_ignored_flows_first_seen ON ignored_flows(first_seen);
   `)
 
   // ── Seed default admin user ────────────────────────────────────────────────

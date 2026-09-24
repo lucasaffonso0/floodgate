@@ -17,6 +17,7 @@ const DEFAULTS: AppConfig = {
   autosync_interval_s: 60,
   hubble_discovery_enabled: false,
   hubble_flow_retention_days: 7,
+  hubble_internet_flow_retention_days: 1,
   backup_enabled: false,
   backup_cron: '0 3 * * *',
   backup_s3_bucket: '',
@@ -55,6 +56,7 @@ export function getConfig(): AppConfig {
     autosync_interval_s:          parseJson(getRow('autosync_interval_s'), DEFAULTS.autosync_interval_s),
     hubble_discovery_enabled:     parseJson(getRow('hubble_discovery_enabled'), DEFAULTS.hubble_discovery_enabled),
     hubble_flow_retention_days:   parseJson(getRow('hubble_flow_retention_days'), DEFAULTS.hubble_flow_retention_days),
+    hubble_internet_flow_retention_days: parseJson(getRow('hubble_internet_flow_retention_days'), DEFAULTS.hubble_internet_flow_retention_days),
     backup_enabled:               parseJson(getRow('backup_enabled'), DEFAULTS.backup_enabled),
     backup_cron:                  getRow('backup_cron') ?? DEFAULTS.backup_cron,
     backup_s3_bucket:             getRow('backup_s3_bucket') ?? DEFAULTS.backup_s3_bucket,
@@ -80,6 +82,7 @@ export function setConfig(c: AppConfig): void {
     upsert.run('autosync_interval_s', JSON.stringify(c.autosync_interval_s))
     upsert.run('hubble_discovery_enabled',   JSON.stringify(c.hubble_discovery_enabled ?? false))
     upsert.run('hubble_flow_retention_days', JSON.stringify(c.hubble_flow_retention_days ?? 7))
+    upsert.run('hubble_internet_flow_retention_days', JSON.stringify(c.hubble_internet_flow_retention_days ?? 1))
     upsert.run('backup_enabled',    JSON.stringify(c.backup_enabled ?? false))
     upsert.run('backup_cron',       c.backup_cron ?? DEFAULTS.backup_cron)
     upsert.run('backup_s3_bucket',  c.backup_s3_bucket ?? '')
@@ -88,7 +91,7 @@ export function setConfig(c: AppConfig): void {
 }
 
 // Snapshot of namespaces considered "already existing" when auto-deny's
-// scope is switched to future_only — not part of AppConfig (never returned
+// scope is switched to future_only. Not part of AppConfig (never returned
 // to the client as a normal setting), same treatment as autosync_last_run.
 const BASELINE_KEY = 'auto_default_deny_baseline_namespaces'
 

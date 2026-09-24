@@ -13,6 +13,20 @@ import type { CiliumFlowSummary, NetworkPolicyInfo } from '@/types'
 const PROTO_ROOT = path.join(process.cwd(), 'proto')
 const HUBBLE_ADDR = process.env.HUBBLE_RELAY_ADDR ?? 'hubble-relay.kube-system.svc.cluster.local:80'
 
+// Safety net regardless of retention settings: getDiscoveredFlows()/
+// getDraftModeFlows() have no other bound, and internet-bound traffic (one
+// permanent row per distinct external IP) can outgrow retention faster
+// than the hourly cleanup runs. Most-recent-first (see the ORDER BY
+// comment below), so this only ever drops the oldest, least-relevant rows.
+// This must stay well above real steady-state volume: a real environment
+// was observed sitting at 10,429 accumulated rows (all internet-bound)
+// under the old uniform 7-day retention, before internet traffic got its
+// own much shorter window. The point of this constant is to catch
+// pathological growth (e.g. retention cleanup itself failing), not to
+// trim normal days; if it starts binding under everyday load, it's set
+// too low, not doing its job.
+const MAX_FLOW_ROWS = 20_000
+
 type ObserverClient = grpc.Client & {
   GetFlows: (req: unknown, meta: grpc.Metadata) => grpc.ClientReadableStream<unknown>
 }
@@ -106,7 +120,7 @@ async function refreshPolicyCache(): Promise<void> {
   if (_policyCacheRefreshing) return
   _policyCacheRefreshing = true
   try {
-    _policyCache = await listNetworkPolicies(true)
+    _policyCache = excludeUnappliedGitOps(await listNetworkPolicies(true))
     _policyCacheAt = Date.now()
   } catch { /* non-critical: mantém cache antigo */ }
   finally { _policyCacheRefreshing = false }
@@ -123,7 +137,7 @@ function getIgnoredNamespaces(): string[] {
   return _ignoredNsCache
 }
 
-// Chamado por PUT /api/config quando ignored_namespaces muda — sem isso, um
+// Chamado por PUT /api/config quando ignored_namespaces muda: sem isso, um
 // flow que chega nos até 10s seguintes ainda usaria a lista antiga (podendo
 // gravar em ignored_flows um flow que acabou de ser des-ignorado, bem depois
 // de migrateUnignoredFlows já ter rodado pra essa mesma mudança).
@@ -174,11 +188,11 @@ function processFlow(msg: unknown): void {
   const rawVerdict: string = flow.verdict ?? ''
 
   // A destination outside the cluster (reserved:world) resolves to nothing
-  // via extractEndpoint() — namespace and workload both come back empty,
+  // via extractEndpoint(): namespace and workload both come back empty,
   // same as every other unresolvable "reserved:*" identity (host,
   // unmanaged, kube-apiserver, ...). Those stay dropped exactly as before;
   // world is the one case turned into a real row, using the actual
-  // destination IP (flow.ip.destination) as its identity — there's no
+  // destination IP (flow.ip.destination) as its identity, since there's no
   // in-cluster namespace/workload for it to have. dst_namespace='internet'
   // is a sentinel, same spelling already used for the internet-egress
   // companion policy isolateNamespace() creates (unrelated mechanism, kept
@@ -200,14 +214,14 @@ function processFlow(msg: unknown): void {
   if (portInfo.port >= 32768 && !dstIsWorld) {
     // Porta alta: só aceita se for port declarado em algum K8s Service real do destino.
     // Caso contrário, é porta efêmera de resposta TCP (Hubble captura os dois sentidos).
-    // Não faz sentido pra internet — não existe "Service" pra validar contra
+    // Não faz sentido pra internet: não existe "Service" pra validar contra
     // um IP externo, e uma porta alta ali pode perfeitamente ser real (ex:
     // uma API de terceiro respondendo numa porta não-privilegiada).
     if (Date.now() - _svcPortCacheAt > 60_000) refreshSvcPortCache()  // refresh async em background
     if (!isKnownServicePort(dst.namespace, dst.workload, portInfo.port)) return
   }
 
-  // Namespace ignorada não descarta o flow mais — vai pra uma tabela
+  // Namespace ignorada não descarta o flow mais: vai pra uma tabela
   // separada (ignored_flows) em vez de discovered_flows, pra não perder o
   // histórico. Se a namespace deixar de ser ignorada depois, esses flows
   // migram pra discovered_flows (ver migrateUnignoredFlows, chamado quando
@@ -249,7 +263,7 @@ function processFlow(msg: unknown): void {
       getDb().prepare(`UPDATE ${table} SET verdict = ?, last_seen = ? WHERE id = ?`).run(verdict, now, id)
     }
 
-    // Emit SSE no máximo a cada 3s para não sobrecarregar o frontend — só
+    // Emit SSE no máximo a cada 3s para não sobrecarregar o frontend, só
     // pros visíveis (discovered_flows); flows de namespace ignorada não têm
     // nada pra atualizar na tela agora mesmo.
     if (table === 'discovered_flows') {
@@ -333,6 +347,41 @@ function reclassifyFlowPolicies(table: 'discovered_flows' | 'ignored_flows', all
   })()
 }
 
+// reclassifyFlowPolicies() is O(flows × policies): checking every flow's
+// has_policy against every policy is only ever needed again when the
+// policy SET has actually changed since the last tick (policy creation/
+// deletion/port-edit are rare admin actions, not something that happens
+// every 15s). This fingerprint is a cheap stand-in for "did anything
+// relevant change" (only the fields flowHasPolicy()/explainAccess() ever
+// look at), so an unrelated field changing (e.g. created_at) never causes
+// a false "changed".
+let _lastPolicyFingerprint = ''
+function policyFingerprint(policies: NetworkPolicyInfo[]): string {
+  return policies
+    // sync_status included on purpose: a GitOps policy going from
+    // 'pending_argocd' to actually live (ArgoCD synced it) doesn't change
+    // any of the OTHER fields here, but it's exactly the kind of change
+    // that must trigger a reclassification pass: has_policy excludes
+    // still-pending policies (see excludeUnappliedGitOps below), so this
+    // transition is what flips a flow from "not covered yet" to "covered"
+    // in reality, not just on paper.
+    .map(p => `${p.namespace}|${p.name}|${p.policy_type}|${p.dst_service}|${p.dst_port}|${JSON.stringify(p.dst_ports)}|${p.src_workload}|${p.src_namespace}|${p.sync_status ?? ''}`)
+    .sort()
+    .join(';')
+}
+
+// has_policy (both the insert-time cache below and the authoritative
+// reclassification pass) must reflect whether Cilium is ACTUALLY enforcing
+// a covering policy right now, not whether floodgate has committed one to
+// git. listNetworkPolicies(true)'s GitOps merge includes synthesized
+// 'pending_argocd' entries for policies not yet applied by ArgoCD: without
+// this filter, flowHasPolicy() would match against one of those and report
+// has_policy=true (hiding "Criar política") while the flow is still being
+// dropped for real, for however long ArgoCD's sync interval is.
+function excludeUnappliedGitOps(policies: NetworkPolicyInfo[]): NetworkPolicyInfo[] {
+  return policies.filter(p => p.sync_status !== 'pending_argocd')
+}
+
 // ─── Atualiza has_policy para todos os flows (chamado pelo scheduler) ──────
 export async function updateFlowPolicies(): Promise<void> {
   try {
@@ -345,11 +394,23 @@ export async function updateFlowPolicies(): Promise<void> {
     // best-effort classification.
     const allPolicies = await listNetworkPolicies(true).catch(() => [])
     if (allPolicies.length === 0) return
-    _policyCache = allPolicies
+
+    // Fingerprint on the UNFILTERED list: sync_status is one of the
+    // fingerprinted fields (see policyFingerprint's comment), so a policy
+    // going from pending_argocd to actually applied still changes the
+    // fingerprint even though every other field stayed the same, and
+    // correctly triggers the reclassification pass below.
+    const fingerprint = policyFingerprint(allPolicies)
+
+    const applied = excludeUnappliedGitOps(allPolicies)
+    _policyCache = applied
     _policyCacheAt = Date.now()
 
-    reclassifyFlowPolicies('discovered_flows', allPolicies)
-    reclassifyFlowPolicies('ignored_flows', allPolicies)
+    if (fingerprint === _lastPolicyFingerprint) return
+    _lastPolicyFingerprint = fingerprint
+
+    reclassifyFlowPolicies('discovered_flows', applied)
+    reclassifyFlowPolicies('ignored_flows', applied)
   } catch { /* non-critical */ }
 }
 
@@ -399,7 +460,17 @@ function normalizeFlowTable(table: 'discovered_flows' | 'ignored_flows'): void {
   })()
 }
 
+// extractEndpoint() (above) always normalizes a workload before it's ever
+// written to a row, so a "dirty" row (needing the merge normalizeFlowTable
+// does) can only be historical data written before that normalization
+// existed in the code, not something that can recur going forward. The
+// scheduler used to call this every 15s tick regardless, meaning a full
+// `SELECT *` scan of both flow tables just to evaluate the `dirty` check,
+// every tick, forever. Once per process lifetime is enough.
+let _normalizedStoredFlowsOnce = false
 export function normalizeStoredFlows(): void {
+  if (_normalizedStoredFlowsOnce) return
+  _normalizedStoredFlowsOnce = true
   try {
     normalizeFlowTable('discovered_flows')
     normalizeFlowTable('ignored_flows')
@@ -407,13 +478,20 @@ export function normalizeStoredFlows(): void {
 }
 
 // ─── Limpeza de flows antigos ──────────────────────────────────────────────
+// Internet-bound flows get their own, much shorter retention window: each
+// distinct external IP is a permanent row (no service-identity collapsing
+// like in-cluster traffic has), so this is the main source of unbounded
+// row growth: see hubble_internet_flow_retention_days in AppConfig.
 export function runRetentionCleanup(): void {
   try {
-    const retentionDays = getConfig().hubble_flow_retention_days ?? 7
-    const staleDate = new Date(Date.now() - retentionDays * 86400 * 1000).toISOString()
+    const cfg = getConfig()
+    const staleDate = new Date(Date.now() - (cfg.hubble_flow_retention_days ?? 7) * 86400 * 1000).toISOString()
+    const staleInternetDate = new Date(Date.now() - (cfg.hubble_internet_flow_retention_days ?? 1) * 86400 * 1000).toISOString()
     const db = getDb()
-    db.prepare('DELETE FROM discovered_flows WHERE last_seen < ?').run(staleDate)
-    db.prepare('DELETE FROM ignored_flows WHERE last_seen < ?').run(staleDate)
+    for (const table of ['discovered_flows', 'ignored_flows'] as const) {
+      db.prepare(`DELETE FROM ${table} WHERE dst_namespace != 'internet' AND last_seen < ?`).run(staleDate)
+      db.prepare(`DELETE FROM ${table} WHERE dst_namespace = 'internet' AND last_seen < ?`).run(staleInternetDate)
+    }
   } catch { /* non-critical */ }
 }
 
@@ -427,7 +505,7 @@ export function migrateUnignoredFlows(newIgnoredNamespaces: string[]): void {
     if (rows.length === 0) return
 
     const stillIgnored = new Set(newIgnoredNamespaces)
-    // Só migra quem não tem NENHUM dos dois lados ainda ignorado — um flow
+    // Só migra quem não tem NENHUM dos dois lados ainda ignorado: um flow
     // entre duas namespaces ignoradas continua escondido até as duas saírem
     // da lista.
     const toMigrate = rows.filter(r => !stillIgnored.has(r.src_namespace) && !stillIgnored.has(r.dst_namespace))
@@ -463,7 +541,7 @@ export function getDiscoveredFlows(): CiliumFlowSummary[] {
   // curvature, which is assigned by array position) on every poll as active
   // flows accumulate hits at different rates, even though nothing meaningful
   // changed. first_seen only changes when a genuinely new flow appears.
-  const rows = db.prepare('SELECT * FROM discovered_flows ORDER BY first_seen DESC, id').all() as Array<Record<string, unknown>>
+  const rows = db.prepare('SELECT * FROM discovered_flows ORDER BY first_seen DESC, id LIMIT ?').all(MAX_FLOW_ROWS) as Array<Record<string, unknown>>
   return rows.map(r => ({
     id: r.id as string,
     src_workload: r.src_workload as string,
@@ -488,7 +566,7 @@ export function clearDiscoveredFlows(): void {
 
 // ── Modo Rascunho ────────────────────────────────────────────────────────
 // A frozen copy of discovered_flows, taken once when Modo Rascunho turns
-// on — the fixed baseline drafts are compared against. Never written back
+// on: the fixed baseline drafts are compared against. Never written back
 // into discovered_flows: live Hubble ingestion keeps running untouched.
 export function snapshotFlowsForDraftMode(): void {
   const db = getDb()
@@ -497,7 +575,7 @@ export function snapshotFlowsForDraftMode(): void {
 }
 
 export function getDraftModeFlows(): CiliumFlowSummary[] {
-  const rows = getDb().prepare('SELECT * FROM draft_mode_flows ORDER BY first_seen DESC, id').all() as Array<Record<string, unknown>>
+  const rows = getDb().prepare('SELECT * FROM draft_mode_flows ORDER BY first_seen DESC, id LIMIT ?').all(MAX_FLOW_ROWS) as Array<Record<string, unknown>>
   return rows.map(r => ({
     id: r.id as string,
     src_workload: r.src_workload as string,
@@ -519,7 +597,7 @@ export function clearDraftModeFlows(): void {
 }
 
 // Own flag in app_config, not part of AppConfig (same treatment as
-// autosync_last_run) — can't infer "active" from the snapshot being
+// autosync_last_run): can't infer "active" from the snapshot being
 // non-empty, since an empty discovered_flows table at activation time
 // would look identical to "never activated".
 const DRAFT_MODE_KEY = 'draft_mode_active'
@@ -532,3 +610,9 @@ export function isDraftModeActive(): boolean {
 export function setDraftModeActive(active: boolean): void {
   getDb().prepare('INSERT OR REPLACE INTO app_config (key, value) VALUES (?, ?)').run(DRAFT_MODE_KEY, JSON.stringify(active))
 }
+
+// Exported for unit tests only: the pure helpers behind the has_policy /
+// reclassification fix (excludeUnappliedGitOps, the sync_status-aware
+// fingerprint), tested in isolation from the gRPC stream / DB side effects
+// the rest of this file has. Not used by any application code path.
+export const __testing = { policyFingerprint, excludeUnappliedGitOps }
