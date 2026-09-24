@@ -271,7 +271,8 @@ export interface ApprovalRequest {
   votes: ApprovalVote[]
   created_at: string
   applied_at: string | null
-  auto_apply_error?: string | null
+  applying: boolean
+  last_apply_error: string | null
 }
 
 export interface ApprovalVote {

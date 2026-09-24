@@ -17,7 +17,7 @@ type ApproverDraft = {
 
 // The namespace(s) an approver actually needs permission in. Only 'ingress'
 // (and CIDR) touch a single namespace (dst_namespace); 'egress' and 'both'
-// require both — same rule the POST handler below already enforces at
+// require both, same rule the POST handler below already enforces at
 // creation time (egress needs src_namespace in addition to dst_namespace,
 // since createEgressNetworkPolicy writes there), kept consistent here so
 // create/vote/apply agree on who's actually authorized for a given request.
@@ -86,6 +86,8 @@ function buildRequest(row: Record<string, unknown>): ApprovalRequest {
     votes,
     created_at: row.created_at as string,
     applied_at: (row.applied_at as string | null) ?? null,
+    applying: row.applying === 1,
+    last_apply_error: (row.last_apply_error as string | null) ?? null,
   }
 }
 

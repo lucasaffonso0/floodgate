@@ -6,6 +6,7 @@ import { runBackup, nextBackupFireTime, readLastBackupRun, saveLastBackupRun } f
 import { getWriteMode } from './writeMode'
 import { refreshRepoInBackground } from './git'
 import { clearAllPendingOps, expireStalePendingOps } from './gitopsPendingOps'
+import { resetStuckApprovals, expireStaleApprovalApplies } from './approvalApply'
 
 const TICK_MS = 15_000
 // Cleanup de retenção uma vez por hora
@@ -15,6 +16,9 @@ let lastRetentionCleanup = 0
 // gitops_pending_ops travado, a cada tick (barato: só uma comparação de data).
 const GIT_BACKGROUND_REFRESH_MS = 180_000
 const GITOPS_PENDING_OP_MAX_AGE_MINUTES = 5
+// Mesma folga do gitops_pending_ops acima: bem maior que qualquer escrita
+// (direta ou via git, que já tem seu próprio timeout de 60s) razoável.
+const APPROVAL_APPLYING_MAX_AGE_MINUTES = 5
 let lastGitBackgroundRefresh = 0
 
 function readConfig(): { enabled: boolean; interval_s: number } {
@@ -120,6 +124,11 @@ async function tick() {
       if (isHubbleStreaming()) stopHubbleStream()
     }
 
+    // Approval auto-apply/apply can run in either write mode, so this isn't
+    // gated on gitops like the block below. Cheap: one UPDATE, only touches
+    // rows already stuck applying past the timeout.
+    expireStaleApprovalApplies(APPROVAL_APPLYING_MAX_AGE_MINUTES)
+
     if (getWriteMode() === 'gitops') {
       // Cheap every tick: just a date comparison against gitops_pending_ops.
       expireStalePendingOps(GITOPS_PENDING_OP_MAX_AGE_MINUTES)
@@ -146,6 +155,8 @@ if (!g._floodgateSchedulerStarted) {
   // Nada em gitops_pending_ops pode legitimamente sobreviver a um
   // reinício, ver o comentário em gitopsPendingOps.ts.
   clearAllPendingOps()
+  // Mesma lógica pra approval_requests.applying, ver approvalApply.ts.
+  resetStuckApprovals()
   setInterval(tick, TICK_MS)
   console.log('[floodgate] background scheduler started')
 }

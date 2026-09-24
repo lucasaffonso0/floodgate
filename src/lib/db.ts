@@ -91,7 +91,10 @@ function initDb(): DbType {
       approvals_required INTEGER NOT NULL DEFAULT 1,
       status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','rejected','applied')),
       created_at TEXT DEFAULT (datetime('now')),
-      applied_at TEXT
+      applied_at TEXT,
+      applying INTEGER NOT NULL DEFAULT 0,
+      last_apply_error TEXT,
+      applying_started_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS approval_votes (
@@ -248,6 +251,22 @@ function initDb(): DbType {
   ).get() as { sql: string } | undefined)?.sql ?? ''
   if (arSchema && !arSchema.includes('allowed_approvers')) {
     db.exec("ALTER TABLE approval_requests ADD COLUMN allowed_approvers TEXT NOT NULL DEFAULT '[]'")
+  }
+
+  // ── Migration: add applying/last_apply_error to approval_requests ────────
+  // Persisted (not just the HTTP response of the vote/apply call) so a page
+  // reload, or a different viewer entirely, can tell "still writing to
+  // git/K8s right now" apart from "just sitting pending" instead of the UI
+  // looking frozen with no explanation.
+  const arSchema2 = (db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_requests'"
+  ).get() as { sql: string } | undefined)?.sql ?? ''
+  if (arSchema2 && !arSchema2.includes('applying')) {
+    db.exec("ALTER TABLE approval_requests ADD COLUMN applying INTEGER NOT NULL DEFAULT 0")
+    db.exec("ALTER TABLE approval_requests ADD COLUMN last_apply_error TEXT")
+  }
+  if (arSchema2 && !arSchema2.includes('applying_started_at')) {
+    db.exec("ALTER TABLE approval_requests ADD COLUMN applying_started_at TEXT")
   }
 
   // ── Migration: add x, y to namespace_layout_locks ────────────────────────

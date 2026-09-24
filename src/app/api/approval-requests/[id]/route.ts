@@ -4,28 +4,9 @@ import { getDb } from '@/lib/db'
 import { parseBody } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { emit } from '@/lib/sse'
-import { createNetworkPolicy, createEgressNetworkPolicy, createCidrPolicy, previewPolicyYAML } from '@/lib/k8s'
+import { previewPolicyYAML } from '@/lib/k8s'
+import { claimApprovalApply, runApprovalApply } from '@/lib/approvalApply'
 import type { ApprovalRequest, Draft, PortSpec } from '@/types'
-
-async function applyDraftPolicy(draft: Draft): Promise<void> {
-  if (draft.src_cidr || draft.dst_cidr) {
-    await createCidrPolicy({
-      namespace: draft.dst_namespace,
-      service_name: draft.dst_service || undefined,
-      cidr: (draft.src_cidr ?? draft.dst_cidr)!,
-      except: draft.cidr_except,
-      dst_ports: draft.dst_ports.length > 0 ? draft.dst_ports : undefined,
-      direction: draft.src_cidr ? 'ingress' : 'egress',
-    })
-    return
-  }
-  const apiReq = {
-    src_workload: draft.src_workload, src_namespace: draft.src_namespace,
-    dst_service: draft.dst_service, dst_namespace: draft.dst_namespace, dst_ports: draft.dst_ports,
-  }
-  if (draft.policy_direction === 'ingress' || draft.policy_direction === 'both') await createNetworkPolicy(apiReq)
-  if (draft.policy_direction === 'egress'  || draft.policy_direction === 'both') await createEgressNetworkPolicy(apiReq)
-}
 
 function normalizeDraft(draft: Draft & { dst_port?: number }): Draft {
   if (draft.dst_ports === undefined) {
@@ -46,7 +27,7 @@ type ApproverDraft = {
 
 // The namespace(s) an approver actually needs permission in. Only 'ingress'
 // (and CIDR) touch a single namespace (dst_namespace); 'egress' and 'both'
-// require both — same rule POST /api/approval-requests already enforces at
+// require both, same rule POST /api/approval-requests already enforces at
 // creation time (egress needs src_namespace in addition to dst_namespace,
 // since createEgressNetworkPolicy writes there), kept consistent here so
 // create/vote/apply agree on who's actually authorized for a given request.
@@ -117,6 +98,8 @@ function getRequest(id: string): ApprovalRequest | null {
     votes,
     created_at: row.created_at as string,
     applied_at: (row.applied_at as string | null) ?? null,
+    applying: row.applying === 1,
+    last_apply_error: (row.last_apply_error as string | null) ?? null,
   }
 }
 
@@ -227,26 +210,16 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     // Auto-apply when quorum is reached: the approval workflow is the authorization mechanism,
     // so the policy is applied regardless of the individual voter's namespace permissions.
     const updated = getRequest(id)!
-    let autoApplyError: string | null = null
     if (updated.approve_count >= updated.approvals_required && updated.reject_count === 0) {
-      // Atomic claim: only one concurrent voter transitions pending→applied.
-      // Two votes reaching quorum simultaneously would otherwise both apply the policy.
-      const claim = getDb().prepare("UPDATE approval_requests SET status='applied', applied_at=datetime('now') WHERE id=? AND status='pending'").run(id)
-      if (claim.changes === 1) {
+      if (claimApprovalApply(id)) {
+        emit({ type: 'approval_voted', id }) // let everyone else see "aplicando" right away
         const draft = normalizeDraft(updated.draft_data as Draft & { dst_port?: number })
-        try {
-          await applyDraftPolicy(draft)
-          logAudit({ user_id: user.sub, username: user.username, action: 'auto_apply_approval_request', resource_type: 'ApprovalRequest', resource_name: id, namespace: draft.dst_namespace })
-          emit({ type: 'approval_applied', id })
-          emit({ type: 'policy_created' })
-        } catch (e: unknown) {
-          // Release the claim so the request can be applied again
-          getDb().prepare("UPDATE approval_requests SET status='pending', applied_at=NULL WHERE id=?").run(id)
-          const msg = e instanceof Error ? e.message : String(e)
-          console.error('[floodgate] auto-apply failed:', msg)
-          autoApplyError = msg
-          emit({ type: 'approval_voted', id })
-        }
+        // Fire-and-forget: the write (a git commit+push in gitops mode can
+        // take real time) runs detached from this request/response cycle
+        // instead of holding this connection open for it. `applying`/
+        // `last_apply_error` on the row is what tells any viewer, this one
+        // included on its next poll/SSE refresh, how it turned out.
+        runApprovalApply(id, draft, { userId: user.sub, username: user.username }, 'auto_apply_approval_request')
       } else {
         emit({ type: 'approval_voted', id })
       }
@@ -254,7 +227,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
       emit({ type: 'approval_voted', id })
     }
 
-    return NextResponse.json({ ...getRequest(id), auto_apply_error: autoApplyError })
+    return NextResponse.json(getRequest(id))
   }
 
   if (action === 'apply') {
@@ -262,6 +235,7 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     const request = getRequest(id)
     if (!request) return NextResponse.json({ detail: 'Not found' }, { status: 404 })
     if (request.status !== 'pending') return NextResponse.json({ detail: 'Request não está pendente' }, { status: 400 })
+    if (request.applying) return NextResponse.json({ detail: 'Já está sendo aplicado' }, { status: 409 })
     if (user.role !== 'admin' && request.approve_count < request.approvals_required) {
       return NextResponse.json({ detail: `Necessário ${request.approvals_required} aprovação(ões), tem ${request.approve_count}` }, { status: 400 })
     }
@@ -272,19 +246,12 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     const canManage = (await Promise.all(relevant.map(ns => canManageNamespace(user.sub, user.role, ns)))).every(Boolean)
     if (!canManage) return NextResponse.json({ detail: 'Forbidden' }, { status: 403 })
 
-    // Atomic claim (see auto-apply above): prevents two concurrent applies
-    const claim = getDb().prepare("UPDATE approval_requests SET status='applied', applied_at=datetime('now') WHERE id=? AND status='pending'").run(id)
-    if (claim.changes !== 1) return NextResponse.json({ detail: 'Request não está pendente' }, { status: 400 })
-    try {
-      await applyDraftPolicy(draft)
-    } catch (e) {
-      getDb().prepare("UPDATE approval_requests SET status='pending', applied_at=NULL WHERE id=?").run(id)
-      console.error('[floodgate] apply failed:', e)
-      return NextResponse.json({ detail: 'Falha ao aplicar a política' }, { status: 500 })
-    }
-    logAudit({ user_id: user.sub, username: user.username, action: 'apply_approval_request', resource_type: 'ApprovalRequest', resource_name: id, namespace: draft.dst_namespace })
-    emit({ type: 'approval_applied', id })
-    emit({ type: 'policy_created' })
+    // Atomic claim, fire-and-forget the actual write (see auto-apply above
+    // for why): this request returns as soon as the claim lands, not once
+    // the write finishes.
+    if (!claimApprovalApply(id)) return NextResponse.json({ detail: 'Request não está pendente' }, { status: 400 })
+    emit({ type: 'approval_voted', id })
+    runApprovalApply(id, draft, { userId: user.sub, username: user.username }, 'apply_approval_request')
     return NextResponse.json(getRequest(id))
   }
 
