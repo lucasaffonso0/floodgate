@@ -1,24 +1,25 @@
 # floodgate
 
-Kubernetes NetworkPolicy manager with an interactive drag-and-drop graph UI. Visualize services, create and delete policies, manage access control — all from a single web app running inside your cluster.
+Kubernetes NetworkPolicy manager with an interactive drag-and-drop graph UI. Visualize services, create and delete policies, and manage access control, all from a single web app running inside your cluster.
 
 ---
 
 ## Features
 
-- **Interactive graph** — services grouped by namespace, policies rendered as colored edges; hide namespaces to focus the view — all edges follow
-- **Drag-and-drop** — draw connections between services to create allow rules
-- **Role-based access** — admin, ns_admin, viewer, audit
-- **Approval workflow** — require N approvals before a policy is applied
-- **Autosync** — drift detection re-applies policies removed externally
-- **Backup** — scheduled (cron) or on-demand snapshot of the whole database uploaded to any S3-compatible bucket
-- **Real-time updates** — Server-Sent Events push changes to all connected users in < 100 ms
-- **Audit log** — every action recorded with user, timestamp, and details
-- **Namespace isolation** — one-click default-deny (ingress, egress, or both)
-- **CIDR/IP range policies** — allow or restrict traffic to/from external IP ranges (e.g. corporate VPN, managed databases, external APIs)
-- **Flow discovery** — Hubble/Cilium integration streams live traffic flows; one click creates a draft policy from any discovered connection
-- **Explain access** — click a service or a blocked flow to see exactly why it's allowed or denied (service-level policy, namespace-wide isolation, or neither)
-- **Pause/Resume** — remove all policies from the cluster temporarily and restore them
+- **Interactive graph**: services grouped by namespace, policies rendered as colored edges; hide namespaces to focus the view, all edges follow
+- **Drag-and-drop**: draw connections between services to create allow rules
+- **Role-based access**: admin, ns_admin, viewer, audit
+- **Approval workflow**: require N approvals before a policy is applied
+- **Autosync**: drift detection re-applies policies removed externally
+- **Backup**: scheduled (cron) or on-demand snapshot of the whole database uploaded to any S3-compatible bucket
+- **Real-time updates**: Server-Sent Events push changes to all connected users in < 100 ms
+- **Audit log**: every action recorded with user, timestamp, and details
+- **Namespace isolation**: one-click default-deny (ingress, egress, or both)
+- **CIDR/IP range policies**: allow or restrict traffic to/from external IP ranges (e.g. corporate VPN, managed databases, external APIs)
+- **Flow discovery**: Hubble/Cilium integration streams live traffic flows; one click creates a draft policy from any discovered connection
+- **Explain access**: click a service or a blocked flow to see exactly why it's allowed or denied (service-level policy, namespace-wide isolation, or neither)
+- **Pause/Resume**: remove all policies from the cluster temporarily and restore them
+- **GitOps write mode**: commit policy changes to a git repo instead of applying them directly, for use with ArgoCD/Flux
 
 ---
 
@@ -52,7 +53,7 @@ kubectl create secret generic floodgate-secrets \
   -n floodgate
 ```
 
-Optional — add S3-compatible credentials to the same secret if you plan to use Backup (Config tab):
+Optional: add S3-compatible credentials to the same secret if you plan to use Backup (Config tab):
 
 ```bash
 kubectl patch secret floodgate-secrets -n floodgate --type merge -p '{
@@ -81,11 +82,11 @@ helm upgrade floodgate ./helm-app-template \
   -n floodgate
 ```
 
-Default credentials: `admin` / `admin` — password change is required on first login.
+Default credentials: `admin` / `admin`. Password change is required on first login.
 
 #### Exposing the app
 
-The Helm chart supports two ingress options — enable only one:
+The Helm chart supports two ingress options; enable only one:
 
 **Ingress Nginx**
 
@@ -134,10 +135,10 @@ Uses `~/.kube/config` directly. No Docker required. File changes reload in under
 Requires the app running and a port-forward active:
 
 ```bash
-# Terminal 1 — keep running
+# Terminal 1: keep running
 kubectl port-forward svc/floodgate 3000:3000 -n floodgate
 
-# Terminal 2 — deploy test apps (once)
+# Terminal 2: deploy test apps (once)
 kubectl apply -f test-apps/
 
 # Run all scenarios (pass your password if already changed from default)
@@ -155,9 +156,9 @@ kubectl apply -f test-apps/
 
 | Role | Description |
 |------|-------------|
-| `admin` | Full access — create/delete policies, manage users, change config |
+| `admin` | Full access: create/delete policies, manage users, change config |
 | `ns_admin` | Same as admin but only in assigned namespaces |
-| `viewer` | Read-only — sees the graph and policies |
+| `viewer` | Read-only: sees the graph and policies |
 | `audit` | Can read policies and the audit log; no mutations |
 
 ---
@@ -166,22 +167,36 @@ kubectl apply -f test-apps/
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JWT_SECRET` | `floodgate-secret-change-me` | HS256 signing key — **required in production** |
+| `JWT_SECRET` | `floodgate-secret-change-me` | HS256 signing key, **required in production** |
 | `DB_PATH` | `floodgate-dev.db` (dev) / `/data/floodgate.db` (prod) | SQLite file path |
-| `S3_ENDPOINT` | — | S3-compatible endpoint URL — only needed if you enable Backup in the Config tab |
-| `S3_REGION` | — | Bucket region (any S3-compatible target accepts a region string) |
-| `S3_ACCESS_KEY_ID` | — | Access key with write access to the backup bucket |
-| `S3_SECRET_ACCESS_KEY` | — | Secret for the access key above |
+| `S3_ENDPOINT` | none | S3-compatible endpoint URL, only needed if you enable Backup in the Config tab |
+| `S3_REGION` | none | Bucket region (any S3-compatible target accepts a region string) |
+| `S3_ACCESS_KEY_ID` | none | Access key with write access to the backup bucket |
+| `S3_SECRET_ACCESS_KEY` | none | Secret for the access key above |
+| `WRITE_MODE` | `direct` | `direct` or `gitops`, see [Write modes](#write-modes-direct-vs-gitops) below |
+
+---
+
+## Write modes: direct vs gitops
+
+Two mutually exclusive modes, set at deploy time via `WRITE_MODE` in `values.yaml`. Never changed at runtime.
+
+- **`direct`** (default): floodgate writes NetworkPolicy objects straight to the Kubernetes API. Effective immediately.
+- **`gitops`**: floodgate commits the policy YAML to a git repository instead. It never touches the Kubernetes API to create or delete a policy. **Something else has to actually apply that commit to the cluster**: ArgoCD, Flux, or any other GitOps operator pointed at the same repo. If nothing is watching that repo, the commit just sits there forever and the policy is never enforced, even though floodgate reports success.
+
+Configure the git connection (repo URL, SSH key, commit author) from the Config tab, admin only, once `WRITE_MODE=gitops` is set. The SSH private key is write-only: once saved, no API ever returns it back, only whether one is configured.
+
+`gitops` mode also strips the NetworkPolicy write verbs (`create`/`update`/`patch`/`delete`) from the app's own ClusterRole (`helm-app-template/templates/rbac.yaml`). The app is read-only against NetworkPolicy by infrastructure guarantee, not just because the code chooses not to call those endpoints.
 
 ---
 
 ## Tech stack
 
-- **Next.js 15** (App Router, TypeScript) — frontend + API in one binary
-- **@xyflow/react** — interactive graph canvas
-- **@kubernetes/client-node** — K8s API (server-only, uses in-cluster ServiceAccount)
-- **better-sqlite3** — embedded database, no external dependencies
-- **jose / bcryptjs** — JWT HS256 auth + password hashing
+- **Next.js 15** (App Router, TypeScript): frontend + API in one binary
+- **@xyflow/react**: interactive graph canvas
+- **@kubernetes/client-node**: K8s API (server-only, uses in-cluster ServiceAccount)
+- **better-sqlite3**: embedded database, no external dependencies
+- **jose / bcryptjs**: JWT HS256 auth + password hashing
 
 ---
 
