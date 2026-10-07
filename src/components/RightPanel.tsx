@@ -2619,17 +2619,25 @@ function ConfigTab({ config, onSave, writeMode }: { config: AppConfig; onSave: (
       )}
       <div style={{ marginBottom: 14, borderTop: '1px solid #f1f5f9', paddingTop: 14 }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 10 }}>Autosync</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-          <ToggleSwitch on={local.autosync_enabled} onChange={v => setLocal(p => ({ ...p, autosync_enabled: v }))} />
-          <span style={{ fontSize: 11, color: '#475569' }}>Restaurar policies removidas externamente</span>
-        </div>
-        {local.autosync_enabled && (
-          <div style={{ paddingLeft: 46, marginBottom: 8 }}>
-            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>Intervalo (segundos)</label>
-            <input type="number" min={30} max={3600} value={local.autosync_interval_s}
-              onChange={e => setLocal(p => ({ ...p, autosync_interval_s: Math.min(3600, Math.max(30, parseInt(e.target.value) || 60)) }))}
-              style={{ width: 80, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 11 }} />
+        {writeMode === 'gitops' ? (
+          <div style={{ fontSize: 10, color: '#64748b', background: '#f8fafc', borderRadius: 6, padding: '8px 10px', lineHeight: 1.5, marginBottom: 8 }}>
+            Em modo GitOps, quem restaura uma policy removida é o self-heal do ArgoCD, não o floodgate. O card abaixo só mostra o que ainda não foi sincronizado por ele.
           </div>
+        ) : (
+          <>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <ToggleSwitch on={local.autosync_enabled} onChange={v => setLocal(p => ({ ...p, autosync_enabled: v }))} />
+              <span style={{ fontSize: 11, color: '#475569' }}>Restaurar policies removidas externamente</span>
+            </div>
+            {local.autosync_enabled && (
+              <div style={{ paddingLeft: 46, marginBottom: 8 }}>
+                <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#475569', marginBottom: 4 }}>Intervalo (segundos)</label>
+                <input type="number" min={30} max={3600} value={local.autosync_interval_s}
+                  onChange={e => setLocal(p => ({ ...p, autosync_interval_s: Math.min(3600, Math.max(30, parseInt(e.target.value) || 60)) }))}
+                  style={{ width: 80, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 11 }} />
+              </div>
+            )}
+          </>
         )}
 
         {/* Status card: always visible, refreshes every 15 s */}
@@ -2649,9 +2657,13 @@ function ConfigTab({ config, onSave, writeMode }: { config: AppConfig; onSave: (
               </div>
               {hasDrift && (
                 <div style={{ fontSize: 9.5, color: '#64748b', marginBottom: 4 }}>
-                  {missing.some(p => p.namespace_missing)
-                    ? 'Algumas não podem ser restauradas (veja abaixo). As demais serão restauradas no próximo ciclo.'
-                    : local.autosync_enabled ? 'Será restaurado no próximo ciclo.' : 'Habilite o autosync ou clique em "Forçar sync" para restaurar.'}
+                  {writeMode === 'gitops'
+                    ? (missing.some(p => p.namespace_missing)
+                        ? 'Algumas não podem ser aplicadas (veja abaixo). As demais, o ArgoCD aplica quando sincronizar.'
+                        : 'Aguardando o ArgoCD sincronizar.')
+                    : missing.some(p => p.namespace_missing)
+                      ? 'Algumas não podem ser restauradas (veja abaixo). As demais serão restauradas no próximo ciclo.'
+                      : local.autosync_enabled ? 'Será restaurado no próximo ciclo.' : 'Habilite o autosync ou clique em "Forçar sync" para restaurar.'}
                 </div>
               )}
               <button
@@ -2697,7 +2709,9 @@ function ConfigTab({ config, onSave, writeMode }: { config: AppConfig; onSave: (
         })()}
 
         <div style={{ fontSize: 10, color: '#94a3b8', background: '#f8fafc', borderRadius: 6, padding: '8px 10px', lineHeight: 1.5, marginBottom: 8 }}>
-          Monitoramento de drift roda a cada 15s. Correção automática só ocorre se o autosync estiver ativo.
+          {writeMode === 'gitops'
+            ? 'Monitoramento de drift roda a cada 15s. Quem aplica de fato é o ArgoCD, não o floodgate.'
+            : 'Monitoramento de drift roda a cada 15s. Correção automática só ocorre se o autosync estiver ativo.'}
         </div>
         <button
           onClick={handleSync} disabled={syncing}
@@ -2705,7 +2719,7 @@ function ConfigTab({ config, onSave, writeMode }: { config: AppConfig; onSave: (
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
             <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
           </svg>
-          {syncing ? 'Sincronizando…' : '↺ Forçar sync agora'}
+          {syncing ? 'Sincronizando…' : writeMode === 'gitops' ? '↺ Checar agora' : '↺ Forçar sync agora'}
         </button>
         {syncResult && (
           <div style={{ marginTop: 6, fontSize: 9.5, color: '#94a3b8', padding: '4px 8px' }}>
