@@ -289,6 +289,7 @@ const PALETTE = [
 ]
 
 const LS_SHOW_INTERNET_KEY = 'floodgate-show-internet-traffic'
+const LS_ONLY_INTERNET_KEY = 'floodgate-only-internet-traffic'
 const LS_SHOW_FLOW_EDGES_KEY = 'floodgate-show-flow-edges'
 
 // ─── Layout constants ──────────────────────────────────────────────────────
@@ -489,6 +490,7 @@ function buildGraph(
   visibleNamespaces?: Set<string>,
   draftMode = false,
   showInternetTraffic = false,
+  onlyInternetTraffic = false,
 ): { nodes: Node[]; edges: BuiltInEdge[] } {
   // 'internet' is a synthetic pseudo-namespace (see hubble.ts's reserved:world
   // handling): it never appears in the real namespace list a user hides/shows
@@ -500,6 +502,7 @@ function buildGraph(
   const visibleFlows = ciliumFlows.filter(
     f => nsVisible(f.src_namespace) && nsVisible(f.dst_namespace)
       && (showInternetTraffic || f.dst_namespace !== 'internet')
+      && (!onlyInternetTraffic || f.dst_namespace === 'internet')
   )
 
   // Modo Rascunho: preview the graph as if the current drafts had been
@@ -2001,10 +2004,27 @@ export default function NetworkGraph({
   const [showInternetTraffic, setShowInternetTraffic] = React.useState(() => {
     try { return localStorage.getItem(LS_SHOW_INTERNET_KEY) === '1' } catch { return false }
   })
+  const [onlyInternetTraffic, setOnlyInternetTraffic] = React.useState(() => {
+    try { return localStorage.getItem(LS_ONLY_INTERNET_KEY) === '1' } catch { return false }
+  })
+  const toggleOnlyInternetTraffic = React.useCallback(() => {
+    setOnlyInternetTraffic(v => {
+      const next = !v
+      try { localStorage.setItem(LS_ONLY_INTERNET_KEY, next ? '1' : '0') } catch {}
+      return next
+    })
+  }, [])
   const toggleInternetTraffic = React.useCallback(() => {
     setShowInternetTraffic(v => {
       const next = !v
       try { localStorage.setItem(LS_SHOW_INTERNET_KEY, next ? '1' : '0') } catch {}
+      // Turning internet traffic off while "só internet" is active would
+      // leave the graph showing nothing at all, with no visible control
+      // left to explain why: fold "só internet" back off in the same click.
+      if (!next) {
+        setOnlyInternetTraffic(false)
+        try { localStorage.setItem(LS_ONLY_INTERNET_KEY, '0') } catch {}
+      }
       return next
     })
   }, [])
@@ -2047,7 +2067,7 @@ export default function NetworkGraph({
       services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, onToggleNamespaceLock,
       nsPositions.current, nsPaletteIdx.current, canManageNamespace,
       layoutMode, globalLocked,
-      ciliumFlows ?? [], showFlowEdges, ignoredNamespaces, visibleNamespaces, draftMode, showInternetTraffic,
+      ciliumFlows ?? [], showFlowEdges, ignoredNamespaces, visibleNamespaces, draftMode, showInternetTraffic, onlyInternetTraffic,
     )
     // buildGraph() always constructs fresh node objects, so ReactFlow's own
     // click-driven `selected` highlight (the box-shadow on the open node)
@@ -2082,7 +2102,7 @@ export default function NetworkGraph({
         .map(node => ({ namespace: node.id.slice(4), x: node.position.x, y: node.position.y }))
       await onAutoLayoutServices([], movedNamespaces)
     }
-  }, [services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, canManageNamespace, onToggleNamespaceLock, onAutoLayoutServices, globalLocked, ciliumFlows, showFlowEdges, ignoredNamespaces, visibleNamespaces, selectedNodeId, selectedNs, draftMode, showInternetTraffic])
+  }, [services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, canManageNamespace, onToggleNamespaceLock, onAutoLayoutServices, globalLocked, ciliumFlows, showFlowEdges, ignoredNamespaces, visibleNamespaces, selectedNodeId, selectedNs, draftMode, showInternetTraffic, onlyInternetTraffic])
 
   useEffect(() => { rebuildRef.current = rebuildGraph }, [rebuildGraph])
   useEffect(() => { if (!isDragging.current) rebuildGraph('namespaces').catch(() => {}) }, [rebuildGraph])
@@ -2405,6 +2425,22 @@ export default function NetworkGraph({
                 }}
               >
                 🌐 Tráfego pra internet
+              </button>
+            )}
+            {showFlowEdges && showInternetTraffic && ciliumFlows?.some(f => f.dst_namespace === 'internet') && (
+              <button
+                onClick={toggleOnlyInternetTraffic}
+                title="Oculta o tráfego normal e mostra só o que vai pra internet"
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6, marginTop: 6,
+                  padding: '5px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600,
+                  cursor: 'pointer',
+                  background: onlyInternetTraffic ? '#eff6ff' : '#f8fafc',
+                  border: `1px solid ${onlyInternetTraffic ? '#93c5fd' : '#cbd5e1'}`,
+                  color: onlyInternetTraffic ? '#1d4ed8' : '#64748b',
+                }}
+              >
+                🌐 Só internet
               </button>
             )}
           </Panel>
