@@ -16,8 +16,9 @@ const HUBBLE_ADDR = process.env.HUBBLE_RELAY_ADDR ?? 'hubble-relay.kube-system.s
 // Safety net regardless of retention settings: getDiscoveredFlows()/
 // getDraftModeFlows() have no other bound, and internet-bound traffic (one
 // permanent row per distinct external IP) can outgrow retention faster
-// than the hourly cleanup runs. Most-recent-first (see the ORDER BY
-// comment below), so this only ever drops the oldest, least-relevant rows.
+// than the hourly cleanup runs. Selected by last_seen (see the ORDER BY
+// comment below), so this only ever drops rows that haven't been seen in
+// the longest time, never a connection that's still actively happening.
 // This must stay well above real steady-state volume: a real environment
 // was observed sitting at 10,429 accumulated rows (all internet-bound)
 // under the old uniform 7-day retention, before internet traffic got its
@@ -25,7 +26,7 @@ const HUBBLE_ADDR = process.env.HUBBLE_RELAY_ADDR ?? 'hubble-relay.kube-system.s
 // pathological growth (e.g. retention cleanup itself failing), not to
 // trim normal days; if it starts binding under everyday load, it's set
 // too low, not doing its job.
-const MAX_FLOW_ROWS = 20_000
+const MAX_FLOW_ROWS = 50_000
 
 type ObserverClient = grpc.Client & {
   GetFlows: (req: unknown, meta: grpc.Metadata) => grpc.ClientReadableStream<unknown>
@@ -537,11 +538,21 @@ export async function checkHubbleAvailable(): Promise<boolean> {
 
 export function getDiscoveredFlows(): CiliumFlowSummary[] {
   const db = getDb()
-  // Stable order: sorting by flow_count would reshuffle rows (and graph edge
-  // curvature, which is assigned by array position) on every poll as active
-  // flows accumulate hits at different rates, even though nothing meaningful
-  // changed. first_seen only changes when a genuinely new flow appears.
-  const rows = db.prepare('SELECT * FROM discovered_flows ORDER BY first_seen DESC, id LIMIT ?').all(MAX_FLOW_ROWS) as Array<Record<string, unknown>>
+  // Two different concerns, deliberately kept apart:
+  // - WHICH rows survive the MAX_FLOW_ROWS cap: by last_seen, so a flow
+  //   still happening right now is never pushed out in favor of one just
+  //   discovered a moment ago (first_seen never moves once set, so an
+  //   old-but-still-active connection would otherwise look "stale" to this
+  //   cap even though it's the opposite).
+  // - The ORDER the surviving rows are returned in: by first_seen, stable
+  //   across polls (unlike flow_count, which reshuffles as active flows
+  //   accumulate hits at different rates) because the graph assigns edge
+  //   curvature by array position.
+  const rows = db.prepare(`
+    SELECT * FROM (
+      SELECT * FROM discovered_flows ORDER BY last_seen DESC, id LIMIT ?
+    ) ORDER BY first_seen DESC, id
+  `).all(MAX_FLOW_ROWS) as Array<Record<string, unknown>>
   return rows.map(r => ({
     id: r.id as string,
     src_workload: r.src_workload as string,
@@ -575,7 +586,12 @@ export function snapshotFlowsForDraftMode(): void {
 }
 
 export function getDraftModeFlows(): CiliumFlowSummary[] {
-  const rows = getDb().prepare('SELECT * FROM draft_mode_flows ORDER BY first_seen DESC, id LIMIT ?').all(MAX_FLOW_ROWS) as Array<Record<string, unknown>>
+  // Same last_seen-selects/first_seen-displays split as getDiscoveredFlows().
+  const rows = getDb().prepare(`
+    SELECT * FROM (
+      SELECT * FROM draft_mode_flows ORDER BY last_seen DESC, id LIMIT ?
+    ) ORDER BY first_seen DESC, id
+  `).all(MAX_FLOW_ROWS) as Array<Record<string, unknown>>
   return rows.map(r => ({
     id: r.id as string,
     src_workload: r.src_workload as string,
