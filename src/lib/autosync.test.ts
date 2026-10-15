@@ -9,7 +9,7 @@ vi.mock('server-only', () => ({}))
 const dbGet = vi.fn(() => ({ n: 0 }))
 vi.mock('./db', () => ({
   getDb: () => ({
-    prepare: () => ({ get: dbGet, all: () => [] }),
+    prepare: () => ({ get: dbGet, all: () => [], run: () => ({ changes: 1 }) }),
   }),
 }))
 
@@ -29,7 +29,8 @@ vi.mock('./git', () => ({ listPolicyFiles, hasGitOpsCredentials }))
 let writeMode: 'direct' | 'gitops' = 'direct'
 vi.mock('./writeMode', () => ({ getWriteMode: () => writeMode }))
 
-const { checkDrift, runAutosync } = await import('./autosync')
+const { checkDrift, runAutosync, getDriftForDisplay, removeManagedPolicy } = await import('./autosync')
+const { invalidateReads } = await import('./readCache')
 
 beforeEach(() => {
   writeMode = 'direct'
@@ -118,5 +119,44 @@ describe('runAutosync: gitops mode', () => {
     // gitops-only short-circuit fired to prevent it from trying.
     expect(result).toEqual(expect.objectContaining({ checked: 0, fixed: 0 }))
     expect(listPolicyFiles).not.toHaveBeenCalled()
+  })
+})
+
+// GET /api/autosync is polled by every open browser; the scheduler already
+// recomputes drift each tick. The display path reuses that result, but must
+// recompute as soon as anything it depends on changed: our own K8s/git
+// writes (read-cache generation) or managed_policies rows (e.g. removing an
+// orphan, which is DB-only and touches no cluster object).
+describe('getDriftForDisplay', () => {
+  it('reuses a recent drift result and recomputes after a write or a managed_policies change', async () => {
+    writeMode = 'gitops'
+    listPolicyFiles.mockResolvedValue(['ns/a.yaml'])
+    invalidateReads()
+
+    await getDriftForDisplay()
+    await getDriftForDisplay()
+    expect(listPolicyFiles).toHaveBeenCalledTimes(1)
+
+    removeManagedPolicy('ns', 'a')
+    await getDriftForDisplay()
+    expect(listPolicyFiles).toHaveBeenCalledTimes(2)
+
+    invalidateReads()
+    await getDriftForDisplay()
+    expect(listPolicyFiles).toHaveBeenCalledTimes(3)
+  })
+
+  it('recomputes once the cached result is too old', async () => {
+    writeMode = 'gitops'
+    vi.useFakeTimers()
+    try {
+      await getDriftForDisplay()
+      const before = listPolicyFiles.mock.calls.length
+      vi.setSystemTime(Date.now() + 21_000)
+      await getDriftForDisplay()
+      expect(listPolicyFiles.mock.calls.length).toBe(before + 1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

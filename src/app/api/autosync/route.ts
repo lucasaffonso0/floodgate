@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
 import { getConfig } from '@/lib/config'
-import { runAutosync, checkDrift, getLastSyncResult, getManagedPolicyCount, removeManagedPolicy } from '@/lib/autosync'
+import { runAutosync, checkDrift, getDriftForDisplay, getLastSyncResult, getManagedPolicyCount, removeManagedPolicy } from '@/lib/autosync'
 import { getWriteMode } from '@/lib/writeMode'
 import { deleteNetworkPolicyViaGit } from '@/lib/k8s-gitops'
 import { apiError } from '@/lib/api-helpers'
@@ -12,7 +12,7 @@ export async function GET() {
   if (!user) return NextResponse.json({ detail: 'Unauthorized' }, { status: 401 })
   try {
     const cfg = getConfig()
-    const drift = await checkDrift()
+    const drift = await getDriftForDisplay()
     return NextResponse.json({
       enabled: cfg.autosync_enabled,
       interval_s: cfg.autosync_interval_s,

@@ -3,6 +3,7 @@ import { getDb } from './db'
 import { listNetworkPolicies, applyPolicyYAML, getPolicyYAML, listNamespaceNames, sanitizeK8sName } from './k8s'
 import { getWriteMode } from './writeMode'
 import { listPolicyFiles, hasGitOpsCredentials } from './git'
+import { readGeneration } from './readCache'
 
 // The target namespace itself (not just the policy) is gone: restoring will
 // keep failing until someone recreates it. Kept apart from a transient error
@@ -23,10 +24,12 @@ export function saveManagedPolicy(namespace: string, name: string, policyYaml: s
     INSERT OR REPLACE INTO managed_policies (namespace, name, policy_yaml, saved_at)
     VALUES (?, ?, ?, datetime('now'))
   `).run(namespace, name, policyYaml)
+  g._floodgateDriftDirty = true
 }
 
 export function removeManagedPolicy(namespace: string, name: string): void {
   getDb().prepare('DELETE FROM managed_policies WHERE namespace = ? AND name = ?').run(namespace, name)
+  g._floodgateDriftDirty = true
 }
 
 // Registers the policies isolateNamespace() creates for one direction into
@@ -63,6 +66,28 @@ export interface DriftResult {
 const g = global as typeof global & {
   _floodgateDriftResult?: DriftResult
   _floodgateSyncResult?: SyncResult
+  // Read-cache generation (readCache.ts) the last drift computation started
+  // under, and whether managed_policies changed since: together they say
+  // whether that result can still be shown as current.
+  _floodgateDriftGen?: number
+  _floodgateDriftDirty?: boolean
+}
+
+// GET /api/autosync is polled by every open browser, while the scheduler
+// already recomputes drift every tick. Reuse that result while it's recent
+// and nothing it depends on changed since: no K8s/git write by floodgate
+// (generation) and no managed_policies change (dirty flag; removing an
+// orphan is DB-only and touches no cluster object). Changes made outside
+// floodgate show up within DRIFT_REUSE_MS, same order as the 15s tick.
+const DRIFT_REUSE_MS = 20_000
+export async function getDriftForDisplay(): Promise<DriftResult> {
+  const last = g._floodgateDriftResult
+  if (
+    last && !g._floodgateDriftDirty &&
+    g._floodgateDriftGen === readGeneration() &&
+    Date.now() - Date.parse(last.timestamp) < DRIFT_REUSE_MS
+  ) return last
+  return checkDrift()
 }
 
 export function getLastDriftResult(): DriftResult | null {
@@ -122,6 +147,14 @@ async function checkDriftViaGit(): Promise<DriftResult> {
 }
 
 export async function checkDrift(): Promise<DriftResult> {
+  const gen = readGeneration()
+  g._floodgateDriftDirty = false
+  const result = await checkDriftUncached()
+  g._floodgateDriftGen = gen
+  return result
+}
+
+async function checkDriftUncached(): Promise<DriftResult> {
   const db = getDb()
 
   // Skip if paused: intentionally empty
