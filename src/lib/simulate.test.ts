@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isFlowBlocked, draftToPolicies, simulateImpact, computeEffectivePolicies } from './simulate'
+import { isFlowBlocked, draftToPolicies, simulateImpact, computeEffectivePolicies, createFlowBlockedChecker } from './simulate'
 import { NetworkPolicyInfo, Draft, CiliumFlowSummary } from '@/types'
 
 function policy(overrides: Partial<NetworkPolicyInfo>): NetworkPolicyInfo {
@@ -209,4 +209,54 @@ describe('simulateImpact', () => {
     const result = simulateImpact(flows, realPolicies, drafts)
     expect(result.breaking.map(f => f.id)).toEqual(['f1'])
   })
+})
+
+// The fast paths (per-namespace policy subsets, memo per endpoint pair) must
+// give exactly what the plain per-row isFlowBlocked() gives.
+describe('memoized flow checks match the plain computation', () => {
+  function mulberry32(seed: number) {
+    return () => {
+      seed |= 0; seed = (seed + 0x6D2B79F5) | 0
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+  }
+  const NS = ['a', 'b', 'c', 'internet']
+  const SVC = ['web', 'api', 'db', '']
+  const TYPES: NetworkPolicyInfo['policy_type'][] = ['allow', 'allow-namespace', 'allow-egress', 'allow-intranamespace', 'restrict-ingress', 'restrict-egress', 'cidr-ingress', 'cidr-egress']
+
+  for (let seed = 1; seed <= 40; seed++) {
+    it(`seed ${seed}`, () => {
+      const rnd = mulberry32(seed)
+      const pick = <T,>(arr: T[]) => arr[Math.floor(rnd() * arr.length)]
+      const policies = Array.from({ length: Math.floor(rnd() * 12) }, (_, i) => policy({
+        name: `p${i}`, namespace: pick(NS.slice(0, 3)), policy_type: pick(TYPES),
+        src_workload: pick(SVC), src_namespace: pick(NS.slice(0, 3)), dst_service: pick([...SVC, 'internet']),
+        policy_types: [pick(['Ingress', 'Egress'])],
+      }))
+      const drafts: Draft[] = Array.from({ length: Math.floor(rnd() * 4) }, (_, i) => pick([
+        draft({ id: `d${i}`, kind: 'isolate', isolate_namespace: pick(NS.slice(0, 3)), isolate_direction: pick(['ingress', 'egress', 'both'] as const), isolate_allow_intra: rnd() < 0.5, isolate_allow_internet: rnd() < 0.5 }),
+        draft({ id: `d${i}`, kind: 'connection', src_workload: pick(SVC.slice(0, 3)), src_namespace: pick(NS.slice(0, 3)), dst_service: pick(SVC.slice(0, 3)), dst_namespace: pick(NS.slice(0, 3)), policy_direction: pick(['ingress', 'egress', 'both'] as const) }),
+        draft({ id: `d${i}`, kind: 'toggle', toggle_namespace: pick(NS.slice(0, 3)), toggle_option: pick(['intra', 'internet'] as const), toggle_action: pick(['enable', 'disable'] as const) }),
+      ]))
+      const flows = Array.from({ length: 60 }, (_, i) => {
+        const dstNs = pick(NS)
+        return flow({ id: `f${i}`, src_workload: pick(SVC.slice(0, 3)), src_namespace: pick(NS.slice(0, 3)), dst_namespace: dstNs, dst_workload: dstNs === 'internet' ? `1.2.3.${i % 4}` : pick(SVC.slice(0, 3)), dst_port: 80 + (i % 3) })
+      })
+
+      const check = createFlowBlockedChecker(policies)
+      for (const f of flows) expect(check(f)).toBe(isFlowBlocked(f, policies))
+
+      const hypothetical = computeEffectivePolicies(policies, drafts)
+      const naive = { breaking: [] as string[], fixed: [] as string[] }
+      for (const f of flows) {
+        const was = isFlowBlocked(f, policies), will = isFlowBlocked(f, hypothetical)
+        if (!was && will) naive.breaking.push(f.id)
+        else if (was && !will) naive.fixed.push(f.id)
+      }
+      const fast = simulateImpact(flows, policies, drafts)
+      expect({ breaking: fast.breaking.map(f => f.id), fixed: fast.fixed.map(f => f.id) }).toEqual(naive)
+    })
+  }
 })

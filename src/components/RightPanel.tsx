@@ -6,7 +6,7 @@ import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, AppConfig, User, Appro
 import {
   deleteNetworkPolicy, deleteAllPolicies, importPolicies, patchNetworkPolicyPort,
   getApprovalRequests, voteApprovalRequest, applyApprovalRequest, cancelApprovalRequest, getApprovalRequestYAML,
-  getSecurityCoverage, isolateNamespace,
+  getSecurityCoverage, isolateNamespaces,
   getPausedPolicies, pauseAllPolicies, resumeAllPolicies, pausePolicy, resumePolicy,
   getAutosyncStatus, triggerAutosync, removeOrphanedManagedPolicy, removeOrphanedPausedPolicy, updateUserPassword, listUsers,
   adoptPolicy, unadoptPolicy, checkHubble, previewDiscoveryPolicyYAML, createCidrPolicy,
@@ -14,9 +14,10 @@ import {
   getGitOpsConfig, saveGitOpsConfig, syncGitOpsRepo, type GitOpsConfigUpdate, type GitOpsConnectionTest,
 } from '@/api/client'
 import { normalizeWorkload, classifyFlowGap } from '@/lib/flowMatch'
-import { simulateImpact, isFlowBlocked, computeEffectivePolicies } from '@/lib/simulate'
+import { simulateImpact, computeEffectivePolicies, createFlowBlockedChecker } from '@/lib/simulate'
 import { getNamespaceIsolation } from '@/lib/nsIsolation'
 import { CronExpressionParser } from 'cron-parser'
+import { useVirtualizer } from '@tanstack/react-virtual'
 
 function isValidCron(expr: string): boolean {
   try { CronExpressionParser.parse(expr); return true } catch { return false }
@@ -146,6 +147,55 @@ function LiveYAMLViewer({ namespace, name }: { namespace: string; name: string }
 }
 
 // ─── Namespaces tab ─────────────────────────────────────────────────────────
+// Lista virtualizada dentro de um container que já rola: só as linhas
+// visíveis (mais uma margem) existem no DOM, cada uma medida depois de
+// montada (alturas variam: YAML aberto, badges). Pode ter conteúdo acima
+// dela no mesmo container: o deslocamento é medido e descontado.
+// O container é achado subindo a árvore a partir da própria lista: uma ref
+// passada pelo pai ainda não está ligada quando os efeitos deste filho rodam
+// pela primeira vez, e a lista ficava vazia.
+function scrollParentOf(el: HTMLElement | null): HTMLElement | null {
+  for (let cur = el?.parentElement ?? null; cur; cur = cur.parentElement) {
+    const oy = getComputedStyle(cur).overflowY
+    if (oy === 'auto' || oy === 'scroll') return cur
+  }
+  return null
+}
+
+function VirtualRows<T>({ items, estimateSize, getKey, render }: {
+  items: T[]
+  estimateSize: number
+  getKey: (item: T) => string
+  render: (item: T) => React.ReactNode
+}) {
+  const ownRef = useRef<HTMLDivElement>(null)
+  const [margin, setMargin] = useState(0)
+  React.useLayoutEffect(() => {
+    const el = ownRef.current, sc = scrollParentOf(el)
+    if (!el || !sc) return
+    const m = el.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop
+    if (Math.abs(m - margin) > 1) setMargin(m)
+  })
+  const virtualizer = useVirtualizer({
+    count: items.length,
+    getScrollElement: () => scrollParentOf(ownRef.current),
+    estimateSize: () => estimateSize,
+    getItemKey: i => getKey(items[i]),
+    overscan: 8,
+    scrollMargin: margin,
+  })
+  return (
+    <div ref={ownRef} style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+      {virtualizer.getVirtualItems().map(item => (
+        <div key={item.key} data-index={item.index} ref={virtualizer.measureElement}
+          style={{ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${item.start - margin}px)` }}>
+          {render(items[item.index])}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function NamespacesTab({ allNamespaces, services, visibleNamespaces, ignoredNamespaces, onToggle, onIgnore, onUnignore, isAdmin }: {
   allNamespaces: string[]; services: ServiceInfo[]; visibleNamespaces: Set<string>; ignoredNamespaces: string[]
   onToggle: (ns: string) => void
@@ -157,7 +207,12 @@ function NamespacesTab({ allNamespaces, services, visibleNamespaces, ignoredName
   const [search, setSearch] = useState('')
   const [addingIgnore, setAddingIgnore] = useState(false)
   const [newIgnoreNs, setNewIgnoreNs] = useState('')
-  const svcCount = (ns: string) => services.filter(s => s.namespace === ns).length
+  const svcCounts = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const s of services) m.set(s.namespace, (m.get(s.namespace) ?? 0) + 1)
+    return m
+  }, [services])
+  const svcCount = (ns: string) => svcCounts.get(ns) ?? 0
   const filtered = allNamespaces.filter(ns => ns.toLowerCase().includes(search.toLowerCase()))
   const allFilteredOn = filtered.length > 0 && filtered.every(ns => visibleNamespaces.has(ns))
   function toggleAll() { filtered.forEach(ns => { if (allFilteredOn ? visibleNamespaces.has(ns) : !visibleNamespaces.has(ns)) onToggle(ns) }) }
@@ -183,8 +238,8 @@ function NamespacesTab({ allNamespaces, services, visibleNamespaces, ignoredName
         {search && <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 4 }}>{filtered.length} de {allNamespaces.length}</div>}
       </div>
       <div style={{ flex: 1, overflowY: 'auto' }}>
-        {filtered.map(ns => (
-          <div key={ns} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px', borderBottom: '1px solid #f9fafb' }}>
+        <VirtualRows items={filtered} estimateSize={45} getKey={ns => ns} render={ns => (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px', borderBottom: '1px solid #f9fafb' }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, minWidth: 0, cursor: 'pointer' }}>
               <input type="checkbox" checked={visibleNamespaces.has(ns)} onChange={() => onToggle(ns)} style={{ accentColor: '#3b82f6', width: 14, height: 14, flexShrink: 0 }} />
               <div style={{ flex: 1, minWidth: 0 }}>
@@ -200,7 +255,7 @@ function NamespacesTab({ allNamespaces, services, visibleNamespaces, ignoredName
               >Ignorar</button>
             )}
           </div>
-        ))}
+        )} />
         {filtered.length === 0 && <div style={{ padding: '20px 14px', textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>Nenhum namespace encontrado</div>}
 
         {/* Ignored namespaces section */}
@@ -532,7 +587,12 @@ function DraftsTab({ drafts, services, ciliumFlows, config, currentUser, onRemov
   onAddDraft: (d: Omit<Draft, 'id'>) => void
   allPolicies?: NetworkPolicyInfo[]; draftMode?: boolean; draftModeFlows?: CiliumFlowSummary[]
 }) {
-  const impact = draftMode ? simulateImpact(draftModeFlows ?? [], allPolicies ?? [], drafts) : null
+  // Memoizado: com dezenas de milhares de flows no snapshot, refazer isso a
+  // cada render (digitar uma porta, abrir um item) travava a aba.
+  const impact = useMemo(
+    () => (draftMode ? simulateImpact(draftModeFlows ?? [], allPolicies ?? [], drafts) : null),
+    [draftMode, draftModeFlows, allPolicies, drafts],
+  )
   const writeMode = currentUser?.write_mode ?? 'direct'
   const [expanded, setExpanded] = useState<string | null>(null)
   const [applying, setApplying] = useState<string | null>(null)
@@ -1345,6 +1405,149 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   const external = allPolicies.filter(p => !p.managed)
   const totalPaused = paused.filter(p => !activePolicyKeys.has(`${p.namespace}/${p.name}`) && !p.namespace_missing).length
 
+
+  function renderActivePolicy(p: NetworkPolicyInfo) {
+      const key = `${p.namespace}/${p.name}`
+      const m = POLICY_META[p.policy_type] ?? POLICY_META['external']
+      const orphan = isOrphaned(p)
+      return (
+        <div style={{ borderBottom: '1px solid #f9fafb', background: orphan ? '#fff8f8' : undefined }}>
+          <div style={{ padding: '8px 14px 8px 20px', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', background: orphan ? '#fca5a5' : m.dot, flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 11, fontWeight: 600, color: orphan ? '#b91c1c' : '#1e293b', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {policyDescription(p)}
+                </span>
+                {orphan && (
+                  <span style={{ fontSize: 8, fontWeight: 700, color: '#dc2626', background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>OBSOLETA</span>
+                )}
+                {/* Quando faz parte de uma operação em massa (>1 ao mesmo tempo), o
+                    banner agregado acima já cobre isso: o badge individual aqui
+                    só soma ruído linha a linha ("apagando uma por uma") em vez de
+                    deixar claro que é uma ação só. */}
+                {p.pending_write === 'apply' && pendingApplies.length <= 1 && (
+                  <span
+                    title="Enviando para o repositório GitOps…"
+                    style={{ fontSize: 8, fontWeight: 700, color: '#1d4ed8', background: '#eff6ff', border: '1px dashed #bfdbfe', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
+                    {pendingWriteFrame} APLICANDO
+                  </span>
+                )}
+                {p.pending_write === 'delete' && pendingDeletes.length <= 1 && (
+                  <span
+                    title="Removendo do repositório GitOps…"
+                    style={{ fontSize: 8, fontWeight: 700, color: '#1d4ed8', background: '#eff6ff', border: '1px dashed #bfdbfe', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
+                    {pendingWriteFrame} REMOVENDO
+                  </span>
+                )}
+                {!p.pending_write && p.sync_status === 'pending_argocd' && (
+                  <span
+                    title="Commitada no repositório GitOps, aguardando o ArgoCD aplicar no cluster"
+                    style={{ fontSize: 8, fontWeight: 700, color: '#b45309', background: '#fffbeb', border: '1px dashed #fde68a', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
+                    ⏳ AGUARDANDO APLICAR
+                  </span>
+                )}
+                {!p.pending_write && p.sync_status === 'pending_delete' && (
+                  <span
+                    title="Removida do repositório GitOps, aguardando o ArgoCD remover do cluster"
+                    style={{ fontSize: 8, fontWeight: 700, color: '#b45309', background: '#fffbeb', border: '1px dashed #fde68a', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
+                    ⏳ AGUARDANDO REMOÇÃO DO CLUSTER
+                  </span>
+                )}
+                {p.invalid_file && (
+                  <span
+                    title="O arquivo desta policy no repositório GitOps não pôde ser lido (YAML malformado ou campo obrigatório faltando)"
+                    style={{ fontSize: 8, fontWeight: 700, color: '#b91c1c', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
+                    ⚠️ ARQUIVO INVÁLIDO
+                  </span>
+                )}
+                {p.external_change && !p.invalid_file && (
+                  <span
+                    title="O último commit que alterou este arquivo não foi feito pelo floodgate: alguém editou o repositório diretamente"
+                    style={{ fontSize: 8, fontWeight: 700, color: '#b91c1c', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
+                    ⚠️ EDITADO FORA DO FLOODGATE
+                  </span>
+                )}
+              </div>
+              <div style={{ fontSize: 9, color: orphan ? '#fca5a5' : '#94a3b8', marginTop: 1 }}>{m.label}</div>
+            </div>
+            <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+              <button style={{ ...btn.base, ...btn.blue, padding: '3px 7px', fontSize: 10 }} onClick={() => toggleYAML(key)}><Icon.Eye /></button>
+              {!isViewer && (!canManageNamespace || canManageNamespace(p.namespace)) && (
+                <>
+                  {(p.policy_type === 'allow' || p.policy_type === 'allow-egress') && (
+                    <button style={{ ...btn.base, ...btn.gray, padding: '3px 7px', fontSize: 10 }} title="Editar portas" onClick={() => setEditingPolicy(p)}><Icon.Edit /></button>
+                  )}
+                  {p.external_change && !p.invalid_file && (p.policy_type === 'allow' || p.policy_type === 'allow-egress') && (
+                    <button style={{ ...btn.base, ...btn.red, padding: '3px 7px', fontSize: 10, opacity: reapplyingPolicy === `${p.namespace}/${p.name}` ? 0.6 : 1 }}
+                      disabled={reapplyingPolicy === `${p.namespace}/${p.name}`}
+                      title="Regrava o arquivo com a identidade do floodgate, restaurando o formato canônico. NÃO reverte porta/destino se foi isso que a edição externa mudou: o valor atual é o que fica."
+                      onClick={() => handleReapply(p)}>
+                      {reapplyingPolicy === `${p.namespace}/${p.name}` ? `${reapplySpinnerFrame} Reaplicando…` : 'Reaplicar via floodgate'}
+                    </button>
+                  )}
+                  {p.adopted && (
+                    <button style={{ ...btn.base, ...btn.orange, padding: '3px 7px', fontSize: 10 }} title="Desadotar: remove do Floodgate mas mantém no cluster" onClick={() => handleUnadopt(p)}>↩ Desadotar</button>
+                  )}
+                  {isAdmin && (
+                    <button style={{ ...btn.base, ...btn.orange, padding: '3px 7px', fontSize: 10 }} title="Pausar: salva no DB e remove do cluster" onClick={() => handlePauseOne(p.namespace, p.name)}>⏸</button>
+                  )}
+                  <button style={{ ...btn.base, ...btn.red, padding: '3px 7px', opacity: deletingPolicy === `${p.namespace}/${p.name}` ? 0.6 : 1 }}
+                    disabled={deletingPolicy === `${p.namespace}/${p.name}`}
+                    title={deletingPolicy === `${p.namespace}/${p.name}` && writeMode === 'gitops' ? 'Removendo do repositório…' : undefined}
+                    onClick={() => handleDelete(p.namespace, p.name)}>
+                    {deletingPolicy === `${p.namespace}/${p.name}`
+                      ? (writeMode === 'gitops' ? `${deleteSpinnerFrame} Removendo…` : '…')
+                      : <Icon.Trash />}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+          {expandedYAML === key && <LiveYAMLViewer namespace={p.namespace} name={p.name} />}
+        </div>
+      )
+  }
+
+  function renderPausedPolicy(p: PausedPolicy) {
+      const key = `paused-${p.id}`
+      return (
+        <div style={{ borderBottom: '1px solid #f9fafb', opacity: 0.55 }}>
+          <div style={{ padding: '8px 14px 8px 20px', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', border: '2px dashed #9ca3af', flexShrink: 0, background: 'transparent' }} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: '#9ca3af', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {p.name}
+              </div>
+              <div style={{ fontSize: 9, color: '#d1d5db', marginTop: 1 }}>pausada · não está no cluster</div>
+            </div>
+            <span style={{ fontSize: 8, fontWeight: 700, color: '#9ca3af', background: '#f3f4f6', border: '1px solid #d1d5db', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>INATIVA</span>
+            <button style={{ ...btn.base, ...btn.gray, padding: '3px 7px', fontSize: 10, flexShrink: 0 }} onClick={() => toggleYAML(key)}><Icon.Eye /></button>
+            {isAdmin && (
+              <button style={{ ...btn.base, ...btn.green, padding: '3px 7px', fontSize: 10, flexShrink: 0 }} title="Reativar: aplica novamente no cluster" onClick={() => handleResumeOne(p.id)}>▶</button>
+            )}
+          </div>
+          {expandedYAML === key && <StaticYAMLViewer yamlStr={p.policy_yaml} />}
+        </div>
+      )
+  }
+
+  // Linhas da lista virtualizada: cabeçalho de cada namespace, seguido das
+  // suas policies ativas e pausadas quando ele está aberto.
+  type PolicyRow =
+    | { kind: 'header'; ns: string; total: number }
+    | { kind: 'active'; p: NetworkPolicyInfo }
+    | { kind: 'paused'; p: PausedPolicy }
+  const policyRows: PolicyRow[] = []
+  for (const ns of allNs) {
+    const nsPolicies = grouped.get(ns) ?? []
+    const nsPaused = pausedByNs.get(ns) ?? []
+    policyRows.push({ kind: 'header', ns, total: nsPolicies.length + nsPaused.length })
+    if (collapsedNs.has(ns)) continue
+    for (const p of nsPolicies) policyRows.push({ kind: 'active', p })
+    for (const p of nsPaused) policyRows.push({ kind: 'paused', p })
+  }
+  const policyRowKey = (r: PolicyRow) => r.kind === 'header' ? `ns:${r.ns}` : r.kind === 'active' ? `a:${r.p.namespace}/${r.p.name}` : `p:${r.p.id}`
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       {editingPolicy && (
@@ -1480,155 +1683,21 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
           </div>
         )}
 
-        {/* Policies grouped by namespace: active + paused inline */}
-        {allNs.map(ns => {
-          const nsPolicies = grouped.get(ns) ?? []
-          const nsPaused   = pausedByNs.get(ns) ?? []
-          const isOpen     = !collapsedNs.has(ns)
-          const total      = nsPolicies.length + nsPaused.length
-          return (
-            <div key={ns}>
-              <button onClick={() => toggleNs(ns)}
+        {/* Policies grouped by namespace: active + paused inline (virtualizada) */}
+        <VirtualRows items={policyRows} estimateSize={44} getKey={policyRowKey} render={row => {
+          if (row.kind === 'header') {
+            const isOpen = !collapsedNs.has(row.ns)
+            return (
+              <button onClick={() => toggleNs(row.ns)}
                 style={{ width: '100%', padding: '7px 14px', background: '#f8fafc', border: 'none', borderBottom: '1px solid #e2e8f0', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, textAlign: 'left' }}>
                 {isOpen ? <Icon.ChevronDown /> : <Icon.ChevronRight />}
-                <span style={{ fontSize: 11, fontWeight: 700, color: '#334155', flex: 1 }}>{ns}</span>
-                <span style={{ fontSize: 10, color: '#94a3b8', background: '#e2e8f0', borderRadius: 10, padding: '1px 7px', fontWeight: 600 }}>{total}</span>
+                <span style={{ fontSize: 11, fontWeight: 700, color: '#334155', flex: 1 }}>{row.ns}</span>
+                <span style={{ fontSize: 10, color: '#94a3b8', background: '#e2e8f0', borderRadius: 10, padding: '1px 7px', fontWeight: 600 }}>{row.total}</span>
               </button>
-
-              {isOpen && (
-                <>
-                  {/* Active policies */}
-                  {nsPolicies.map(p => {
-                    const key = `${p.namespace}/${p.name}`
-                    const m = POLICY_META[p.policy_type] ?? POLICY_META['external']
-                    const orphan = isOrphaned(p)
-                    return (
-                      <div key={key} style={{ borderBottom: '1px solid #f9fafb', background: orphan ? '#fff8f8' : undefined }}>
-                        <div style={{ padding: '8px 14px 8px 20px', display: 'flex', alignItems: 'center', gap: 8 }}>
-                          <span style={{ width: 8, height: 8, borderRadius: '50%', background: orphan ? '#fca5a5' : m.dot, flexShrink: 0 }} />
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
-                              <span style={{ fontSize: 11, fontWeight: 600, color: orphan ? '#b91c1c' : '#1e293b', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                                {policyDescription(p)}
-                              </span>
-                              {orphan && (
-                                <span style={{ fontSize: 8, fontWeight: 700, color: '#dc2626', background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>OBSOLETA</span>
-                              )}
-                              {/* Quando faz parte de uma operação em massa (>1 ao mesmo tempo), o
-                                  banner agregado acima já cobre isso: o badge individual aqui
-                                  só soma ruído linha a linha ("apagando uma por uma") em vez de
-                                  deixar claro que é uma ação só. */}
-                              {p.pending_write === 'apply' && pendingApplies.length <= 1 && (
-                                <span
-                                  title="Enviando para o repositório GitOps…"
-                                  style={{ fontSize: 8, fontWeight: 700, color: '#1d4ed8', background: '#eff6ff', border: '1px dashed #bfdbfe', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
-                                  {pendingWriteFrame} APLICANDO
-                                </span>
-                              )}
-                              {p.pending_write === 'delete' && pendingDeletes.length <= 1 && (
-                                <span
-                                  title="Removendo do repositório GitOps…"
-                                  style={{ fontSize: 8, fontWeight: 700, color: '#1d4ed8', background: '#eff6ff', border: '1px dashed #bfdbfe', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
-                                  {pendingWriteFrame} REMOVENDO
-                                </span>
-                              )}
-                              {!p.pending_write && p.sync_status === 'pending_argocd' && (
-                                <span
-                                  title="Commitada no repositório GitOps, aguardando o ArgoCD aplicar no cluster"
-                                  style={{ fontSize: 8, fontWeight: 700, color: '#b45309', background: '#fffbeb', border: '1px dashed #fde68a', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
-                                  ⏳ AGUARDANDO APLICAR
-                                </span>
-                              )}
-                              {!p.pending_write && p.sync_status === 'pending_delete' && (
-                                <span
-                                  title="Removida do repositório GitOps, aguardando o ArgoCD remover do cluster"
-                                  style={{ fontSize: 8, fontWeight: 700, color: '#b45309', background: '#fffbeb', border: '1px dashed #fde68a', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
-                                  ⏳ AGUARDANDO REMOÇÃO DO CLUSTER
-                                </span>
-                              )}
-                              {p.invalid_file && (
-                                <span
-                                  title="O arquivo desta policy no repositório GitOps não pôde ser lido (YAML malformado ou campo obrigatório faltando)"
-                                  style={{ fontSize: 8, fontWeight: 700, color: '#b91c1c', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
-                                  ⚠️ ARQUIVO INVÁLIDO
-                                </span>
-                              )}
-                              {p.external_change && !p.invalid_file && (
-                                <span
-                                  title="O último commit que alterou este arquivo não foi feito pelo floodgate: alguém editou o repositório diretamente"
-                                  style={{ fontSize: 8, fontWeight: 700, color: '#b91c1c', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>
-                                  ⚠️ EDITADO FORA DO FLOODGATE
-                                </span>
-                              )}
-                            </div>
-                            <div style={{ fontSize: 9, color: orphan ? '#fca5a5' : '#94a3b8', marginTop: 1 }}>{m.label}</div>
-                          </div>
-                          <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
-                            <button style={{ ...btn.base, ...btn.blue, padding: '3px 7px', fontSize: 10 }} onClick={() => toggleYAML(key)}><Icon.Eye /></button>
-                            {!isViewer && (!canManageNamespace || canManageNamespace(p.namespace)) && (
-                              <>
-                                {(p.policy_type === 'allow' || p.policy_type === 'allow-egress') && (
-                                  <button style={{ ...btn.base, ...btn.gray, padding: '3px 7px', fontSize: 10 }} title="Editar portas" onClick={() => setEditingPolicy(p)}><Icon.Edit /></button>
-                                )}
-                                {p.external_change && !p.invalid_file && (p.policy_type === 'allow' || p.policy_type === 'allow-egress') && (
-                                  <button style={{ ...btn.base, ...btn.red, padding: '3px 7px', fontSize: 10, opacity: reapplyingPolicy === `${p.namespace}/${p.name}` ? 0.6 : 1 }}
-                                    disabled={reapplyingPolicy === `${p.namespace}/${p.name}`}
-                                    title="Regrava o arquivo com a identidade do floodgate, restaurando o formato canônico. NÃO reverte porta/destino se foi isso que a edição externa mudou: o valor atual é o que fica."
-                                    onClick={() => handleReapply(p)}>
-                                    {reapplyingPolicy === `${p.namespace}/${p.name}` ? `${reapplySpinnerFrame} Reaplicando…` : 'Reaplicar via floodgate'}
-                                  </button>
-                                )}
-                                {p.adopted && (
-                                  <button style={{ ...btn.base, ...btn.orange, padding: '3px 7px', fontSize: 10 }} title="Desadotar: remove do Floodgate mas mantém no cluster" onClick={() => handleUnadopt(p)}>↩ Desadotar</button>
-                                )}
-                                {isAdmin && (
-                                  <button style={{ ...btn.base, ...btn.orange, padding: '3px 7px', fontSize: 10 }} title="Pausar: salva no DB e remove do cluster" onClick={() => handlePauseOne(p.namespace, p.name)}>⏸</button>
-                                )}
-                                <button style={{ ...btn.base, ...btn.red, padding: '3px 7px', opacity: deletingPolicy === `${p.namespace}/${p.name}` ? 0.6 : 1 }}
-                                  disabled={deletingPolicy === `${p.namespace}/${p.name}`}
-                                  title={deletingPolicy === `${p.namespace}/${p.name}` && writeMode === 'gitops' ? 'Removendo do repositório…' : undefined}
-                                  onClick={() => handleDelete(p.namespace, p.name)}>
-                                  {deletingPolicy === `${p.namespace}/${p.name}`
-                                    ? (writeMode === 'gitops' ? `${deleteSpinnerFrame} Removendo…` : '…')
-                                    : <Icon.Trash />}
-                                </button>
-                              </>
-                            )}
-                          </div>
-                        </div>
-                        {expandedYAML === key && <LiveYAMLViewer namespace={p.namespace} name={p.name} />}
-                      </div>
-                    )
-                  })}
-
-                  {/* Paused policies (inline, grayed out) */}
-                  {nsPaused.map(p => {
-                    const key = `paused-${p.id}`
-                    return (
-                      <div key={p.id} style={{ borderBottom: '1px solid #f9fafb', opacity: 0.55 }}>
-                        <div style={{ padding: '8px 14px 8px 20px', display: 'flex', alignItems: 'center', gap: 8 }}>
-                          <span style={{ width: 8, height: 8, borderRadius: '50%', border: '2px dashed #9ca3af', flexShrink: 0, background: 'transparent' }} />
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ fontSize: 11, fontWeight: 600, color: '#9ca3af', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                              {p.name}
-                            </div>
-                            <div style={{ fontSize: 9, color: '#d1d5db', marginTop: 1 }}>pausada · não está no cluster</div>
-                          </div>
-                          <span style={{ fontSize: 8, fontWeight: 700, color: '#9ca3af', background: '#f3f4f6', border: '1px solid #d1d5db', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>INATIVA</span>
-                          <button style={{ ...btn.base, ...btn.gray, padding: '3px 7px', fontSize: 10, flexShrink: 0 }} onClick={() => toggleYAML(key)}><Icon.Eye /></button>
-                          {isAdmin && (
-                            <button style={{ ...btn.base, ...btn.green, padding: '3px 7px', fontSize: 10, flexShrink: 0 }} title="Reativar: aplica novamente no cluster" onClick={() => handleResumeOne(p.id)}>▶</button>
-                          )}
-                        </div>
-                        {expandedYAML === key && <StaticYAMLViewer yamlStr={p.policy_yaml} />}
-                      </div>
-                    )
-                  })}
-                </>
-              )}
-            </div>
-          )
-        })}
+            )
+          }
+          return row.kind === 'active' ? renderActivePolicy(row.p) : renderPausedPolicy(row.p)
+        }} />
 
         {/* External (non-managed) policies */}
         {external.length > 0 && (
@@ -1850,6 +1919,22 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
     }
   }
 
+  // One request for the whole batch (one git commit in GitOps mode).
+  // Namespaces that failed are listed; the others went through.
+  async function runBulkIsolate(items: Parameters<typeof isolateNamespaces>[0]) {
+    try {
+      const { results } = await isolateNamespaces(items)
+      const failed = results.filter(r => r.error)
+      if (failed.length > 0) alert(`Falhou em ${failed.length} de ${results.length} namespace(s):\n${failed.map(f => `${f.namespace}: ${f.error}`).join('\n')}`)
+    } catch (e: unknown) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      alert(`Falha ao isolar: ${detail ?? 'erro desconhecido'}`)
+    } finally {
+      setBulkBusy(null)
+      onRefresh()
+    }
+  }
+
   async function handleIsolateAllExposed() {
     const targets = exposedNs.map(b => b.ns).filter(ns => !canManageNamespace || canManageNamespace(ns))
     if (targets.length === 0) return
@@ -1859,11 +1944,7 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
     }
     if (!confirm(`Isolar ${targets.length} namespace(s) expostos?`)) return
     setBulkBusy('exposed')
-    for (const ns of targets) {
-      try { await isolateNamespace({ namespace: ns, direction: expDirection, allow_intra_namespace: expAllowIntra, allow_egress_internet: expAllowInternet }) } catch { /* best-effort */ }
-    }
-    setBulkBusy(null)
-    onRefresh()
+    await runBulkIsolate(targets.map(ns => ({ namespace: ns, direction: expDirection, allow_intra_namespace: expAllowIntra, allow_egress_internet: expAllowInternet })))
   }
 
   async function handleCompletePartial() {
@@ -1875,12 +1956,10 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
     }
     if (!confirm(`Completar isolamento em ${targets.length} namespace(s)?`)) return
     setBulkBusy('partial')
-    for (const { ns, iso } of targets) {
-      const missingDir = iso.isolatedIn ? 'egress' : 'ingress'
-      try { await isolateNamespace({ namespace: ns, direction: missingDir, allow_intra_namespace: partAllowIntra, allow_egress_internet: partAllowInternet }) } catch { /* best-effort */ }
-    }
-    setBulkBusy(null)
-    onRefresh()
+    await runBulkIsolate(targets.map(({ ns, iso }) => ({
+      namespace: ns, direction: iso.isolatedIn ? 'egress' as const : 'ingress' as const,
+      allow_intra_namespace: partAllowIntra, allow_egress_internet: partAllowInternet,
+    })))
   }
 
   if (!coverageLoaded) {
@@ -1987,8 +2066,8 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
                   </div>
                 )}
 
-                {sec.items.map(({ ns, count, iso }) => (
-                  <div key={ns}
+                <VirtualRows items={sec.items} estimateSize={44} getKey={it => it.ns} render={({ ns, count, iso }) => (
+                  <div
                     onClick={() => onViewNamespace?.(ns)}
                     style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 14px 9px 22px', borderBottom: `1px solid ${sec.border}`, cursor: onViewNamespace ? 'pointer' : 'default' }}>
                     <div style={{ flex: 1, minWidth: 0 }}>
@@ -2004,7 +2083,7 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
                       </svg>
                     )}
                   </div>
-                ))}
+                )} />
                 {sec.items.length === 0 && (
                   <div style={{ padding: '12px 14px', textAlign: 'center', fontSize: 11, color: '#94a3b8' }}>
                     {sec.id === 'protected' ? 'Nenhum namespace totalmente isolado ainda.' : 'Nenhum.'}
@@ -2367,13 +2446,14 @@ function ConfigTab({ config, onSave, writeMode }: { config: AppConfig; onSave: (
   useEffect(() => { setLocal(config) }, [config])
   useEffect(() => { listUsers().then(setAllUsers).catch(() => {}) }, [])
   useEffect(() => {
+    if (writeMode === 'gitops') return // seção Autosync não existe em GitOps
     function refresh() {
       getAutosyncStatus().then(s => { setAutosyncStatus(s); setSyncResult(s.last_result) }).catch(() => {})
     }
     refresh()
     const id = setInterval(refresh, 15_000)
     return () => clearInterval(id)
-  }, [])
+  }, [writeMode])
   useEffect(() => {
     function refresh() {
       getBackupStatus().then(setBackupStatus).catch(() => {})
@@ -2617,14 +2697,11 @@ function ConfigTab({ config, onSave, writeMode }: { config: AppConfig; onSave: (
         </div>
       </div>
       )}
+      {/* Em GitOps quem restaura uma policy removida é o self-heal do ArgoCD:
+          nada aqui se aplica, então a seção inteira some. */}
+      {writeMode !== 'gitops' && (
       <div style={{ marginBottom: 14, borderTop: '1px solid #f1f5f9', paddingTop: 14 }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 10 }}>Autosync</div>
-        {writeMode === 'gitops' ? (
-          <div style={{ fontSize: 10, color: '#64748b', background: '#f8fafc', borderRadius: 6, padding: '8px 10px', lineHeight: 1.5, marginBottom: 8 }}>
-            Em modo GitOps, quem restaura uma policy removida é o self-heal do ArgoCD, não o floodgate. O card abaixo só mostra o que ainda não foi sincronizado por ele.
-          </div>
-        ) : (
-          <>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
               <ToggleSwitch on={local.autosync_enabled} onChange={v => setLocal(p => ({ ...p, autosync_enabled: v }))} />
               <span style={{ fontSize: 11, color: '#475569' }}>Restaurar policies removidas externamente</span>
@@ -2637,8 +2714,6 @@ function ConfigTab({ config, onSave, writeMode }: { config: AppConfig; onSave: (
                   style={{ width: 80, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 11 }} />
               </div>
             )}
-          </>
-        )}
 
         {/* Status card: always visible, refreshes every 15 s */}
         {(() => {
@@ -2657,13 +2732,9 @@ function ConfigTab({ config, onSave, writeMode }: { config: AppConfig; onSave: (
               </div>
               {hasDrift && (
                 <div style={{ fontSize: 9.5, color: '#64748b', marginBottom: 4 }}>
-                  {writeMode === 'gitops'
-                    ? (missing.some(p => p.namespace_missing)
-                        ? 'Algumas não podem ser aplicadas (veja abaixo). As demais, o ArgoCD aplica quando sincronizar.'
-                        : 'Aguardando o ArgoCD sincronizar.')
-                    : missing.some(p => p.namespace_missing)
-                      ? 'Algumas não podem ser restauradas (veja abaixo). As demais serão restauradas no próximo ciclo.'
-                      : local.autosync_enabled ? 'Será restaurado no próximo ciclo.' : 'Habilite o autosync ou clique em "Forçar sync" para restaurar.'}
+                  {missing.some(p => p.namespace_missing)
+                    ? 'Algumas não podem ser restauradas (veja abaixo). As demais serão restauradas no próximo ciclo.'
+                    : local.autosync_enabled ? 'Será restaurado no próximo ciclo.' : 'Habilite o autosync ou clique em "Forçar sync" para restaurar.'}
                 </div>
               )}
               <button
@@ -2709,9 +2780,7 @@ function ConfigTab({ config, onSave, writeMode }: { config: AppConfig; onSave: (
         })()}
 
         <div style={{ fontSize: 10, color: '#94a3b8', background: '#f8fafc', borderRadius: 6, padding: '8px 10px', lineHeight: 1.5, marginBottom: 8 }}>
-          {writeMode === 'gitops'
-            ? 'Monitoramento de drift roda a cada 15s. Quem aplica de fato é o ArgoCD, não o floodgate.'
-            : 'Monitoramento de drift roda a cada 15s. Correção automática só ocorre se o autosync estiver ativo.'}
+          Monitoramento de drift roda a cada 15s. Correção automática só ocorre se o autosync estiver ativo.
         </div>
         <button
           onClick={handleSync} disabled={syncing}
@@ -2719,7 +2788,7 @@ function ConfigTab({ config, onSave, writeMode }: { config: AppConfig; onSave: (
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
             <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
           </svg>
-          {syncing ? 'Sincronizando…' : writeMode === 'gitops' ? '↺ Checar agora' : '↺ Forçar sync agora'}
+          {syncing ? 'Sincronizando…' : '↺ Forçar sync agora'}
         </button>
         {syncResult && (
           <div style={{ marginTop: 6, fontSize: 9.5, color: '#94a3b8', padding: '4px 8px' }}>
@@ -2733,6 +2802,7 @@ function ConfigTab({ config, onSave, writeMode }: { config: AppConfig; onSave: (
           </div>
         )}
       </div>
+      )}
       {writeMode !== 'gitops' && (
       <div style={{ marginBottom: 14, borderTop: '1px solid #f1f5f9', paddingTop: 14 }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 10 }}>Backup</div>
@@ -2997,7 +3067,8 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
     () => (draftMode && drafts && drafts.length > 0 ? computeEffectivePolicies(allPolicies, drafts) : allPolicies),
     [draftMode, drafts, allPolicies],
   )
-  const savedFilters = (() => { try { return JSON.parse(localStorage.getItem(DISC_FILTER_KEY) ?? '{}') } catch { return {} } })()
+  const isPreviewBlocked = useMemo(() => createFlowBlockedChecker(effectivePolicies), [effectivePolicies])
+  const [savedFilters] = useState(() => { try { return JSON.parse(localStorage.getItem(DISC_FILTER_KEY) ?? '{}') } catch { return {} } })
   const [nsFilter, setNsFilter] = useState<string>(savedFilters.nsFilter ?? 'all')
   // Once narrowed to internet-bound flows, dst_namespace is always
   // 'internet': the dst-namespace dropdown above has nothing left to
@@ -3006,6 +3077,9 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   const [srcNsFilter, setSrcNsFilter] = useState<string>(savedFilters.srcNsFilter ?? 'all')
   const [verdictFilter, setVerdictFilter] = useState<'all' | 'FORWARDED' | 'DROPPED'>(savedFilters.verdictFilter ?? 'all')
   const [searchText, setSearchText] = useState<string>(savedFilters.searchText ?? '')
+  // A filtragem roda sobre a versão adiada do texto: digitar continua fluido
+  // mesmo com dezenas de milhares de flows, e o filtro alcança logo depois.
+  const deferredSearch = React.useDeferredValue(searchText).toLowerCase()
   const [onlyDraftBlocked, setOnlyDraftBlocked] = useState<boolean>(!!savedFilters.onlyDraftBlocked)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [selectedProtect, setSelectedProtect] = useState<Set<string>>(new Set())
@@ -3018,45 +3092,33 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
   function toggleDiscNs(ns: string) {
     setCollapsedNs(prev => { const n = new Set(prev); n.has(ns) ? n.delete(ns) : n.add(ns); return n })
   }
-  // Cada card é um bloco de UI rico (múltiplas linhas, badges, botões
-  // condicionais); um namespace com milhares de flows renderizando todos
-  // de uma vez pesa no commit do React mesmo com o pipeline de filtro já
-  // memoizado acima. Mostra só os N mais recentes por namespace por
-  // padrão, com um botão pra revelar mais sob demanda (por namespace).
-  // Ambientes reais chegaram a ter >10k flows num único namespace
-  // ("internet"), então o incremento é maior que o primeiro instinto de
-  // 100-200, senão "Mostrar mais" precisaria de dezenas de cliques.
-  const DISC_ROWS_PER_PAGE = 300
-  const [shownPerNs, setShownPerNs] = useState<Record<string, number>>({})
-  function showMoreForNs(ns: string) {
-    setShownPerNs(prev => ({ ...prev, [ns]: (prev[ns] ?? DISC_ROWS_PER_PAGE) + DISC_ROWS_PER_PAGE }))
-  }
-  function showAllForNs(ns: string, total: number) {
-    setShownPerNs(prev => ({ ...prev, [ns]: total }))
-  }
-
   // "Abrir na Descoberta" (clicado no aviso de fluxo bloqueado do gráfico):
   // acha o card do flow, força namespace/filtros que o esconderiam a
   // aparecer, rola até ele e pisca um destaque.
   const [highlightedFlowId, setHighlightedFlowId] = useState<string | null>(null)
-  const cardRefs = React.useRef<Record<string, HTMLDivElement | null>>({})
+  // Também reage a `flows`: aberta pelo grafo, a aba pode ainda estar
+  // baixando as linhas quando o pedido chega; tenta de novo quando elas
+  // chegam, uma vez por pedido (token).
+  const handledFocusToken = React.useRef<number | null>(null)
+  const focusHighlightTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  React.useEffect(() => () => { if (focusHighlightTimer.current) clearTimeout(focusHighlightTimer.current) }, [])
   React.useEffect(() => {
-    if (!focusFlow) return
+    if (!focusFlow || handledFocusToken.current === focusFlow.token) return
     const flow = flows.find(f => f.id === focusFlow.flowId)
     if (!flow) return
+    handledFocusToken.current = focusFlow.token
     setSearchText('')
     setNsFilter('all')
     setVerdictFilter('all')
     setCollapsedNs(prev => { if (!prev.has(flow.dst_namespace)) return prev; const n = new Set(prev); n.delete(flow.dst_namespace); return n })
-    // O flow pode estar além do limite "mostrar mais" do seu namespace:
-    // sem isso, o ref nunca existe e o scroll/destaque abaixo não acha nada.
-    setShownPerNs(prev => ({ ...prev, [flow.dst_namespace]: Number.MAX_SAFE_INTEGER }))
     setHighlightedFlowId(focusFlow.flowId)
-    requestAnimationFrame(() => cardRefs.current[focusFlow.flowId]?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
-    const t = setTimeout(() => setHighlightedFlowId(null), 2200)
-    return () => clearTimeout(t)
+    // Rola quando a linha existir na lista (depois que os filtros limpos
+    // acima e o namespace reaberto refizerem as linhas): ver listRows.
+    pendingScrollFlowId.current = focusFlow.flowId
+    if (focusHighlightTimer.current) clearTimeout(focusHighlightTimer.current)
+    focusHighlightTimer.current = setTimeout(() => setHighlightedFlowId(null), 2200)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusFlow?.token])
+  }, [focusFlow?.token, flows])
 
   React.useEffect(() => {
     checkHubble().then(r => setHubbleAvailable(r.available)).catch(() => setHubbleAvailable(false))
@@ -3095,8 +3157,8 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
       (nsFilter === 'all' || f.dst_namespace === nsFilter) &&
       (nsFilter !== 'internet' || srcNsFilter === 'all' || f.src_namespace === srcNsFilter) &&
       (verdictFilter === 'all' || f.verdict === verdictFilter) &&
-      (!searchText || [f.src_workload, f.src_namespace, f.dst_workload, f.dst_namespace].some(s => s.toLowerCase().includes(searchText.toLowerCase()))) &&
-      (!onlyDraftBlocked || (draftMode && f.verdict === 'FORWARDED' && isFlowBlocked(f, effectivePolicies)))
+      (!deferredSearch || [f.src_workload, f.src_namespace, f.dst_workload, f.dst_namespace].some(s => s.toLowerCase().includes(deferredSearch))) &&
+      (!onlyDraftBlocked || (draftMode && f.verdict === 'FORWARDED' && isPreviewBlocked(f)))
     )
 
     const grouped = filtered.reduce<Record<string, CiliumFlowSummary[]>>((acc, f) => {
@@ -3109,10 +3171,10 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
     // Modo Rascunho: flows que funcionam hoje mas os rascunhos atuais
     // bloqueariam; mesma lista usada linha a linha, elevada aqui pra
     // alimentar a seleção em massa (espelha o "Sem política" acima).
-    const previewBlockedFlows = draftMode ? filtered.filter(f => f.verdict === 'FORWARDED' && isFlowBlocked(f, effectivePolicies)) : []
+    const previewBlockedFlows = draftMode ? filtered.filter(f => f.verdict === 'FORWARDED' && isPreviewBlocked(f)) : []
 
     return { visibleFlows, namespaces, hasInternetFlows, internetSrcNamespaces, filtered, grouped, unprotected, previewBlockedFlows }
-  }, [flows, config.ignored_namespaces, nsFilter, srcNsFilter, verdictFilter, searchText, onlyDraftBlocked, draftMode, effectivePolicies])
+  }, [flows, config.ignored_namespaces, nsFilter, srcNsFilter, verdictFilter, deferredSearch, onlyDraftBlocked, draftMode, isPreviewBlocked])
 
   function toggleSelect(id: string) {
     setSelected(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
@@ -3212,6 +3274,170 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
     setSelectedProtect(new Set())
     onSwitchTab('drafts')
   }
+
+  function renderFlowCard(f: CiliumFlowSummary) {
+    const matchedPolicy = findMatchedPolicy(f)
+    const gap = !f.has_policy && f.verdict === 'DROPPED' ? classifyFlowGap({
+      src_workload: f.src_workload, src_namespace: f.src_namespace,
+      dst_workload: f.dst_workload, dst_namespace: f.dst_namespace, dst_port: f.dst_port,
+    }, allPolicies) : null
+    const gapDirection = gapDirectionOf(gap)
+    // Internet só existe como CIDR-egress (draftForFlow força isso
+    // independente do gap calculado); o rótulo precisa bater.
+    const gapLabel = f.dst_namespace === 'internet' ? 'Criar política de egress (CIDR)'
+      : gapDirection === 'both' ? 'Criar política de ingress e egress' : gapDirection === 'egress' ? 'Criar política de egress' : 'Criar política de ingress'
+
+    // Modo Rascunho: esse flow funciona hoje, mas os rascunhos
+    // atuais (isolar/restringir ainda não aplicados) o bloqueariam.
+    const previewBlocked = !!draftMode && f.verdict === 'FORWARDED' && isPreviewBlocked(f)
+    const previewGap = previewBlocked ? classifyFlowGap({
+      src_workload: f.src_workload, src_namespace: f.src_namespace,
+      dst_workload: f.dst_workload, dst_namespace: f.dst_namespace, dst_port: f.dst_port,
+    }, effectivePolicies) : null
+    const previewDirection = gapDirectionOf(previewGap)
+    const previewLabel = previewDirection === 'both' ? 'Criar rascunho de proteção (ingress e egress)' : previewDirection === 'egress' ? 'Criar rascunho de proteção (egress)' : 'Criar rascunho de proteção (ingress)'
+
+    const vc = f.verdict === 'DROPPED'
+      ? { bg: '#fff1f2', border: '#fecdd3', badge: '#fee2e2', text: '#dc2626' }
+      : previewBlocked
+        ? { bg: '#fffbeb', border: '#fde68a', badge: '#fef3c7', text: '#b45309' }
+        : { bg: '#f8fafc', border: '#e2e8f0', badge: '#dcfce7', text: '#16a34a' }
+    const lastSeen = new Date(f.last_seen)
+    const timeSince = (() => {
+      const s = Math.floor((Date.now() - lastSeen.getTime()) / 1000)
+      if (s < 60) return 'agora mesmo'
+      if (s < 3600) return `há ${Math.floor(s / 60)} min`
+      return lastSeen.toLocaleTimeString()
+    })()
+    const isHighlighted = highlightedFlowId === f.id
+    return (
+      <div style={{
+        background: vc.bg, borderRadius: 8, padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 6,
+        border: isHighlighted ? '2px solid #2563eb' : `1px solid ${vc.border}`,
+        boxShadow: isHighlighted ? '0 0 0 3px rgba(37,99,235,0.25)' : 'none',
+        transition: 'box-shadow 0.3s, border-color 0.3s',
+      }}>
+
+        {/* Linha 1: veredicto + ocorrências + tempo */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {!f.has_policy && f.verdict === 'DROPPED' && (
+            <input type="checkbox" checked={selected.has(f.id)} onChange={() => toggleSelect(f.id)} style={{ cursor: 'pointer', flexShrink: 0 }} />
+          )}
+          {previewBlocked && (
+            <input type="checkbox" checked={selectedProtect.has(f.id)} onChange={() => toggleSelectProtect(f.id)} style={{ cursor: 'pointer', flexShrink: 0 }} />
+          )}
+          <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 10, background: vc.badge, color: vc.text }}>
+            {f.verdict}
+          </span>
+          {f.has_policy && (
+            <span style={{ fontSize: 10, color: '#2563eb', fontWeight: 600 }}>✓ com política</span>
+          )}
+          {previewBlocked && (
+            <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 10, background: '#fef3c7', color: '#b45309' }}>
+              🧪 Seria bloqueado pelo rascunho
+            </span>
+          )}
+          <span style={{ fontSize: 10, color: '#94a3b8', marginLeft: 'auto' }}>
+            {f.flow_count === 1 ? '1 ocorrência' : `${f.flow_count} ocorrências`} · {timeSince}
+          </span>
+        </div>
+
+        {/* Linha 2: de → para (destaque principal) */}
+        <div title={`${f.src_workload || '?'} → ${f.dst_workload}`} style={{ fontSize: 13, fontWeight: 700, color: '#0f172a', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {f.src_workload || '?'} → {f.dst_workload}
+        </div>
+
+        {/* Linha 3: namespaces + porta (info secundária) */}
+        <div style={{ fontSize: 11, color: '#64748b' }}>
+          <span style={{ color: '#475569' }}>{f.src_namespace}</span>
+          <span style={{ color: '#94a3b8' }}> → </span>
+          <span style={{ color: '#475569' }}>{f.dst_namespace}</span>
+          <span style={{ color: '#94a3b8' }}> · porta </span>
+          <span style={{ fontWeight: 600, color: '#475569' }}>{f.dst_port}/{f.protocol}</span>
+        </div>
+
+        {/* Linha 4: botões de ação */}
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', paddingTop: 2 }}>
+          {!f.has_policy && f.verdict === 'DROPPED' && (
+            <button onClick={() => {
+              onAddDraft(draftForFlow(f, gapDirection))
+              onSwitchTab('drafts')
+            }} style={{ ...btn.base, ...btn.green }}>
+              {gapLabel}
+            </button>
+          )}
+          {!f.has_policy && (
+            <button onClick={async () => {
+              const title = `Preview: ${f.src_workload} → ${f.dst_workload}`
+              if (previewYamlMap.has(f.id)) {
+                setPolicyYaml({ name: title, content: previewYamlMap.get(f.id)! })
+                return
+              }
+              setLoadingYaml(f.id)
+              try {
+                const yaml = await previewDiscoveryPolicyYAML(f, gapDirection)
+                setPreviewYamlMap(prev => new Map(prev).set(f.id, yaml))
+                setPolicyYaml({ name: title, content: yaml })
+              } catch (e: unknown) {
+                const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+                setPolicyYaml({ name: title, content: `# Erro ao gerar YAML\n# ${detail ?? 'motivo desconhecido, confira o console do navegador'}` })
+              } finally {
+                setLoadingYaml(null)
+              }
+            }} disabled={loadingYaml === f.id} style={{ ...btn.base, ...btn.gray }}>
+              <Icon.Eye />{loadingYaml === f.id ? 'Carregando…' : 'Ver YAML'}
+            </button>
+          )}
+          {f.has_policy && matchedPolicy && (
+            <button onClick={() => handleViewPolicy(f)} disabled={loadingYaml === f.id}
+              style={{ ...btn.base, background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe' }}>
+              {loadingYaml === f.id ? 'Carregando…' : 'Ver política'}
+            </button>
+          )}
+          {previewBlocked && (
+            <button onClick={() => {
+              onAddDraft({ src_workload: f.src_workload, src_namespace: f.src_namespace, dst_service: f.dst_workload, dst_namespace: f.dst_namespace, dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }], policy_direction: previewDirection })
+              onSwitchTab('drafts')
+            }} style={{ ...btn.base, background: '#fffbeb', color: '#b45309', border: '1px solid #fde68a' }}>
+              {previewLabel}
+            </button>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // Linhas da lista virtualizada: cabeçalho de cada namespace, seguido dos
+  // seus flows quando ele está aberto.
+  type ListRow =
+    | { kind: 'header'; ns: string; count: number }
+    | { kind: 'flow'; flow: CiliumFlowSummary; first: boolean; last: boolean }
+  const listRows = useMemo<ListRow[]>(() => {
+    const rows: ListRow[] = []
+    for (const [ns, nsFlows] of Object.entries(grouped)) {
+      rows.push({ kind: 'header', ns, count: nsFlows.length })
+      if (collapsedNs.has(ns)) continue
+      nsFlows.forEach((flow, i) => rows.push({ kind: 'flow', flow, first: i === 0, last: i === nsFlows.length - 1 }))
+    }
+    return rows
+  }, [grouped, collapsedNs])
+  const listRef = React.useRef<HTMLDivElement>(null)
+  const listVirtualizer = useVirtualizer({
+    count: listRows.length,
+    getScrollElement: () => listRef.current,
+    estimateSize: i => (listRows[i]?.kind === 'header' ? 32 : 130),
+    getItemKey: i => { const r = listRows[i]; return r.kind === 'header' ? `ns:${r.ns}` : r.flow.id },
+    overscan: 6,
+  })
+  const pendingScrollFlowId = React.useRef<string | null>(null)
+  React.useEffect(() => {
+    const id = pendingScrollFlowId.current
+    if (!id) return
+    const index = listRows.findIndex(r => r.kind === 'flow' && r.flow.id === id)
+    if (index < 0) return
+    pendingScrollFlowId.current = null
+    listVirtualizer.scrollToIndex(index, { align: 'center' })
+  }, [listRows, listVirtualizer])
 
   const isOn = config.hubble_discovery_enabled
   const selStyle: React.CSSProperties = { fontSize: 11, border: '1px solid #e2e8f0', borderRadius: 5, padding: '3px 6px', color: '#334155', background: 'white' }
@@ -3387,170 +3613,33 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
         )}
       </div>
 
-      {/* ─── Lista scrollável ──────────────────────────────────────────── */}
-      <div style={{ flex: 1, overflowY: 'auto' }}>
-        {Object.entries(grouped).map(([ns, nsFlows]) => {
-          const isOpen = !collapsedNs.has(ns)
-          return (
-          <div key={ns}>
-            <button onClick={() => toggleDiscNs(ns)}
-              style={{ width: '100%', padding: '7px 14px', background: '#f8fafc', border: 'none', borderBottom: '1px solid #e2e8f0', borderTop: '1px solid #e2e8f0', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, textAlign: 'left' }}>
-              {isOpen ? <Icon.ChevronDown /> : <Icon.ChevronRight />}
-              <span style={{ fontSize: 11, fontWeight: 700, color: '#334155', flex: 1 }}>{ns}</span>
-              <span style={{ fontSize: 10, color: '#94a3b8', background: '#e2e8f0', borderRadius: 10, padding: '1px 7px', fontWeight: 600 }}>{nsFlows.length}</span>
-            </button>
-            {isOpen && (() => {
-              const shownCount = shownPerNs[ns] ?? DISC_ROWS_PER_PAGE
-              const visibleNsFlows = nsFlows.slice(0, shownCount)
-              return (
-            <div style={{ padding: '8px 14px', display: 'flex', flexDirection: 'column', gap: 6 }}>
-              {visibleNsFlows.map(f => {
-                const matchedPolicy = findMatchedPolicy(f)
-                const gap = !f.has_policy && f.verdict === 'DROPPED' ? classifyFlowGap({
-                  src_workload: f.src_workload, src_namespace: f.src_namespace,
-                  dst_workload: f.dst_workload, dst_namespace: f.dst_namespace, dst_port: f.dst_port,
-                }, allPolicies) : null
-                const gapDirection = gapDirectionOf(gap)
-                // Internet só existe como CIDR-egress (draftForFlow força isso
-                // independente do gap calculado); o rótulo precisa bater.
-                const gapLabel = f.dst_namespace === 'internet' ? 'Criar política de egress (CIDR)'
-                  : gapDirection === 'both' ? 'Criar política de ingress e egress' : gapDirection === 'egress' ? 'Criar política de egress' : 'Criar política de ingress'
-
-                // Modo Rascunho: esse flow funciona hoje, mas os rascunhos
-                // atuais (isolar/restringir ainda não aplicados) o bloqueariam.
-                const previewBlocked = !!draftMode && f.verdict === 'FORWARDED' && isFlowBlocked(f, effectivePolicies)
-                const previewGap = previewBlocked ? classifyFlowGap({
-                  src_workload: f.src_workload, src_namespace: f.src_namespace,
-                  dst_workload: f.dst_workload, dst_namespace: f.dst_namespace, dst_port: f.dst_port,
-                }, effectivePolicies) : null
-                const previewDirection = gapDirectionOf(previewGap)
-                const previewLabel = previewDirection === 'both' ? 'Criar rascunho de proteção (ingress e egress)' : previewDirection === 'egress' ? 'Criar rascunho de proteção (egress)' : 'Criar rascunho de proteção (ingress)'
-
-                const vc = f.verdict === 'DROPPED'
-                  ? { bg: '#fff1f2', border: '#fecdd3', badge: '#fee2e2', text: '#dc2626' }
-                  : previewBlocked
-                    ? { bg: '#fffbeb', border: '#fde68a', badge: '#fef3c7', text: '#b45309' }
-                    : { bg: '#f8fafc', border: '#e2e8f0', badge: '#dcfce7', text: '#16a34a' }
-                const lastSeen = new Date(f.last_seen)
-                const timeSince = (() => {
-                  const s = Math.floor((Date.now() - lastSeen.getTime()) / 1000)
-                  if (s < 60) return 'agora mesmo'
-                  if (s < 3600) return `há ${Math.floor(s / 60)} min`
-                  return lastSeen.toLocaleTimeString()
-                })()
-                const isHighlighted = highlightedFlowId === f.id
-                return (
-                  <div key={f.id} ref={el => { cardRefs.current[f.id] = el }} style={{
-                    background: vc.bg, borderRadius: 8, padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 6,
-                    border: isHighlighted ? '2px solid #2563eb' : `1px solid ${vc.border}`,
-                    boxShadow: isHighlighted ? '0 0 0 3px rgba(37,99,235,0.25)' : 'none',
-                    transition: 'box-shadow 0.3s, border-color 0.3s',
-                  }}>
-
-                    {/* Linha 1: veredicto + ocorrências + tempo */}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      {!f.has_policy && f.verdict === 'DROPPED' && (
-                        <input type="checkbox" checked={selected.has(f.id)} onChange={() => toggleSelect(f.id)} style={{ cursor: 'pointer', flexShrink: 0 }} />
-                      )}
-                      {previewBlocked && (
-                        <input type="checkbox" checked={selectedProtect.has(f.id)} onChange={() => toggleSelectProtect(f.id)} style={{ cursor: 'pointer', flexShrink: 0 }} />
-                      )}
-                      <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 10, background: vc.badge, color: vc.text }}>
-                        {f.verdict}
-                      </span>
-                      {f.has_policy && (
-                        <span style={{ fontSize: 10, color: '#2563eb', fontWeight: 600 }}>✓ com política</span>
-                      )}
-                      {previewBlocked && (
-                        <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 10, background: '#fef3c7', color: '#b45309' }}>
-                          🧪 Seria bloqueado pelo rascunho
-                        </span>
-                      )}
-                      <span style={{ fontSize: 10, color: '#94a3b8', marginLeft: 'auto' }}>
-                        {f.flow_count === 1 ? '1 ocorrência' : `${f.flow_count} ocorrências`} · {timeSince}
-                      </span>
-                    </div>
-
-                    {/* Linha 2: de → para (destaque principal) */}
-                    <div title={`${f.src_workload || '?'} → ${f.dst_workload}`} style={{ fontSize: 13, fontWeight: 700, color: '#0f172a', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {f.src_workload || '?'} → {f.dst_workload}
-                    </div>
-
-                    {/* Linha 3: namespaces + porta (info secundária) */}
-                    <div style={{ fontSize: 11, color: '#64748b' }}>
-                      <span style={{ color: '#475569' }}>{f.src_namespace}</span>
-                      <span style={{ color: '#94a3b8' }}> → </span>
-                      <span style={{ color: '#475569' }}>{f.dst_namespace}</span>
-                      <span style={{ color: '#94a3b8' }}> · porta </span>
-                      <span style={{ fontWeight: 600, color: '#475569' }}>{f.dst_port}/{f.protocol}</span>
-                    </div>
-
-                    {/* Linha 4: botões de ação */}
-                    <div style={{ display: 'flex', gap: 6, alignItems: 'center', paddingTop: 2 }}>
-                      {!f.has_policy && f.verdict === 'DROPPED' && (
-                        <button onClick={() => {
-                          onAddDraft(draftForFlow(f, gapDirection))
-                          onSwitchTab('drafts')
-                        }} style={{ ...btn.base, ...btn.green }}>
-                          {gapLabel}
-                        </button>
-                      )}
-                      {!f.has_policy && (
-                        <button onClick={async () => {
-                          const title = `Preview: ${f.src_workload} → ${f.dst_workload}`
-                          if (previewYamlMap.has(f.id)) {
-                            setPolicyYaml({ name: title, content: previewYamlMap.get(f.id)! })
-                            return
-                          }
-                          setLoadingYaml(f.id)
-                          try {
-                            const yaml = await previewDiscoveryPolicyYAML(f, gapDirection)
-                            setPreviewYamlMap(prev => new Map(prev).set(f.id, yaml))
-                            setPolicyYaml({ name: title, content: yaml })
-                          } catch (e: unknown) {
-                            const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-                            setPolicyYaml({ name: title, content: `# Erro ao gerar YAML\n# ${detail ?? 'motivo desconhecido, confira o console do navegador'}` })
-                          } finally {
-                            setLoadingYaml(null)
-                          }
-                        }} disabled={loadingYaml === f.id} style={{ ...btn.base, ...btn.gray }}>
-                          <Icon.Eye />{loadingYaml === f.id ? 'Carregando…' : 'Ver YAML'}
-                        </button>
-                      )}
-                      {f.has_policy && matchedPolicy && (
-                        <button onClick={() => handleViewPolicy(f)} disabled={loadingYaml === f.id}
-                          style={{ ...btn.base, background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe' }}>
-                          {loadingYaml === f.id ? 'Carregando…' : 'Ver política'}
-                        </button>
-                      )}
-                      {previewBlocked && (
-                        <button onClick={() => {
-                          onAddDraft({ src_workload: f.src_workload, src_namespace: f.src_namespace, dst_service: f.dst_workload, dst_namespace: f.dst_namespace, dst_ports: [{ port: f.dst_port, protocol: f.protocol as 'TCP' | 'UDP' }], policy_direction: previewDirection })
-                          onSwitchTab('drafts')
-                        }} style={{ ...btn.base, background: '#fffbeb', color: '#b45309', border: '1px solid #fde68a' }}>
-                          {previewLabel}
-                        </button>
-                      )}
-                    </div>
+      {/* ─── Lista scrollável (virtualizada) ───────────────────────────── */}
+      {/* Só as linhas visíveis (mais uma margem) existem no DOM: com dezenas
+          de milhares de flows, montar todos os cards travava a aba. Alturas
+          variam por card, então cada linha é medida depois de montada. */}
+      <div ref={listRef} style={{ flex: 1, overflowY: 'auto' }}>
+        <div style={{ height: listVirtualizer.getTotalSize(), position: 'relative' }}>
+          {listVirtualizer.getVirtualItems().map(item => {
+            const row = listRows[item.index]
+            return (
+              <div key={item.key} data-index={item.index} ref={listVirtualizer.measureElement}
+                style={{ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${item.start}px)` }}>
+                {row.kind === 'header' ? (
+                  <button onClick={() => toggleDiscNs(row.ns)}
+                    style={{ width: '100%', padding: '7px 14px', background: '#f8fafc', border: 'none', borderBottom: '1px solid #e2e8f0', borderTop: '1px solid #e2e8f0', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, textAlign: 'left' }}>
+                    {collapsedNs.has(row.ns) ? <Icon.ChevronRight /> : <Icon.ChevronDown />}
+                    <span style={{ fontSize: 11, fontWeight: 700, color: '#334155', flex: 1 }}>{row.ns}</span>
+                    <span style={{ fontSize: 10, color: '#94a3b8', background: '#e2e8f0', borderRadius: 10, padding: '1px 7px', fontWeight: 600 }}>{row.count}</span>
+                  </button>
+                ) : (
+                  <div style={{ padding: `${row.first ? 8 : 3}px 14px ${row.last ? 8 : 3}px` }}>
+                    {renderFlowCard(row.flow)}
                   </div>
-                )
-              })}
-              {nsFlows.length > shownCount && (
-                <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
-                  <button onClick={() => showMoreForNs(ns)} style={{ ...btn.base, ...btn.gray, fontSize: 10.5 }}>
-                    Mostrar mais {Math.min(DISC_ROWS_PER_PAGE, nsFlows.length - shownCount)} (de {nsFlows.length - shownCount} restantes)
-                  </button>
-                  <button onClick={() => showAllForNs(ns, nsFlows.length)} style={{ ...btn.base, ...btn.gray, fontSize: 10.5 }} title="Pode deixar a lista pesada com muitos flows">
-                    Mostrar todos
-                  </button>
-                </div>
-              )}
-            </div>
-              )
-            })()}
-          </div>
-          )
-        })}
+                )}
+              </div>
+            )
+          })}
+        </div>
 
         {flows.length > 0 && filtered.length === 0 && (
           <div style={{ textAlign: 'center', color: '#94a3b8', fontSize: 12, padding: '30px 0' }}>

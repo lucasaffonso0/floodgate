@@ -1,3 +1,4 @@
+import type { FlowEdge } from '@/lib/flowEdges'
 import axios from 'axios'
 import type {
   ServiceInfo, NetworkPolicyInfo, CreatePolicyRequest, NamespaceIngressRequest,
@@ -114,6 +115,11 @@ export const getSecurityCoverage = (): Promise<SecurityCoverage[]> =>
 export const isolateNamespace = (req: { namespace: string; direction: 'ingress' | 'egress' | 'both'; allow_intra_namespace: boolean; allow_egress_internet: boolean }): Promise<{ created: number; skipped: number }> =>
   api.post('/networkpolicies/namespace-isolate', req).then(r => r.data)
 
+// Several namespaces in one request (one git commit in GitOps mode). Each
+// result carries its own error, if that namespace failed.
+export const isolateNamespaces = (items: Array<{ namespace: string; direction: 'ingress' | 'egress' | 'both'; allow_intra_namespace: boolean; allow_egress_internet: boolean }>): Promise<{ results: Array<{ namespace: string; created: number; skipped: number; error?: string }> }> =>
+  api.post('/networkpolicies/namespace-isolate', { items }).then(r => r.data)
+
 export const adoptPolicy = (namespace: string, name: string, policyType?: string): Promise<{ ok: boolean }> =>
   api.post('/networkpolicies/adopt', { namespace, name, policy_type: policyType }).then(r => r.data)
 
@@ -223,14 +229,22 @@ export const syncGitOpsRepo = (): Promise<GitOpsConnectionTest> =>
 export const getCiliumFlowsSummary = (): Promise<CiliumFlowsSummaryResponse> =>
   api.get('/cilium/flows/summary').then(r => r.data)
 
-// Conditional fetch of the full list: pass the ETag of the copy already in
-// hand and a 304 comes back as `null` (keep that copy, nothing changed)
-// instead of re-downloading and re-parsing every row.
-export const getCiliumFlowsIfChanged = (etag: string | null): Promise<{ etag: string | null; data: CiliumFlowsResponse } | null> =>
+// Pass the version of the copy already in hand (null for none): returns
+// `null` when nothing changed, otherwise either the changed rows only
+// (full: false) or the whole list (full: true). See mergeFlowsDelta().
+export const getCiliumFlowsSince = (version: string | null): Promise<CiliumFlowsResponse | null> =>
   api.get('/cilium/flows', {
-    headers: etag ? { 'If-None-Match': etag } : {},
+    params: version ? { since: version } : {},
     validateStatus: s => (s >= 200 && s < 300) || s === 304,
-  }).then(r => r.status === 304 ? null : { etag: (r.headers['etag'] as string | undefined) ?? null, data: r.data })
+  }).then(r => r.status === 304 ? null : r.data)
+
+// The graph's view of the flows (one entry per edge, see aggregateFlowEdges),
+// conditional on the version already held: `null` when unchanged.
+export const getCiliumFlowEdgesIfChanged = (version: string | null): Promise<{ version: string; edges: FlowEdge[] } | null> =>
+  api.get('/cilium/flows/edges', {
+    headers: version ? { 'If-None-Match': `"${version}"` } : {},
+    validateStatus: s => (s >= 200 && s < 300) || s === 304,
+  }).then(r => r.status === 304 ? null : r.data)
 
 export const clearCiliumFlows = (): Promise<void> =>
   api.delete('/cilium/flows').then(() => undefined)

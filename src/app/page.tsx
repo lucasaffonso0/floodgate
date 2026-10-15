@@ -1,18 +1,20 @@
 'use client'
 
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import { FloodgateLogoIcon } from '@/components/FloodgateLogo'
 import { ServiceInfo, NetworkPolicyInfo, Draft, AppConfig, User, ServiceLayout, AutosyncStatus, ApprovalRequest, CiliumFlowSummary, CiliumFlowsSummaryResponse } from '@/types'
 import {
   getServices, getNetworkPolicies, getAllNetworkPolicies,
   getConfig, updateConfig, createNetworkPolicy, createEgressNetworkPolicy, createCidrPolicy,
-  createApprovalRequest, getSecurityCoverage, getAutosyncStatus,
+  createApprovalRequest, getAutosyncStatus,
   getMe, logout, getServiceLayout, setNamespaceLayoutLock,
   saveAllLayout, setGlobalLayoutLock, getApprovalRequests,
-  getCiliumFlowsSummary, getCiliumFlowsIfChanged, clearCiliumFlows,
+  getCiliumFlowsSummary, getCiliumFlowsSince, getCiliumFlowEdgesIfChanged, clearCiliumFlows,
   isolateNamespace, restrictService, deleteNetworkPolicy,
   getDraftMode, activateDraftMode, deactivateDraftMode,
 } from '@/api/client'
+import { mergeFlowsDelta } from '@/lib/flowsDelta'
+import { aggregateFlowEdges, type FlowEdge } from '@/lib/flowEdges'
 import NetworkGraph from '@/components/NetworkGraph'
 import RightPanel from '@/components/RightPanel'
 
@@ -102,6 +104,14 @@ function SaveSpinner({ status }: { status: 'idle' | 'saving' | 'draft' | 'saved'
   )
 }
 
+// Every poll returns brand-new arrays/objects even when nothing changed, and
+// a new identity is enough to make NetworkGraph rebuild every node and edge.
+// Keeping the previous value when the content is the same means the graph
+// only rebuilds on a real change.
+function keepIfEqual<T>(prev: T, next: T): T {
+  return JSON.stringify(prev) === JSON.stringify(next) ? prev : next
+}
+
 export default function App() {
   const configRef = useRef<AppConfig>(DEFAULT_CONFIG)
   const pendingLayouts = useRef<Map<string, { x: number; y: number }>>(new Map())
@@ -188,26 +198,52 @@ export default function App() {
   const [ciliumStreaming, setCiliumStreaming] = useState(false)
   const currentUserRef = useRef<User | null>(null)
 
-  // The full flow list (up to MAX_FLOW_ROWS rows, tens of MB) is only
-  // downloaded while something on screen uses it (the graph's "Tráfego ao
-  // vivo" edges, or the Descoberta/Rascunhos tabs) and only when its version
-  // changed. Every poll otherwise fetches just the small summary, which also
-  // carries the Descoberta badge count.
+  // Flows are only downloaded while something on screen uses them, and only
+  // when the summary's version moved. Every poll otherwise fetches just the
+  // small summary, which also carries the Descoberta badge count.
+  // - Descoberta/Rascunhos need every row: kept as `ciliumFlows`, updated
+  //   with deltas (rows changed since the version held).
+  // - The graph's "Tráfego ao vivo" alone needs only one entry per edge:
+  //   fetched pre-aggregated from /flows/edges, or derived locally from the
+  //   rows when those are held anyway.
   const [flowsSummary, setFlowsSummary] = useState<CiliumFlowsSummaryResponse | null>(null)
   const [graphNeedsFlows, setGraphNeedsFlows] = useState(false)
   const [panelNeedsFlows, setPanelNeedsFlows] = useState(false)
-  const needFlows = graphNeedsFlows || panelNeedsFlows
-  const needFlowsRef = useRef(false)
-  const flowsEtagRef = useRef<string | null>(null)
+  const needsRef = useRef({ graph: false, panel: false })
+  const flowsVersionRef = useRef<string | null>(null)
+  const [serverFlowEdges, setServerFlowEdges] = useState<FlowEdge[]>([])
+  const edgesVersionRef = useRef<string | null>(null)
+  const edgesLoadingRef = useRef(false)
+  const loadEdges = useCallback(async () => {
+    if (edgesLoadingRef.current) return
+    edgesLoadingRef.current = true
+    try {
+      const r = await getCiliumFlowEdgesIfChanged(edgesVersionRef.current)
+      if (r) {
+        edgesVersionRef.current = r.version
+        setServerFlowEdges(r.edges)
+      }
+    } catch { /* keep the copy already on screen */ }
+    finally { edgesLoadingRef.current = false }
+  }, [])
+  const graphFlows = useMemo<FlowEdge[]>(
+    // Until the rows arrive after opening Descoberta, keep showing the
+    // edges already held instead of blanking the graph for a moment.
+    () => (panelNeedsFlows && ciliumFlows.length > 0 ? aggregateFlowEdges(ciliumFlows) : serverFlowEdges),
+    [panelNeedsFlows, ciliumFlows, serverFlowEdges],
+  )
   const flowsLoadingRef = useRef(false)
   const loadFlows = useCallback(async () => {
     if (flowsLoadingRef.current) return
     flowsLoadingRef.current = true
     try {
-      const r = await getCiliumFlowsIfChanged(flowsEtagRef.current)
+      // Asks only for what changed since the version already held: after
+      // the first load, a poll with live traffic downloads the handful of
+      // rows touched in the last cycle instead of the whole list.
+      const r = await getCiliumFlowsSince(flowsVersionRef.current)
       if (r) {
-        flowsEtagRef.current = r.etag
-        setCiliumFlows(r.data.flows)
+        flowsVersionRef.current = r.version
+        setCiliumFlows(prev => r.full ? r.flows : mergeFlowsDelta(prev, r.flows, r.removed))
       }
     } catch { /* keep the copy already on screen */ }
     finally { flowsLoadingRef.current = false }
@@ -215,10 +251,18 @@ export default function App() {
   const handlePanelTabChange = useCallback((tab: string | null) => {
     setPanelNeedsFlows(tab === 'descoberta' || tab === 'drafts')
   }, [])
+  // Fetches whichever form is needed right now, if the version moved.
+  const syncFlows = useCallback((version: string | null) => {
+    const { graph, panel } = needsRef.current
+    if (panel) { if (version === null || version !== flowsVersionRef.current) void loadFlows() }
+    else if (graph) { if (version === null || version !== edgesVersionRef.current) void loadEdges() }
+  }, [loadFlows, loadEdges])
+  const syncFlowsRef = useRef(syncFlows)
+  syncFlowsRef.current = syncFlows
   useEffect(() => {
-    needFlowsRef.current = needFlows
-    if (needFlows) void loadFlows()
-  }, [needFlows, loadFlows])
+    needsRef.current = { graph: graphNeedsFlows, panel: panelNeedsFlows }
+    syncFlows(null)
+  }, [graphNeedsFlows, panelNeedsFlows, syncFlows])
 
   const refreshOnce = useCallback(async () => {
     try {
@@ -242,14 +286,14 @@ export default function App() {
         getCiliumFlowsSummary().catch(() => null),
       ])
       setAutosyncStatus(sync)
-      setServices(svcs); servicesRef.current = svcs
-      setPolicies(pols); policiesRef.current = pols
-      setAllPolicies(allPols); allPoliciesRef.current = allPols
+      setServices(prev => keepIfEqual(prev, svcs)); servicesRef.current = svcs
+      setPolicies(prev => keepIfEqual(prev, pols)); policiesRef.current = pols
+      setAllPolicies(prev => keepIfEqual(prev, allPols)); allPoliciesRef.current = allPols
       serviceLayoutRef.current = layoutData
-      setPendingApprovals(approvals)
+      setPendingApprovals(prev => keepIfEqual(prev, approvals))
       setFlowsSummary(flowsSum)
       setCiliumStreaming(flowsSum?.streaming ?? false)
-      if (needFlowsRef.current && flowsSum && `"${flowsSum.version}"` !== flowsEtagRef.current) void loadFlows()
+      if (flowsSum) syncFlows(flowsSum.version)
 
       // Protect in-flight dragged positions from being overwritten by poll
       const dbLayouts = layoutData.layouts.map(l => {
@@ -262,7 +306,7 @@ export default function App() {
         setServiceLayouts(dbLayouts)
       } else if (pendingLayouts.current.size === 0 && !loadLayoutDraft()) {
         // Subsequent polls with no local changes → always reflect DB (picks up admin layout changes)
-        setServiceLayouts(dbLayouts)
+        setServiceLayouts(prev => keepIfEqual(prev, dbLayouts))
       }
 
       const nsFromDB: Record<string, { x: number; y: number }> = {}
@@ -271,40 +315,38 @@ export default function App() {
       }
       const nsForGraph = { ...nsFromDB, ...pendingNsChanges.current }
       savedNsPositionsRef.current = { ...nsFromDB }
-      setSavedNsPositions(nsForGraph)
+      setSavedNsPositions(prev => keepIfEqual(prev, nsForGraph))
       if (!layoutInitialized.current) {
         setLocalNsPositions(nsFromDB)
         layoutInitialized.current = true
       } else if (Object.keys(pendingNsChanges.current).length === 0 && !loadLayoutDraft()) {
-        setLocalNsPositions(nsFromDB)
+        setLocalNsPositions(prev => keepIfEqual(prev, nsFromDB))
       }
 
       // Namespace drag locks: default unlocked so services are draggable
       const locks: Record<string, boolean> = {}
       for (const ns of layoutData.namespaces) locks[ns] = false
       for (const row of layoutData.namespace_locks) locks[row.namespace] = row.locked
-      setNamespaceLocks(locks)
+      setNamespaceLocks(prev => keepIfEqual(prev, locks))
 
       setGlobalLayoutLocked(layoutData.global_locked)
       setLayoutMeta(layoutData.layout_meta)
 
       const nsArr = [...new Set(svcs.map(s => s.namespace))].sort()
-      setAllNamespaces(nsArr)
-      setVisibleNamespaces(() => {
+      setAllNamespaces(prev => keepIfEqual(prev, nsArr))
+      setVisibleNamespaces(prev => {
         const hidden = loadHiddenFromStorage()
-        return new Set(nsArr.filter(ns => !hidden.has(ns)))
+        const next = new Set(nsArr.filter(ns => !hidden.has(ns)))
+        return next.size === prev.size && [...next].every(ns => prev.has(ns)) ? prev : next
       })
 
-      if (configRef.current.auto_default_deny_enabled) {
-        getSecurityCoverage().catch(() => {})
-      }
       setLastUpdate(new Date())
       setError(null)
       hasLoadedOnce.current = true
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Erro ao conectar ao backend')
     }
-  }, [loadFlows])
+  }, [syncFlows])
 
   // Never two refreshes at once: a call arriving mid-refresh joins the
   // running one, which then runs once more so that caller still sees data
@@ -454,6 +496,14 @@ export default function App() {
     let retryDelay = 1000
     let cancelled = false
 
+    // Events arriving close together (distinct changes from one bulk action)
+    // share a single refresh.
+    let sseRefreshTimer: ReturnType<typeof setTimeout> | undefined
+    function scheduleSseRefresh() {
+      if (sseRefreshTimer) return
+      sseRefreshTimer = setTimeout(() => { sseRefreshTimer = undefined; void refresh() }, 300)
+    }
+
     function connect() {
       if (cancelled) return
       es = new EventSource('/api/events')
@@ -466,13 +516,17 @@ export default function App() {
           // Triggering the full 7-endpoint refresh() on every single one of
           // those (instead of just the normal 15s poll everything else
           // already uses) was the main thing making the whole app feel
-          // like it froze under heavy discovery traffic. New flows still
-          // land in the DB in real time; they just show up on the next
-          // regular poll instead of instantly, same cadence as
-          // services/policies already have.
+          // like it froze under heavy discovery traffic. It only ever
+          // triggers the flow delta below, never the full refresh.
           if (event.type !== 'hubble_flow_new') {
             if (document.hidden) staleWhileHiddenRef.current = true
-            else void refresh()
+            else scheduleSseRefresh()
+          } else if (!document.hidden && typeof event.version === 'string') {
+            // It carries the flow list's version: when Descoberta or the
+            // graph's live traffic is open, fetch just what changed right
+            // away (a small delta) instead of waiting for the 15s poll.
+            // Nothing is fetched when nothing on screen uses flows.
+            syncFlowsRef.current(event.version)
           }
           if (event.type === 'approval_created') {
             const user = currentUserRef.current
@@ -503,6 +557,7 @@ export default function App() {
     return () => {
       cancelled = true
       clearTimeout(retryTimer)
+      clearTimeout(sseRefreshTimer)
       es?.close()
     }
   }, [refresh])
@@ -582,7 +637,9 @@ export default function App() {
     await Promise.all(toRemove.map(p => deleteNetworkPolicy(p.namespace, p.name)))
   }
 
-  async function applyDraft(draft: Draft, allowedApprovers: Array<{ id: string; username: string }> = []) {
+  // refreshAfter=false lets applyAllDrafts() refresh once at the end instead
+  // of once per draft.
+  async function applyDraft(draft: Draft, allowedApprovers: Array<{ id: string; username: string }> = [], refreshAfter = true) {
     // Isolar/restringir/toggle nunca passaram pelo fluxo de aprovação: mesmo
     // comportamento de hoje, só que agora podem ficar em rascunho antes.
     if (draft.kind === 'isolate') {
@@ -591,26 +648,26 @@ export default function App() {
         allow_intra_namespace: !!draft.isolate_allow_intra, allow_egress_internet: !!draft.isolate_allow_internet,
       })
       removeDraft(draft.id)
-      await refresh()
+      if (refreshAfter) await refresh()
       return
     }
     if (draft.kind === 'restrict') {
       await restrictService({ service_name: draft.restrict_service!, namespace: draft.restrict_namespace!, direction: draft.restrict_direction! })
       removeDraft(draft.id)
-      await refresh()
+      if (refreshAfter) await refresh()
       return
     }
     if (draft.kind === 'toggle') {
       await applyToggleDraft(draft)
       removeDraft(draft.id)
-      await refresh()
+      if (refreshAfter) await refresh()
       return
     }
     if (draft.kind === 'remove') {
       const ns = draft.remove_namespace!
       await Promise.all((draft.remove_policy_names ?? []).map(name => deleteNetworkPolicy(ns, name).catch(() => {})))
       removeDraft(draft.id)
-      await refresh()
+      if (refreshAfter) await refresh()
       return
     }
     if (config.approval_enabled) {
@@ -629,7 +686,7 @@ export default function App() {
         direction: draft.src_cidr ? 'ingress' : 'egress',
       })
       removeDraft(draft.id)
-      await refresh()
+      if (refreshAfter) await refresh()
       return
     }
     const req = {
@@ -639,7 +696,7 @@ export default function App() {
     if (draft.policy_direction === 'ingress' || draft.policy_direction === 'both') await createNetworkPolicy(req)
     if (draft.policy_direction === 'egress'  || draft.policy_direction === 'both') await createEgressNetworkPolicy(req)
     removeDraft(draft.id)
-    await refresh()
+    if (refreshAfter) await refresh()
   }
 
   function discardAllDrafts() {
@@ -657,7 +714,8 @@ export default function App() {
     // "still pending" before, tempting a retry that re-applies them and
     // fails again.
     const targets = [...drafts]
-    const results = await Promise.allSettled(targets.map(d => applyDraft(d)))
+    const results = await Promise.allSettled(targets.map(d => applyDraft(d, [], false)))
+    await refresh()
     const failed = results.filter(r => r.status === 'rejected').length
     if (failed > 0) throw new Error(`${failed} de ${targets.length} rascunho(s) falharam ao aplicar`)
   }
@@ -672,7 +730,7 @@ export default function App() {
     window.location.href = '/login'
   }
 
-  const visibleServices = services.filter(s => visibleNamespaces.has(s.namespace))
+  const visibleServices = useMemo(() => services.filter(s => visibleNamespaces.has(s.namespace)), [services, visibleNamespaces])
   const canManageNamespace = useCallback((namespace: string) => {
     if (!currentUser) return false
     if (currentUser.role === 'admin') return true
@@ -1118,7 +1176,7 @@ export default function App() {
           onPasswordModalClosed={() => setOpenPasswordModal(false)}
           ciliumFlows={ciliumFlows}
           ciliumStreaming={ciliumStreaming}
-          onClearCiliumFlows={() => clearCiliumFlows().then(() => { flowsEtagRef.current = null; setCiliumFlows([]) }).catch(() => {})}
+          onClearCiliumFlows={() => clearCiliumFlows().then(() => { flowsVersionRef.current = null; edgesVersionRef.current = null; setCiliumFlows([]); setServerFlowEdges([]) }).catch(() => {})}
           onActiveTabChange={handlePanelTabChange}
           descobertaBadgeCount={flowsSummary?.unprotected_dropped}
           onViewNamespace={setSelectedNamespace}
@@ -1178,7 +1236,7 @@ export default function App() {
             onAddDraft={addDraft}
             onRemoveDraft={removeDraft}
             onPolicyChanged={refresh}
-            ciliumFlows={ciliumFlows}
+            ciliumFlows={graphFlows}
             ciliumStreaming={ciliumStreaming}
             onShowFlowEdgesChange={setGraphNeedsFlows}
             ignoredNamespaces={config.ignored_namespaces}

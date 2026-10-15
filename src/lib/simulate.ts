@@ -1,5 +1,5 @@
 import type { NetworkPolicyInfo, Draft, CiliumFlowSummary } from '@/types'
-import { explainAccess, sourceIsExempt, isDestinationExempt } from './explainAccess'
+import { explainAccess, sourceIsExempt, isDestinationExempt, type ExplainResult } from './explainAccess'
 import { normalizeWorkload } from './flowMatch'
 
 let seq = 0
@@ -13,23 +13,77 @@ function fabricated(overrides: Partial<NetworkPolicyInfo>): NetworkPolicyInfo {
   }
 }
 
-// Same reasoning FlowExplainPanel uses (NetworkGraph.tsx) to decide whether
-// a flow is actually blocked, extracted so both stay in sync instead of
-// drifting apart again like ingress/egress did earlier this session.
-export function isFlowBlocked(
-  f: { src_workload: string; src_namespace: string; dst_workload: string; dst_namespace: string },
-  policies: NetworkPolicyInfo[],
-): boolean {
+type FlowEnds = { src_workload: string; src_namespace: string; dst_workload: string; dst_namespace: string }
+type ExplainFn = (name: string, ns: string, direction: 'ingress' | 'egress') => ExplainResult
+
+function flowBlockedWith(f: FlowEnds, explain: ExplainFn): boolean {
   const srcW = normalizeWorkload(f.src_workload)
   const dstW = normalizeWorkload(f.dst_workload)
 
-  const dstExplain = explainAccess(dstW, f.dst_namespace, 'ingress', policies)
+  const dstExplain = explain(dstW, f.dst_namespace, 'ingress')
   const exemptAtDst = !dstExplain.blocked || sourceIsExempt(dstExplain.exceptions, f.src_namespace, srcW, f.dst_namespace)
   if (!exemptAtDst) return true
 
-  const srcExplain = explainAccess(srcW, f.src_namespace, 'egress', policies)
+  const srcExplain = explain(srcW, f.src_namespace, 'egress')
   const exemptAtSrc = !srcExplain.blocked || isDestinationExempt(srcExplain.exceptions, dstW, f.src_namespace, f.dst_namespace)
   return !exemptAtSrc
+}
+
+// Same reasoning FlowExplainPanel uses (NetworkGraph.tsx) to decide whether
+// a flow is actually blocked, extracted so both stay in sync instead of
+// drifting apart again like ingress/egress did earlier this session.
+export function isFlowBlocked(f: FlowEnds, policies: NetworkPolicyInfo[]): boolean {
+  return flowBlockedWith(f, (name, ns, dir) => explainAccess(name, ns, dir, policies))
+}
+
+// explainAccess() only ever looks at policies living in `ns` (or, for
+// egress, whose source namespace is `ns`), so it gets that subset instead of
+// the whole cluster, in the original order (find() takes the first match).
+// Results are memoized per (name, ns, direction): many flows share the same
+// endpoints.
+function memoExplain(policies: NetworkPolicyInfo[]): ExplainFn {
+  const byNs = new Map<string, number[]>()
+  const add = (key: string, i: number) => {
+    const list = byNs.get(key)
+    if (list) { if (list[list.length - 1] !== i) list.push(i) } else byNs.set(key, [i])
+  }
+  policies.forEach((p, i) => {
+    add(`ns:${p.namespace}`, i)
+    add(`src:${p.src_namespace}`, i)
+  })
+  const subset = (ns: string, direction: 'ingress' | 'egress'): NetworkPolicyInfo[] => {
+    const own = byNs.get(`ns:${ns}`) ?? []
+    if (direction === 'ingress') return own.map(i => policies[i])
+    const merged = [...new Set([...own, ...(byNs.get(`src:${ns}`) ?? [])])].sort((a, b) => a - b)
+    return merged.map(i => policies[i])
+  }
+  const cache = new Map<string, ExplainResult>()
+  return (name, ns, direction) => {
+    const key = `${direction}|${ns}|${name}`
+    let r = cache.get(key)
+    if (!r) { r = explainAccess(name, ns, direction, subset(ns, direction)); cache.set(key, r) }
+    return r
+  }
+}
+
+// isFlowBlocked() is a function of the flow's two endpoints only (not port,
+// verdict or counters), so rows sharing the same pair share the answer.
+function pairKey(f: FlowEnds): string {
+  return `${f.src_namespace}|${normalizeWorkload(f.src_workload)}|${f.dst_namespace}|${normalizeWorkload(f.dst_workload)}`
+}
+
+// A reusable isFlowBlocked() bound to one policy set, for checking many
+// flows against the same policies (Descoberta, graph edges): same answers,
+// computed once per endpoint pair instead of once per row.
+export function createFlowBlockedChecker(policies: NetworkPolicyInfo[]): (f: FlowEnds) => boolean {
+  const explain = memoExplain(policies)
+  const cache = new Map<string, boolean>()
+  return f => {
+    const key = pairKey(f)
+    let r = cache.get(key)
+    if (r === undefined) { r = flowBlockedWith(f, explain); cache.set(key, r) }
+    return r
+  }
 }
 
 // The NetworkPolicy objects a draft *would* create if applied: mirrors
@@ -165,12 +219,14 @@ export function simulateImpact(
   realPolicies: NetworkPolicyInfo[],
   drafts: Draft[],
 ): { breaking: CiliumFlowSummary[]; fixed: CiliumFlowSummary[] } {
-  const hypothetical = computeEffectivePolicies(realPolicies, drafts)
   const breaking: CiliumFlowSummary[] = []
   const fixed: CiliumFlowSummary[] = []
+  if (drafts.length === 0) return { breaking, fixed }
+  const before = createFlowBlockedChecker(realPolicies)
+  const after = createFlowBlockedChecker(computeEffectivePolicies(realPolicies, drafts))
   for (const f of flows) {
-    const was = isFlowBlocked(f, realPolicies)
-    const will = isFlowBlocked(f, hypothetical)
+    const was = before(f)
+    const will = after(f)
     if (!was && will) breaking.push(f)
     else if (was && !will) fixed.push(f)
   }

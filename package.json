@@ -15,6 +15,7 @@
     "@grpc/grpc-js": "^1.14.4",
     "@grpc/proto-loader": "^0.8.1",
     "@kubernetes/client-node": "^1.4.0",
+    "@tanstack/react-virtual": "^3.13.12",
     "@xyflow/react": "^12.3.6",
     "axios": "^1.7.9",
     "bcryptjs": "^3.0.3",

@@ -28,7 +28,7 @@ import dagre from '@dagrejs/dagre'
 import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, ServiceLayout, ApprovalRequest, CiliumFlowSummary } from '@/types'
 import { deleteNetworkPolicy, restrictService, patchNetworkPolicyPort } from '@/api/client'
 import { explainAccess, sourceIsExempt, isDestinationExempt, type ExplainResult } from '@/lib/explainAccess'
-import { isFlowBlocked, computeEffectivePolicies } from '@/lib/simulate'
+import { createFlowBlockedChecker, computeEffectivePolicies } from '@/lib/simulate'
 import { normalizeWorkload, classifyFlowGap } from '@/lib/flowMatch'
 import { getNamespaceIsolation } from '@/lib/nsIsolation'
 import { NamespaceIsolationPanel } from './NamespaceIsolationPanel'
@@ -124,6 +124,9 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
     exceptionCount: number
     virtual?: boolean
     hideVirtualBadge?: boolean
+    collapsed?: boolean
+    serviceCount?: number
+    onToggleCollapse?: () => void
   }
   return (
     <div style={{
@@ -147,9 +150,19 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
           borderBottom: `1px solid ${d.borderColor}25`, userSelect: 'none',
           display: 'flex', alignItems: 'center', gap: 6,
         }}>
-        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={d.borderColor} strokeWidth="2.5" style={{ opacity: 0.6, flexShrink: 0 }}>
-          <path d="M5 9l4-4 4 4M5 15l4 4 4-4M15 9l4-4 4 4M15 15l4 4 4-4" />
-        </svg>
+        {d.onToggleCollapse ? (
+          <button
+            onClick={e => { e.stopPropagation(); d.onToggleCollapse!() }}
+            title={d.collapsed ? 'Expandir: mostrar os serviços deste namespace' : 'Recolher: mostrar só a caixa do namespace'}
+            style={{ border: 'none', background: 'transparent', color: d.borderColor, cursor: 'pointer', padding: 0, width: 14, fontSize: 10, lineHeight: 1, flexShrink: 0 }}
+          >
+            {d.collapsed ? '▸' : '▾'}
+          </button>
+        ) : (
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={d.borderColor} strokeWidth="2.5" style={{ opacity: 0.6, flexShrink: 0 }}>
+            <path d="M5 9l4-4 4 4M5 15l4 4 4-4M15 9l4-4 4 4M15 15l4 4 4-4" />
+          </svg>
+        )}
         <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.label}</span>
         {d.virtual && !d.hideVirtualBadge && (
           <span style={{ fontSize: 9, color: '#94a3b8', fontWeight: 400, whiteSpace: 'nowrap', fontStyle: 'italic' }}>descoberto</span>
@@ -177,6 +190,14 @@ function NamespaceGroupNode({ data, selected }: NodeProps) {
           {d.locked ? '🔒' : '🔓'}
         </button>
       </div>
+      {d.collapsed && (
+        <div
+          onDoubleClick={e => { e.stopPropagation(); d.onToggleCollapse?.() }}
+          title="Clique duplo para expandir"
+          style={{ padding: '6px 12px', fontSize: 11, color: '#64748b', userSelect: 'none' }}>
+          {d.serviceCount === 1 ? '1 serviço' : `${d.serviceCount ?? 0} serviços`} · recolhido
+        </div>
+      )}
       <Handle type="source" position={Position.Right}
         isConnectable={false}
         style={{ opacity: 0, pointerEvents: 'none', width: 8, height: 8 }} />
@@ -291,10 +312,20 @@ const PALETTE = [
 const LS_SHOW_INTERNET_KEY = 'floodgate-show-internet-traffic'
 const LS_ONLY_INTERNET_KEY = 'floodgate-only-internet-traffic'
 const LS_SHOW_FLOW_EDGES_KEY = 'floodgate-show-flow-edges'
+// Which namespaces the user collapsed/expanded on the graph. Absent means
+// "never touched": the default then depends on cluster size (see
+// COLLAPSE_BY_DEFAULT_ABOVE).
+const LS_COLLAPSED_NS_KEY = 'floodgate-graph-collapsed-ns'
+// Above this many namespaces the graph opens with every namespace collapsed
+// (one box each, no service nodes): thousands of service nodes and their
+// edges at once is slow to draw and impossible to read. Expand the ones
+// you care about, or find a service with the search box.
+const COLLAPSE_BY_DEFAULT_ABOVE = 25
 
 // ─── Layout constants ──────────────────────────────────────────────────────
 const NODE_W = 160, NODE_H = 56, NODE_GAPH = 20, NODE_GAPV = 16
 const NS_PAD = 20, NS_HEADER = 34
+const COLLAPSED_NS_W = 220, COLLAPSED_NS_H = NS_HEADER + 30
 const TREE_COL_GAP = 130, TREE_ROW_GAP = 70
 
 // Fraction of the smaller rect's area covered by the intersection (0..1).
@@ -350,6 +381,38 @@ function assignCurvatures(rawEdges: Array<{ srcId: string; dstId: string; key: s
     const offset = total === 1 ? 0 : (idx / (total - 1) - 0.5) * spread * 2
     return { key, curvature: base + offset }
   })
+}
+
+// The graph is fed pre-aggregated edges (aggregateFlowEdges: one entry per
+// pair, carrying every port seen); a plain row only has its own port.
+function flowPorts(f: CiliumFlowSummary & { dst_ports?: number[] }): number[] {
+  return f.dst_ports && f.dst_ports.length > 0 ? f.dst_ports : [f.dst_port]
+}
+
+// Above this many edges, they're drawn without animation or labels (see
+// plainEdges).
+const PLAIN_EDGES_ABOVE = 400
+
+// Most flow edges the graph draws at once (see buildGraph).
+const MAX_DRAWN_FLOW_EDGES = 1500
+
+// Above this many namespaces, a grid instead of dagre (see buildGraph).
+const LARGE_LAYOUT_NAMESPACES = 200
+
+// Rows of namespace boxes, left to right, wrapping at roughly a square
+// overall shape; each row as tall as its tallest box.
+function computeGridLayout(namespaces: string[], nsSizes: Map<string, { w: number; h: number }>): Map<string, { x: number; y: number }> {
+  const positions = new Map<string, { x: number; y: number }>()
+  const cols = Math.max(1, Math.ceil(Math.sqrt(namespaces.length)))
+  let x = 0, y = 0, rowH = 0
+  namespaces.forEach((ns, i) => {
+    if (i > 0 && i % cols === 0) { x = 0; y += rowH + TREE_ROW_GAP; rowH = 0 }
+    const { w, h } = nsSizes.get(ns) ?? { w: 200, h: 100 }
+    positions.set(ns, { x, y })
+    x += w + TREE_COL_GAP / 2
+    rowH = Math.max(rowH, h)
+  })
+  return positions
 }
 
 // ─── Tree layout (topological sort, left-to-right) ────────────────────────
@@ -491,7 +554,9 @@ function buildGraph(
   draftMode = false,
   showInternetTraffic = false,
   onlyInternetTraffic = false,
-): { nodes: Node[]; edges: BuiltInEdge[] } {
+  collapsedNs: Set<string> = new Set(),
+  onToggleCollapse?: (namespace: string) => void,
+): { nodes: Node[]; edges: BuiltInEdge[]; flowEdgesHidden: number } {
   // 'internet' is a synthetic pseudo-namespace (see hubble.ts's reserved:world
   // handling): it never appears in the real namespace list a user hides/shows
   // from, so it can never be a member of visibleNamespaces even when the user
@@ -518,6 +583,7 @@ function buildGraph(
   // is excluding a real one instead) but still needs the preview to engage.
   const hasDraftPreview = draftMode && drafts.length > 0
   const effectivePolicies = hasDraftPreview ? computeEffectivePolicies(policies, drafts) : policies
+  const isPreviewBlocked = hasDraftPreview ? createFlowBlockedChecker(effectivePolicies) : null
 
   const nsMap = new Map<string, ServiceInfo[]>()
   for (const svc of services) {
@@ -527,6 +593,7 @@ function buildGraph(
 
   const nsSizes = new Map<string, { w: number; h: number }>()
   for (const [ns, svcs] of nsMap) {
+    if (collapsedNs.has(ns)) { nsSizes.set(ns, { w: COLLAPSED_NS_W, h: COLLAPSED_NS_H }); continue }
     const cols = Math.max(1, Math.ceil(Math.sqrt(svcs.length)))
     const rows = Math.ceil(svcs.length / cols)
     nsSizes.set(ns, {
@@ -556,15 +623,25 @@ function buildGraph(
   }
 
   {
-    const tree = computeNamespaceTreeLayout([...nsMap.keys()], nsSizes, policies, drafts, showFlowEdges ? visibleFlows : [])
     // Remove stale namespaces that no longer exist in the cluster nor in
     // any currently visible flow.
     for (const key of [...nsPositions.keys()]) {
       if (!nsMap.has(key) && !virtualNsCandidates.has(key)) nsPositions.delete(key)
     }
-    // Only assign tree positions to namespaces not already positioned (preserves manual drags)
-    for (const [ns, pos] of tree) {
-      if (!nsPositions.has(ns)) nsPositions.set(ns, pos)
+    // The layout only ever fills in namespaces not positioned yet (manual
+    // drags are preserved), so it runs only when one is missing, not on
+    // every rebuild. dagre's crossing minimization blows up on very large
+    // graphs (1,000 namespaces with live-traffic edges hung the tab for
+    // minutes): past LARGE_LAYOUT_NAMESPACES it gets a plain grid instead.
+    const unpositioned = [...nsMap.keys()].filter(ns => !nsPositions.has(ns))
+    if (unpositioned.length > 0) {
+      const tree = nsMap.size > LARGE_LAYOUT_NAMESPACES
+        ? computeGridLayout([...nsMap.keys()].sort(), nsSizes)
+        : computeNamespaceTreeLayout([...nsMap.keys()], nsSizes, policies, drafts, showFlowEdges ? visibleFlows : [])
+      for (const ns of unpositioned) {
+        const pos = tree.get(ns)
+        if (pos) nsPositions.set(ns, pos)
+      }
     }
   }
 
@@ -671,6 +748,32 @@ function buildGraph(
     const nsLocked = namespaceLocks[ns] ?? false
     const canToggleLock = !!canManageNamespace?.(ns)
 
+    // Recolhido: só a caixa do namespace, sem um nó por serviço. As arestas
+    // dos serviços dele passam a chegar/sair da própria caixa (endpointId
+    // abaixo) e são agrupadas no fim (collapseEdges).
+    if (collapsedNs.has(ns)) {
+      groupNodes.push({
+        id: `ns::${ns}`,
+        type: 'namespace',
+        position: pos,
+        style: { width: COLLAPSED_NS_W, height: COLLAPSED_NS_H, padding: 0 },
+        data: {
+          label: ns, color: p.bg, borderColor: p.border,
+          locked: nsLocked, canToggleLock,
+          onToggleLock: () => onToggleNamespaceLock?.(ns, !nsLocked),
+          isolatedIn: nsIsolatedIngress.has(ns),
+          isolatedEg: nsIsolatedEgress.has(ns),
+          exceptionCount: nsExceptionCount.get(ns) ?? 0,
+          collapsed: true,
+          serviceCount: svcs.length,
+          onToggleCollapse: onToggleCollapse ? () => onToggleCollapse(ns) : undefined,
+        },
+        draggable: !globalLocked,
+        zIndex: 0,
+      })
+      continue
+    }
+
     // Resolve every service's slot before building any node. A saved custom
     // position (from a past drag) can coincidentally collide with another
     // service's freshly-computed default grid slot, e.g. right after
@@ -722,6 +825,8 @@ function buildGraph(
         isolatedIn: nsIsolatedIngress.has(ns),
         isolatedEg: nsIsolatedEgress.has(ns),
         exceptionCount: nsExceptionCount.get(ns) ?? 0,
+        collapsed: false,
+        onToggleCollapse: onToggleCollapse ? () => onToggleCollapse(ns) : undefined,
       },
       draggable: !globalLocked,
       zIndex: 0,
@@ -750,6 +855,13 @@ function buildGraph(
   const svcSet = new Set(serviceNodes.map(n => n.id))
   const nsGroupSet = new Set(groupNodes.map(n => n.id))
   const workloadSet = new Set<string>()
+  // Node a service's edges attach to: its own node, or its namespace's box
+  // when that namespace is collapsed. null when neither exists.
+  const endpointId = (ns: string, name: string): string | null => {
+    if (collapsedNs.has(ns) && nsGroupSet.has(`ns::${ns}`)) return `ns::${ns}`
+    const id = `svc::${ns}::${name}`
+    return svcSet.has(id) ? id : null
+  }
 
   // Cria nós virtuais para namespaces que aparecem em flows mas não têm K8s Services
   if (showFlowEdges && visibleFlows.length > 0) {
@@ -878,21 +990,36 @@ function buildGraph(
       const pairKey = `${srcId}→${dstId}::${flow.verdict}`
       const entry = flowPairMap.get(pairKey)
       if (entry) {
-        entry.ports.add(flow.dst_port)
+        for (const port of flowPorts(flow)) entry.ports.add(port)
         if (new Date(flow.last_seen) > new Date(entry.flow.last_seen)) entry.flow = flow
       } else {
-        flowPairMap.set(pairKey, { flow, srcId, dstId, ports: new Set([flow.dst_port]) })
+        flowPairMap.set(pairKey, { flow, srcId, dstId, ports: new Set(flowPorts(flow)) })
       }
     }
+  }
+  // Past MAX_DRAWN_FLOW_EDGES, only the most relevant ones are drawn:
+  // blocked first, then the most recently seen. Tens of thousands of
+  // animated, labeled edges add hundreds of thousands of DOM elements (a
+  // large cluster with lots of distinct traffic crashed the tab), and
+  // nobody can read that many anyway. The kept ones stay in their original
+  // order, so their curvatures don't shuffle. Descoberta still lists all.
+  let flowEdgesHidden = 0
+  if (flowPairMap.size > MAX_DRAWN_FLOW_EDGES) {
+    const ranked = [...flowPairMap.entries()].sort(([, a], [, b]) =>
+      (a.flow.verdict === 'DROPPED' ? 0 : 1) - (b.flow.verdict === 'DROPPED' ? 0 : 1)
+      || (a.flow.last_seen < b.flow.last_seen ? 1 : a.flow.last_seen > b.flow.last_seen ? -1 : 0))
+    const keep = new Set(ranked.slice(0, MAX_DRAWN_FLOW_EDGES).map(([k]) => k))
+    flowEdgesHidden = flowPairMap.size - keep.size
+    for (const k of [...flowPairMap.keys()]) if (!keep.has(k)) flowPairMap.delete(k)
   }
 
   // ── Conjuntos para lógica UX semântica (Fix 3) ──────────────────────────
   // Pares cobertos por policies gerenciadas
   const policyNodePairs = new Set<string>()
   for (const policy of policies.filter(p => p.managed && p.src_workload)) {
-    const srcId = `svc::${policy.src_namespace}::${policy.src_workload}`
-    const dstId = `svc::${policy.namespace}::${policy.dst_service}`
-    if (svcSet.has(srcId) && svcSet.has(dstId)) policyNodePairs.add(`${srcId}|${dstId}`)
+    const srcId = endpointId(policy.src_namespace, policy.src_workload)
+    const dstId = endpointId(policy.namespace, policy.dst_service)
+    if (srcId && dstId) policyNodePairs.add(`${srcId}|${dstId}`)
   }
   // Pares com tráfego FORWARDED recente (para animar policy edges)
   const activeFlowPairs = new Set<string>()
@@ -903,21 +1030,21 @@ function buildGraph(
   const rawEdges: Array<{ srcId: string; dstId: string; key: string }> = []
 
   for (const policy of policies.filter(p => p.managed && p.src_workload)) {
-    const srcId = `svc::${policy.src_namespace}::${policy.src_workload}`
-    const dstId = `svc::${policy.namespace}::${policy.dst_service}`
+    const srcId = endpointId(policy.src_namespace, policy.src_workload) ?? `svc::${policy.src_namespace}::${policy.src_workload}`
+    const dstId = endpointId(policy.namespace, policy.dst_service) ?? `svc::${policy.namespace}::${policy.dst_service}`
     rawEdges.push({ srcId, dstId, key: `policy::${policy.name}` })
   }
   for (const draft of drafts) {
-    const srcId = `svc::${draft.src_namespace}::${draft.src_workload}`
-    const dstId = `svc::${draft.dst_namespace}::${draft.dst_service}`
-    if (!svcSet.has(srcId) || !svcSet.has(dstId)) continue
+    const srcId = endpointId(draft.src_namespace, draft.src_workload)
+    const dstId = endpointId(draft.dst_namespace, draft.dst_service)
+    if (!srcId || !dstId) continue
     rawEdges.push({ srcId, dstId, key: `draft::${draft.id}` })
   }
   for (const apr of pendingApprovals) {
     const d = apr.draft_data as Draft
-    const srcId = `svc::${d.src_namespace}::${d.src_workload}`
-    const dstId = `svc::${d.dst_namespace}::${d.dst_service}`
-    if (!svcSet.has(srcId) || !svcSet.has(dstId)) continue
+    const srcId = endpointId(d.src_namespace, d.src_workload)
+    const dstId = endpointId(d.dst_namespace, d.dst_service)
+    if (!srcId || !dstId) continue
     rawEdges.push({ srcId, dstId, key: `approval::${apr.id}` })
   }
   // Flow edges integradas no cálculo de curvatura
@@ -933,8 +1060,9 @@ function buildGraph(
 
   for (const policy of policies.filter(p => p.managed && p.src_workload)) {
     if (!nsVisible(policy.src_namespace) || !nsVisible(policy.namespace)) continue
-    const srcId = `svc::${policy.src_namespace}::${policy.src_workload}`
-    const dstId = `svc::${policy.namespace}::${policy.dst_service}`
+    const srcId = endpointId(policy.src_namespace, policy.src_workload) ?? `svc::${policy.src_namespace}::${policy.src_workload}`
+    const dstId = endpointId(policy.namespace, policy.dst_service) ?? `svc::${policy.namespace}::${policy.dst_service}`
+    if (srcId === dstId) continue // both ends inside one collapsed namespace
     const id    = `policy::${policy.name}`
     const cur   = curvatureMap.get(id) ?? 0.25
     const isEgress = policy.policy_type === 'allow-egress'
@@ -959,9 +1087,9 @@ function buildGraph(
   }
 
   for (const draft of drafts) {
-    const srcId = `svc::${draft.src_namespace}::${draft.src_workload}`
-    const dstId = `svc::${draft.dst_namespace}::${draft.dst_service}`
-    if (!svcSet.has(srcId) || !svcSet.has(dstId)) continue
+    const srcId = endpointId(draft.src_namespace, draft.src_workload)
+    const dstId = endpointId(draft.dst_namespace, draft.dst_service)
+    if (!srcId || !dstId || srcId === dstId) continue
     const id  = `draft::${draft.id}`
     const cur = curvatureMap.get(id) ?? 0.25
     edges.push({
@@ -979,9 +1107,9 @@ function buildGraph(
 
   for (const apr of pendingApprovals) {
     const d = apr.draft_data as Draft
-    const srcId = `svc::${d.src_namespace}::${d.src_workload}`
-    const dstId = `svc::${d.dst_namespace}::${d.dst_service}`
-    if (!svcSet.has(srcId) || !svcSet.has(dstId)) continue
+    const srcId = endpointId(d.src_namespace, d.src_workload)
+    const dstId = endpointId(d.dst_namespace, d.dst_service)
+    if (!srcId || !dstId || srcId === dstId) continue
     const id  = `approval::${apr.id}`
     const cur = curvatureMap.get(id) ?? 0.25
     const approvedCount = apr.approve_count ?? 0
@@ -1007,7 +1135,7 @@ function buildGraph(
     // Modo Rascunho: mostra a linha como se os rascunhos atuais já tivessem
     // sido aplicados, não o veredito real do Hubble: é exatamente o que o
     // aviso de impacto da aba Rascunhos calcula, só que desenhado no grafo.
-    const isDropped = hasDraftPreview ? isFlowBlocked(flow, effectivePolicies) : reallyDropped
+    const isDropped = isPreviewBlocked ? isPreviewBlocked(flow) : reallyDropped
     const previewChanged = hasDraftPreview && isDropped !== reallyDropped
     if (!isDropped && policyNodePairs.has(`${srcId}|${dstId}`)) continue
     const id = `flow::${pairKey}`
@@ -1037,7 +1165,47 @@ function buildGraph(
     })
   }
 
-  return { nodes, edges }
+  const finalEdges = collapsedNs.size > 0 ? collapseEdges(edges) : edges
+  return { nodes, edges: finalEdges.length > PLAIN_EDGES_ABOVE ? plainEdges(finalEdges) : finalEdges, flowEdgesHidden }
+}
+
+// Every animated edge is a CSS animation repainting each frame, and every
+// label several more DOM elements: with hundreds of edges on screen that's
+// what made dragging and panning crawl. Past PLAIN_EDGES_ABOVE edges they
+// are drawn still and unlabeled; the details (ports, quorum, policy) are
+// still a click away on the edge.
+function plainEdges(edges: BuiltInEdge[]): BuiltInEdge[] {
+  return edges.map(e => ({ ...e, animated: false, label: undefined, style: { ...e.style, filter: undefined } }))
+}
+
+// With namespaces collapsed, many edges end up on the same pair of boxes
+// (every policy between two collapsed namespaces, say). Draws one edge per
+// pair and kind instead, labeled with how many it stands for. A merged
+// edge has no single policy/draft/flow behind it, so clicking it does
+// nothing (type 'aggregate'); expanding the namespace shows the real ones.
+function collapseEdges(edges: BuiltInEdge[]): BuiltInEdge[] {
+  const groups = new Map<string, BuiltInEdge[]>()
+  const out: BuiltInEdge[] = []
+  for (const e of edges) {
+    if (!e.source.startsWith('ns::') && !e.target.startsWith('ns::')) { out.push(e); continue }
+    const kind = String((e.data as { type?: string } | undefined)?.type ?? '')
+    const key = `${e.source}|${e.target}|${kind}|${String(e.style?.stroke ?? '')}`
+    const list = groups.get(key)
+    if (list) list.push(e); else groups.set(key, [e])
+  }
+  const KIND_LABEL: Record<string, string> = { policy: 'policies', draft: 'rascunhos', approval: 'pendentes', flow: 'fluxos' }
+  for (const list of groups.values()) {
+    if (list.length === 1) { out.push(list[0]); continue }
+    const first = list[0]
+    const kind = String((first.data as { type?: string } | undefined)?.type ?? '')
+    out.push({
+      ...first,
+      id: `agg::${first.id}`,
+      label: `${list.length} ${KIND_LABEL[kind] ?? 'conexões'}`,
+      data: { type: 'aggregate', count: list.length },
+    })
+  }
+  return out
 }
 
 // ─── Service detail panel ──────────────────────────────────────────────────
@@ -1721,11 +1889,83 @@ interface Props {
   onShowFlowEdgesChange?: (on: boolean) => void
 }
 
+// ─── Busca + recolher/expandir namespaces ──────────────────────────────────
+// Finds a namespace or service and centers the view on it, expanding its
+// namespace first when collapsed (the node only exists once expanded, so
+// the zoom waits for it to show up among the graph's nodes).
+function GraphNavigator({ services, collapsedNs, onExpand, onSelectService, onCollapseAll, onExpandAll }: {
+  services: ServiceInfo[]
+  collapsedNs: Set<string>
+  onExpand: (ns: string) => void
+  onSelectService: (nodeId: string) => void
+  onCollapseAll: () => void
+  onExpandAll: () => void
+}) {
+  const { fitView } = useReactFlow()
+  const nodeIds = useNodes().map(n => n.id)
+  const [query, setQuery] = React.useState('')
+  const [pendingFocus, setPendingFocus] = React.useState<string | null>(null)
+  const namespaces = React.useMemo(() => [...new Set(services.map(s => s.namespace))].sort(), [services])
+  const options = React.useMemo(
+    () => [...namespaces.map(ns => ({ label: ns, ns, svc: null as string | null })), ...services.map(s => ({ label: `${s.name} (${s.namespace})`, ns: s.namespace, svc: s.name }))],
+    [namespaces, services],
+  )
+  React.useEffect(() => {
+    if (!pendingFocus || !nodeIds.includes(pendingFocus)) return
+    setPendingFocus(null)
+    fitView({ nodes: [{ id: pendingFocus }], duration: 400, maxZoom: 1.2, padding: 0.4 })
+    if (pendingFocus.startsWith('svc::')) onSelectService(pendingFocus)
+  }, [pendingFocus, nodeIds, fitView, onSelectService])
+
+  function go(label: string) {
+    const opt = options.find(o => o.label === label) ?? options.find(o => o.label.toLowerCase().startsWith(label.trim().toLowerCase()))
+    if (!opt) return
+    if (opt.svc) {
+      if (collapsedNs.has(opt.ns)) onExpand(opt.ns)
+      setPendingFocus(`svc::${opt.ns}::${opt.svc}`)
+    } else {
+      setPendingFocus(`ns::${opt.ns}`)
+    }
+    setQuery('')
+  }
+
+  const allCollapsed = namespaces.length > 0 && namespaces.every(ns => collapsedNs.has(ns))
+  return (
+    <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 6, justifyContent: 'flex-end' }}>
+      <input
+        id="graph-search"
+        list="graph-search-options"
+        placeholder="Buscar serviço ou namespace…"
+        value={query}
+        onChange={e => {
+          setQuery(e.target.value)
+          // Picking an entry from the datalist fills the exact label: go right away.
+          if (options.some(o => o.label === e.target.value)) go(e.target.value)
+        }}
+        onKeyDown={e => { if (e.key === 'Enter') go(query) }}
+        style={{ width: 220, fontSize: 11, padding: '5px 8px', border: '1px solid #e2e8f0', borderRadius: 8, background: 'white', boxShadow: '0 1px 3px rgba(0,0,0,0.08)' }}
+      />
+      <datalist id="graph-search-options">
+        {options.map(o => <option key={o.label} value={o.label} />)}
+      </datalist>
+      {namespaces.length > 1 && (
+        <button
+          onClick={allCollapsed ? onExpandAll : onCollapseAll}
+          title={allCollapsed ? 'Mostrar os serviços de todos os namespaces' : 'Mostrar só uma caixa por namespace'}
+          style={{ fontSize: 11, padding: '5px 10px', border: '1px solid #e2e8f0', borderRadius: 8, background: 'white', color: '#475569', cursor: 'pointer', whiteSpace: 'nowrap', boxShadow: '0 1px 3px rgba(0,0,0,0.08)' }}
+        >
+          {allCollapsed ? 'Expandir namespaces' : 'Recolher namespaces'}
+        </button>
+      )}
+    </div>
+  )
+}
+
 // ─── Layout toolbar ────────────────────────────────────────────────────────
 function LayoutToolbar({
   layoutSaveStatus, autosave, isAdmin,
   onSaveLayout, onDiscardLayout, onToggleAutosave,
-  onAutoLayout,
+  onAutoLayout, onCaptureChange,
 }: {
   layoutSaveStatus: 'idle' | 'saving' | 'draft' | 'saved' | 'error'
   autosave: boolean
@@ -1734,6 +1974,7 @@ function LayoutToolbar({
   onDiscardLayout?: () => void
   onToggleAutosave?: () => void
   onAutoLayout: (mode: 'namespaces' | 'services' | 'both') => void
+  onCaptureChange: (capturing: boolean) => void
 }) {
   // getNodesBounds from the hook (not the top-level export) is needed here:
   // service nodes are positioned relative to their namespace parent node, and
@@ -1752,6 +1993,11 @@ function LayoutToolbar({
     const nodes = getNodes()
     if (nodes.length === 0 || capturing) return
     setCapturing(true)
+    // The graph normally only renders what's on screen
+    // (onlyRenderVisibleElements), but the PNG is taken from the DOM: render
+    // every node for the capture, and give React two frames to mount them.
+    onCaptureChange(true)
+    await new Promise<void>(res => requestAnimationFrame(() => requestAnimationFrame(() => res())))
     try {
       const viewportEl = document.querySelector<HTMLElement>('.react-flow__viewport')
       if (!viewportEl) return
@@ -1793,8 +2039,9 @@ function LayoutToolbar({
       console.error('[floodgate] screenshot do grafo falhou:', e)
     } finally {
       setCapturing(false)
+      onCaptureChange(false)
     }
-  }, [getNodes, getNodesBounds, capturing])
+  }, [getNodes, getNodesBounds, capturing, onCaptureChange])
   useEffect(() => {
     if (layoutSaveStatus !== 'saving') return
     const id = setInterval(() => setTick(t => t + 1), 120)
@@ -2062,20 +2309,69 @@ export default function NetworkGraph({
   // node back to its old position and then jump back to the cursor on the
   // next pointer move: a visible "goes back, then returns" flicker.
   const isDragging = useRef(false)
+
+  // Namespaces recolhidos no grafo (ver COLLAPSE_BY_DEFAULT_ABOVE): o que o
+  // usuário recolheu/expandiu explicitamente fica salvo; quem nunca foi
+  // tocado segue o padrão pelo tamanho do cluster.
+  const [collapsePref, setCollapsePref] = React.useState<{ collapsed: string[]; expanded: string[] }>(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(LS_COLLAPSED_NS_KEY) ?? 'null')
+      if (v && Array.isArray(v.collapsed) && Array.isArray(v.expanded)) return v
+    } catch { /* default below */ }
+    return { collapsed: [], expanded: [] }
+  })
+  const realNamespaces = React.useMemo(() => [...new Set(services.map(s => s.namespace))], [services])
+  const collapsedNs = React.useMemo(() => {
+    const byDefault = realNamespaces.length > COLLAPSE_BY_DEFAULT_ABOVE
+    const collapsed = new Set(collapsePref.collapsed)
+    const expanded = new Set(collapsePref.expanded)
+    return new Set(realNamespaces.filter(ns => collapsed.has(ns) || (byDefault && !expanded.has(ns))))
+  }, [realNamespaces, collapsePref])
+  const saveCollapsePref = useCallback((next: { collapsed: string[]; expanded: string[] }) => {
+    setCollapsePref(next)
+    try { localStorage.setItem(LS_COLLAPSED_NS_KEY, JSON.stringify(next)) } catch { /* only this session */ }
+  }, [])
+  const collapsedNsRef = useRef(collapsedNs)
+  collapsedNsRef.current = collapsedNs
+  const collapsePrefRef = useRef(collapsePref)
+  collapsePrefRef.current = collapsePref
+  const toggleCollapse = useCallback((ns: string) => {
+    const pref = collapsePrefRef.current
+    const without = (list: string[]) => list.filter(n => n !== ns)
+    saveCollapsePref(collapsedNsRef.current.has(ns)
+      ? { collapsed: without(pref.collapsed), expanded: [...without(pref.expanded), ns] }
+      : { collapsed: [...without(pref.collapsed), ns], expanded: without(pref.expanded) })
+  }, [saveCollapsePref])
+  const expandNamespace = useCallback((ns: string) => {
+    if (collapsedNsRef.current.has(ns)) toggleCollapse(ns)
+  }, [toggleCollapse])
+  const collapseAll = useCallback(() => saveCollapsePref({ collapsed: realNamespaces, expanded: [] }), [realNamespaces, saveCollapsePref])
+  const expandAll = useCallback(() => saveCollapsePref({ collapsed: [], expanded: realNamespaces }), [realNamespaces, saveCollapsePref])
+  const [renderAllForCapture, setRenderAllForCapture] = React.useState(false)
+  const [flowEdgesHidden, setFlowEdgesHidden] = React.useState(0)
   const transitionClearTimers = useRef<ReturnType<typeof setTimeout>[]>([])
   useEffect(() => () => { transitionClearTimers.current.forEach(clearTimeout) }, [])
   const rebuildRef = useRef<(mode?: 'namespaces' | 'services' | 'both', force?: boolean, persist?: boolean) => Promise<void>>(() => Promise.resolve())
+
+  // The parent recreates these handlers on every render. Read through refs
+  // so they don't count as a rebuildGraph dependency: otherwise every parent
+  // render (a poll, a typed character in a panel) rebuilt the whole graph.
+  const toggleLockRef = useRef(onToggleNamespaceLock)
+  const autoLayoutRef = useRef(onAutoLayoutServices)
+  useEffect(() => { toggleLockRef.current = onToggleNamespaceLock; autoLayoutRef.current = onAutoLayoutServices })
+  const stableToggleLock = useCallback((...args: Parameters<typeof onToggleNamespaceLock>) => toggleLockRef.current(...args), [])
 
   const rebuildGraph = useCallback(async (layoutMode: 'namespaces' | 'services' | 'both' = 'both', forceNsReset = false, persistAutoLayout = false) => {
     // When the user explicitly triggers auto-layout for namespaces, clear saved positions first
     if (forceNsReset && (layoutMode === 'namespaces' || layoutMode === 'both')) {
       nsPositions.current.clear()
     }
-    const { nodes: n, edges: e } = buildGraph(
-      services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, onToggleNamespaceLock,
+    const { nodes: n, edges: e, flowEdgesHidden: hidden } = buildGraph(
+      services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, stableToggleLock,
       nsPositions.current, nsPaletteIdx.current, canManageNamespace,
       layoutMode, globalLocked,
       ciliumFlows ?? [], showFlowEdges, ignoredNamespaces, visibleNamespaces, draftMode, showInternetTraffic, onlyInternetTraffic,
+      collapsedNs, toggleCollapse,
     )
     // buildGraph() always constructs fresh node objects, so ReactFlow's own
     // click-driven `selected` highlight (the box-shadow on the open node)
@@ -2088,6 +2384,7 @@ export default function NetworkGraph({
         : node.selected ? { ...node, selected: false } : node
     )
     setNodes(withSelection)
+    setFlowEdgesHidden(hidden)
     setEdges(e)
     if (!persistAutoLayout) return
 
@@ -2103,22 +2400,28 @@ export default function NetworkGraph({
             .filter(node => node.id.startsWith('ns::'))
             .map(node => ({ namespace: node.id.slice(4), x: node.position.x, y: node.position.y }))
         : []
-      await onAutoLayoutServices(movedServices, movedNamespaces)
+      await autoLayoutRef.current(movedServices, movedNamespaces)
     } else if (layoutMode === 'namespaces') {
       const movedNamespaces = n
         .filter(node => node.id.startsWith('ns::'))
         .map(node => ({ namespace: node.id.slice(4), x: node.position.x, y: node.position.y }))
-      await onAutoLayoutServices([], movedNamespaces)
+      await autoLayoutRef.current([], movedNamespaces)
     }
-  }, [services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, canManageNamespace, onToggleNamespaceLock, onAutoLayoutServices, globalLocked, ciliumFlows, showFlowEdges, ignoredNamespaces, visibleNamespaces, selectedNodeId, selectedNs, draftMode, showInternetTraffic, onlyInternetTraffic])
+  }, [services, policies, drafts, pendingApprovals, serviceLayouts, namespaceLocks, canManageNamespace, stableToggleLock, globalLocked, ciliumFlows, showFlowEdges, ignoredNamespaces, visibleNamespaces, selectedNodeId, selectedNs, draftMode, showInternetTraffic, onlyInternetTraffic, collapsedNs, toggleCollapse])
 
   useEffect(() => { rebuildRef.current = rebuildGraph }, [rebuildGraph])
-  useEffect(() => { if (!isDragging.current) rebuildGraph('namespaces').catch(() => {}) }, [rebuildGraph])
+  // A change that arrives mid-drag is skipped (see isDragging above), not
+  // lost: rebuildSkipped makes handleNodeDragStop replay it on drop.
+  const rebuildSkipped = useRef(false)
+  useEffect(() => {
+    if (isDragging.current) { rebuildSkipped.current = true; return }
+    rebuildGraph('namespaces').catch(() => {})
+  }, [rebuildGraph])
 
   // Apply DB positions whenever they arrive (initial load or poll)
   useEffect(() => {
     if (Object.keys(nsPositionsFromDB).length === 0) return
-    if (isDragging.current) return
+    if (isDragging.current) { rebuildSkipped.current = true; return }
     for (const [ns, pos] of Object.entries(nsPositionsFromDB)) {
       nsPositions.current.set(ns, pos)
     }
@@ -2224,6 +2527,13 @@ export default function NetworkGraph({
 
   const handleNodeDragStop = useCallback((_: React.MouseEvent | MouseEvent | TouchEvent, node: Node) => {
     isDragging.current = false
+    if (rebuildSkipped.current) {
+      rebuildSkipped.current = false
+      // After this handler's own position updates have reached the parent
+      // (handleServiceMove/handleNsMove update its state right away), so the
+      // replayed rebuild already sees where the node was dropped.
+      setTimeout(() => { if (!isDragging.current) rebuildRef.current('namespaces', false, false).catch(() => {}) }, 0)
+    }
     const start = dragStartPos.current.get(node.id)
     if (!start) return
 
@@ -2384,6 +2694,7 @@ export default function NetworkGraph({
         zoomOnScroll={false}
         zoomOnPinch={true}
         proOptions={{ hideAttribution: true }}
+        onlyRenderVisibleElements={!renderAllForCapture}
       >
         <Background gap={20} size={1} color="#e2e8f0" />
         <Controls position="bottom-left" />
@@ -2397,6 +2708,15 @@ export default function NetworkGraph({
             onDiscardLayout={onDiscardLayout}
             onToggleAutosave={onToggleAutosave}
             onAutoLayout={(mode) => rebuildGraph(mode, true, true)}
+            onCaptureChange={setRenderAllForCapture}
+          />
+          <GraphNavigator
+            services={services}
+            collapsedNs={collapsedNs}
+            onExpand={expandNamespace}
+            onSelectService={setSelectedNodeId}
+            onCollapseAll={collapseAll}
+            onExpandAll={expandAll}
           />
         </Panel>
         {(ciliumStreaming || (ciliumFlows && ciliumFlows.length > 0)) && (
@@ -2419,6 +2739,13 @@ export default function NetworkGraph({
               }} />
               Tráfego ao vivo
             </button>
+            {showFlowEdges && flowEdgesHidden > 0 && (
+              <div
+                title="Muitas conexões distintas para desenhar de uma vez: o grafo mostra as bloqueadas primeiro e depois as vistas mais recentemente. A lista completa está na aba Descoberta."
+                style={{ marginTop: 6, padding: '4px 9px', borderRadius: 6, fontSize: 10.5, background: '#fffbeb', border: '1px solid #fde68a', color: '#92400e', maxWidth: 260 }}>
+                Mostrando {MAX_DRAWN_FLOW_EDGES.toLocaleString('pt-BR')} conexões; {flowEdgesHidden.toLocaleString('pt-BR')} ocultas (lista completa na Descoberta)
+              </div>
+            )}
             {showFlowEdges && ciliumFlows?.some(f => f.dst_namespace === 'internet') && (
               <button
                 onClick={toggleInternetTraffic}
