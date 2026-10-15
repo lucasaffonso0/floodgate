@@ -6,7 +6,7 @@ Kubernetes NetworkPolicy manager with an interactive drag-and-drop graph UI. Vis
 
 ## Features
 
-- **Interactive graph**: services grouped by namespace, policies rendered as colored edges; hide namespaces to focus the view, all edges follow
+- **Interactive graph**: services grouped by namespace, policies rendered as colored edges; hide namespaces to focus the view, all edges follow. Namespaces collapse to a single box (automatically above 25 namespaces), and a search box jumps straight to any service or namespace
 - **Drag-and-drop**: draw connections between services to create allow rules
 - **Role-based access**: admin, ns_admin, viewer, audit
 - **Approval workflow**: require N approvals before a policy is applied
@@ -83,6 +83,8 @@ helm upgrade floodgate ./helm-app-template \
 ```
 
 Default credentials: `admin` / `admin`. Password change is required on first login.
+
+**Single replica, by design.** State lives in one SQLite file on a ReadWriteOnce volume, plus in-process work (scheduler, Hubble stream, live updates). The chart uses the `Recreate` deploy strategy, so the old pod stops before the new one starts (a few seconds of downtime per upgrade, never two pods writing the same database), and refuses to render with `replicaCount` above 1 or autoscaling enabled. Scale vertically: the default is 512Mi requested / 768Mi limit with the Node heap capped at 384MB (`NODE_OPTIONS`), measured with 50,000 flows and five browsers loading at once.
 
 #### Exposing the app
 
@@ -178,6 +180,7 @@ kubectl apply -f test-apps/
 | `WRITE_MODE` | `direct` | `direct` or `gitops`, see [Write modes](#write-modes-direct-vs-gitops) below |
 | `HUBBLE_RELAY_ADDR` | `hubble-relay.kube-system.svc.cluster.local:80` | Hubble Relay gRPC address used by flow discovery |
 | `FLOODGATE_PERF_LOG` | unset | Set to `1` to log event-loop delay, memory and K8s/git/flow counters every 60 s (`[perf]` lines) |
+| `FLOODGATE_K8S_WATCH` | on | Services, NetworkPolicies and Namespaces are kept current by a Kubernetes watch instead of listing the cluster on every read. Set to `0` to go back to plain list calls |
 
 ### Load testing
 
@@ -186,7 +189,7 @@ kubectl apply -f test-apps/
 - `gen-scale-cluster.mjs`: synthetic cluster manifests (e.g. 1,000 namespaces / 5,000 Services), `| kubectl apply -f -`.
 - `fake-hubble-relay.mjs`: a fake Hubble Relay streaming synthetic flows at a chosen rate; run the app with `HUBBLE_RELAY_ADDR=localhost:4245`.
 - `seed-flows.mjs`: inserts N synthetic flows straight into the dev database.
-- `measure.mjs`: simulates N admins polling the main page and reports latency and payload size per endpoint.
+- `measure.mjs`: simulates N admins polling the main page and reports latency and payload size per endpoint. `--flows` picks how flows are fetched: `none` (summary only), `conditional` (Descoberta open: only rows changed since the version held), `edges` ("Tráfego ao vivo" only: pre-aggregated graph edges) or `always` (the full list every poll, how the page used to work).
 
 ---
 
