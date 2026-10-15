@@ -178,4 +178,26 @@ describe('sourceIsExempt / isDestinationExempt', () => {
     expect(isDestinationExempt(r.exceptions, 'other-app-in-frontend', 'frontend', 'frontend')).toBe(true) // same namespace: covered
     expect(isDestinationExempt(r.exceptions, 'worker', 'frontend', 'backend')).toBe(false) // different namespace: not covered
   })
+
+  // Internet flows carry the external IP as their destination workload, but
+  // the internet-egress companion policy is keyed on the 'internet'
+  // sentinel. Matching on the IP never hit, so every internet flow looked
+  // blocked even with "saída para internet" allowed.
+  it('isDestinationExempt exempts an internet-bound flow via the internet-egress companion, whatever the destination IP', () => {
+    const policies = [
+      policy({ policy_type: 'restrict-egress', namespace: 'frontend', dst_service: '' }),
+      policy({ policy_type: 'allow-egress', namespace: 'frontend', src_workload: '', src_namespace: 'frontend', dst_service: 'internet' }),
+    ]
+    const r = explainAccess('app', 'frontend', 'egress', policies)
+    expect(isDestinationExempt(r.exceptions, '203.0.113.7', 'frontend', 'internet')).toBe(true)
+  })
+
+  it('isDestinationExempt does not exempt an internet-bound flow when only an in-cluster egress allow exists', () => {
+    const policies = [
+      policy({ policy_type: 'restrict-egress', namespace: 'frontend', dst_service: '' }),
+      policy({ policy_type: 'allow-egress', namespace: 'frontend', src_workload: 'app', src_namespace: 'frontend', dst_service: 'worker' }),
+    ]
+    const r = explainAccess('app', 'frontend', 'egress', policies)
+    expect(isDestinationExempt(r.exceptions, '203.0.113.7', 'frontend', 'internet')).toBe(false)
+  })
 })

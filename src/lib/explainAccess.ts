@@ -131,8 +131,12 @@ export function sourceIsExempt(exceptions: ExplainExceptionEntry[], srcNs: strin
 // service name only — NetworkPolicyInfo doesn't track a destination
 // namespace for egress policies, same limitation as the label above.
 // `dstNs` gates the "intra" match for the same reason as sourceIsExempt.
+// An internet-bound flow's destination "service" is the external IP, but
+// the internet-egress companion policy is keyed on the 'internet'
+// sentinel, so internet flows match against that instead.
 export function isDestinationExempt(exceptions: ExplainExceptionEntry[], dstService: string, srcNs: string, dstNs: string): boolean {
-  return exceptions.some(e => e.matchKey === `service:${dstService}` || (e.matchKey === 'intra' && srcNs === dstNs))
+  const target = dstNs === 'internet' ? 'internet' : dstService
+  return exceptions.some(e => e.matchKey === `service:${target}` || (e.matchKey === 'intra' && srcNs === dstNs))
 }
 
 function exceptionLines(exceptions: ExplainExceptionEntry[]): string[] {

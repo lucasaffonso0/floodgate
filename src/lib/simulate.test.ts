@@ -155,6 +155,18 @@ describe('computeEffectivePolicies', () => {
 })
 
 describe('simulateImpact', () => {
+  // Real production data is almost entirely internet-bound, so this case
+  // decides whether the impact warning is usable at all: isolating egress
+  // WITH "saída para internet" allowed must not list internet flows as
+  // breaking, and isolating WITHOUT it must.
+  it('respects the internet-egress companion for internet-bound flows', () => {
+    const flows = [flow({ id: 'net', dst_workload: '203.0.113.7', dst_namespace: 'internet', dst_port: 443 })]
+    const withInternet = [draft({ kind: 'isolate', isolate_namespace: 'frontend', isolate_direction: 'egress', isolate_allow_intra: true, isolate_allow_internet: true })]
+    const withoutInternet = [draft({ kind: 'isolate', isolate_namespace: 'frontend', isolate_direction: 'egress', isolate_allow_intra: true, isolate_allow_internet: false })]
+    expect(simulateImpact(flows, [], withInternet).breaking).toEqual([])
+    expect(simulateImpact(flows, [], withoutInternet).breaking.map(f => f.id)).toEqual(['net'])
+  })
+
   it('flags a flow as breaking when an isolate draft would newly block it', () => {
     const flows = [flow({})]
     const realPolicies: NetworkPolicyInfo[] = []
