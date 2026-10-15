@@ -16,6 +16,11 @@ function initDb(): DbType {
   const db = new Database(DB_PATH)
   fs.chmodSync(DB_PATH, 0o600)
   db.pragma('journal_mode = WAL')
+  // Em WAL, NORMAL só faz fsync no checkpoint, não em cada commit: o banco
+  // continua íntegro numa queda de energia, perdendo no máximo as últimas
+  // transações. Pra um cache de flows e config isso é aceitável, e cada
+  // commit deixa de esperar o disco.
+  db.pragma('synchronous = NORMAL')
   db.pragma('foreign_keys = ON')
   db.pragma('busy_timeout = 5000')
 
@@ -221,7 +226,9 @@ function initDb(): DbType {
 
     CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
     CREATE INDEX IF NOT EXISTS idx_approval_votes_request_id ON approval_votes(request_id);
-    CREATE INDEX IF NOT EXISTS idx_discovered_flows_flow_count ON discovered_flows(flow_count);
+    -- flow_count não é usado em nenhum WHERE/ORDER BY e muda a cada conexão
+    -- nova: o índice só custava escrita.
+    DROP INDEX IF EXISTS idx_discovered_flows_flow_count;
     -- last_seen: runRetentionCleanup()'s DELETE ... WHERE last_seen < ?
     -- first_seen: getDiscoveredFlows()/getDraftModeFlows()'s ORDER BY first_seen DESC
     CREATE INDEX IF NOT EXISTS idx_discovered_flows_last_seen ON discovered_flows(last_seen);

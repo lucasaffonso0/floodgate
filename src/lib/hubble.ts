@@ -73,8 +73,10 @@ function extractPort(l4: any): { port: number; protocol: 'TCP' | 'UDP' } | null 
 }
 
 // ─── Cache de ports dos K8s Services (filtra portas efêmeras vs. portas reais) ──
-// key: "namespace::serviceName" → Set de target_ports declarados no Service
-let _svcPortCache = new Map<string, Set<number>>()
+// namespace → (serviceName → Set de target_ports declarados no Service).
+// Indexado por namespace pra que o prefix match abaixo só percorra os
+// Services da namespace do destino, não os do cluster inteiro.
+let _svcPortCache = new Map<string, Map<string, Set<number>>>()
 let _svcPortCacheAt = 0
 let _svcPortCacheRefreshing = false
 
@@ -83,13 +85,15 @@ async function refreshSvcPortCache(): Promise<void> {
   _svcPortCacheRefreshing = true
   try {
     const services = await listServices()
-    const cache = new Map<string, Set<number>>()
+    const cache = new Map<string, Map<string, Set<number>>>()
     for (const svc of services) {
-      const key = `${svc.namespace}::${svc.name}`
-      if (!cache.has(key)) cache.set(key, new Set())
+      let byName = cache.get(svc.namespace)
+      if (!byName) { byName = new Map(); cache.set(svc.namespace, byName) }
+      let ports = byName.get(svc.name)
+      if (!ports) { ports = new Set(); byName.set(svc.name, ports) }
       for (const p of svc.ports) {
-        cache.get(key)!.add(p.port)
-        if (p.target_port) cache.get(key)!.add(p.target_port)
+        ports.add(p.port)
+        if (p.target_port) ports.add(p.target_port)
       }
     }
     _svcPortCache = cache
@@ -99,12 +103,11 @@ async function refreshSvcPortCache(): Promise<void> {
 }
 
 function isKnownServicePort(namespace: string, workload: string, port: number): boolean {
-  const directKey = `${namespace}::${workload}`
-  if (_svcPortCache.get(directKey)?.has(port)) return true
+  const byName = _svcPortCache.get(namespace)
+  if (!byName) return false
+  if (byName.get(workload)?.has(port)) return true
   // Prefix match: workload pode ser nome de pod como "haproxy-abc12-xyz99", service é "haproxy"
-  for (const [k, ports] of _svcPortCache) {
-    if (!k.startsWith(`${namespace}::`)) continue
-    const svcName = k.slice(namespace.length + 2)
+  for (const [svcName, ports] of byName) {
     if (workload.startsWith(svcName + '-') || workload.startsWith(svcName + '_')) {
       if (ports.has(port)) return true
     }
@@ -157,12 +160,154 @@ function isNewConnection(id: string, srcPort: number): boolean {
   const key = `${id}:${srcPort}`
   if (_connDedup.has(key)) return false
   _connDedup.set(key, Date.now())
-  // Limpeza periódica para não crescer indefinidamente
-  if (_connDedup.size > 20_000) {
-    const cutoff = Date.now() - CONN_TTL_MS
-    for (const [k, ts] of _connDedup) { if (ts < cutoff) _connDedup.delete(k) }
-  }
   return true
+}
+
+// Varrido por timer (ver startFlowWriter), não a cada conexão nova: com o
+// mapa acima do limite, a varredura antiga rodava inteira em cada flow novo.
+function sweepConnDedup(): void {
+  const cutoff = Date.now() - CONN_TTL_MS
+  for (const [k, ts] of _connDedup) { if (ts < cutoff) _connDedup.delete(k) }
+}
+
+// ─── Escrita em lote ──────────────────────────────────────────────────────
+// Cada evento do Hubble era um INSERT/UPDATE próprio (com fsync no commit).
+// Agora os eventos se acumulam em memória, um item por linha (tabela + id),
+// e vão pro banco numa única transação a cada FLUSH_INTERVAL_MS. A semântica
+// por linha é a mesma de antes: flow_count soma só conexões novas, o
+// veredito e o last_seen são os do último evento, has_policy é o calculado
+// na primeira conexão nova, e uma linha que só recebeu repetições é apenas
+// atualizada (nunca criada).
+type FlowTable = 'discovered_flows' | 'ignored_flows'
+type PendingFlow = {
+  table: FlowTable
+  id: string
+  src_workload: string; src_namespace: string; dst_workload: string; dst_namespace: string
+  dst_port: number; protocol: string
+  verdict: string
+  first_seen: string
+  last_seen: string
+  new_conns: number
+  has_policy: number
+}
+
+const FLUSH_INTERVAL_MS = 1_000
+const MAX_PENDING_FLOWS = 5_000      // flush antecipado se um pico encher o buffer
+const DEDUP_SWEEP_INTERVAL_MS = 30_000
+
+// No global, não no módulo: o Next empacota cada rota separado, e
+// clearDiscoveredFlows()/snapshotFlowsForDraftMode() chamados de uma rota
+// precisam ver o mesmo buffer que o stream (iniciado pelo scheduler) enche.
+const _flowBuffer = global as typeof global & { _hubblePendingFlows?: Map<string, PendingFlow> }
+const _pendingFlows = (_flowBuffer._hubblePendingFlows ??= new Map<string, PendingFlow>())
+
+type FlowStatements = { upsert: Record<FlowTable, ReturnType<ReturnType<typeof getDb>['prepare']>>; update: Record<FlowTable, ReturnType<ReturnType<typeof getDb>['prepare']>> }
+let _flowStatements: { db: ReturnType<typeof getDb>; stmts: FlowStatements } | null = null
+
+function flowStatements(): FlowStatements {
+  const db = getDb()
+  if (_flowStatements?.db === db) return _flowStatements.stmts
+  const upsert = (table: FlowTable) => db.prepare(`
+    INSERT INTO ${table} (id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port, protocol, verdict, flow_count, has_policy, first_seen, last_seen)
+    VALUES (@id, @src_workload, @src_namespace, @dst_workload, @dst_namespace, @dst_port, @protocol, @verdict, @new_conns, @has_policy, @first_seen, @last_seen)
+    ON CONFLICT(id) DO UPDATE SET
+      flow_count = ${table}.flow_count + excluded.flow_count,
+      verdict = excluded.verdict,
+      last_seen = excluded.last_seen
+  `)
+  const update = (table: FlowTable) => db.prepare(`UPDATE ${table} SET verdict = @verdict, last_seen = @last_seen WHERE id = @id`)
+  const stmts = {
+    upsert: { discovered_flows: upsert('discovered_flows'), ignored_flows: upsert('ignored_flows') },
+    update: { discovered_flows: update('discovered_flows'), ignored_flows: update('ignored_flows') },
+  }
+  _flowStatements = { db, stmts }
+  return stmts
+}
+
+function queueFlowWrite(row: Omit<PendingFlow, 'first_seen' | 'new_conns' | 'has_policy'>, isNew: boolean, hasPolicy: () => boolean): void {
+  const key = `${row.table}:${row.id}`
+  const pending = _pendingFlows.get(key)
+  if (pending) {
+    pending.verdict = row.verdict
+    pending.last_seen = row.last_seen
+    if (isNew) {
+      if (pending.new_conns === 0) pending.has_policy = hasPolicy() ? 1 : 0
+      pending.new_conns++
+    }
+  } else {
+    _pendingFlows.set(key, { ...row, first_seen: row.last_seen, new_conns: isNew ? 1 : 0, has_policy: isNew && hasPolicy() ? 1 : 0 })
+  }
+  if (_pendingFlows.size >= MAX_PENDING_FLOWS) flushFlowWrites()
+}
+
+// Grava tudo o que está pendente numa transação. Chamado pelo timer, antes
+// de qualquer leitura/escrita que precise do estado completo (snapshot do
+// Modo Rascunho, migração de ignorados) e ao parar o stream/processo.
+export function flushFlowWrites(): void {
+  if (_pendingFlows.size === 0) return
+  const batch = [..._pendingFlows.values()]
+  _pendingFlows.clear()
+  let touchedDiscovered = false
+  try {
+    const { upsert, update } = flowStatements()
+    getDb().transaction(() => {
+      for (const f of batch) {
+        if (f.new_conns > 0) {
+          perfCount('hubble.db_upsert')
+          upsert[f.table].run(f)
+        } else {
+          perfCount('hubble.db_update')
+          update[f.table].run({ id: f.id, verdict: f.verdict, last_seen: f.last_seen })
+        }
+        if (f.table === 'discovered_flows') touchedDiscovered = true
+      }
+    })()
+    perfCount('hubble.flush_batches')
+  } catch (e) {
+    console.error('[hubble] DB write error:', e)
+    return
+  }
+
+  // Emit SSE no máximo a cada 3s para não sobrecarregar o frontend, só
+  // pros visíveis (discovered_flows); flows de namespace ignorada não têm
+  // nada pra atualizar na tela agora mesmo.
+  if (touchedDiscovered) {
+    const lastEmit = g._hubbleLastSseEmit ?? 0
+    if (Date.now() - lastEmit > 3000) {
+      g._hubbleLastSseEmit = Date.now()
+      emit({ type: 'hubble_flow_new' })
+    }
+  }
+}
+
+function startFlowWriter(): void {
+  if (g._hubbleFlushTimer) return
+  let lastSweep = Date.now()
+  g._hubbleFlushTimer = setInterval(() => {
+    flushFlowWrites()
+    if (Date.now() - lastSweep >= DEDUP_SWEEP_INTERVAL_MS) {
+      lastSweep = Date.now()
+      sweepConnDedup()
+    }
+  }, FLUSH_INTERVAL_MS)
+  g._hubbleFlushTimer.unref?.()
+  if (!g._hubbleExitHooked) {
+    g._hubbleExitHooked = true
+    // Grava o último segundo pendente quando o pod recebe SIGTERM. Se não
+    // houver outro handler pro sinal (o Next registra o dele), re-emite
+    // pra manter o comportamento padrão de encerrar o processo.
+    for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+      process.once(sig, () => {
+        flushFlowWrites()
+        if (process.listenerCount(sig) === 0) process.kill(process.pid, sig)
+      })
+    }
+  }
+}
+
+function stopFlowWriter(): void {
+  if (g._hubbleFlushTimer) { clearInterval(g._hubbleFlushTimer); g._hubbleFlushTimer = undefined }
+  flushFlowWrites()
 }
 
 // ─── Global streaming state ────────────────────────────────────────────────
@@ -172,6 +317,8 @@ const g = global as typeof global & {
   _hubbleStreaming?: boolean
   _hubbleRetryTimer?: ReturnType<typeof setTimeout>
   _hubbleLastSseEmit?: number
+  _hubbleFlushTimer?: ReturnType<typeof setInterval>
+  _hubbleExitHooked?: boolean
 }
 
 export function isHubbleStreaming(): boolean {
@@ -248,39 +395,14 @@ function processFlow(msg: unknown): void {
   const srcPort: number = Number((flow.l4 as any)?.TCP?.source_port ?? (flow.l4 as any)?.UDP?.source_port ?? 0)
   const isNew = isNewConnection(id, srcPort)
 
-  try {
-    if (isNew) {
-      perfCount('hubble.db_upsert')
-      const hasPolicy = flowHasPolicy(
-        { src_workload: src.workload, src_namespace: src.namespace, dst_workload: dstWorkload, dst_namespace: dst.namespace, dst_port: portInfo.port },
-        _policyCache,
-      )
-      getDb().prepare(`
-        INSERT INTO ${table} (id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port, protocol, verdict, flow_count, has_policy, first_seen, last_seen)
-        VALUES (@id, @src_workload, @src_namespace, @dst_workload, @dst_namespace, @dst_port, @protocol, @verdict, 1, @has_policy, @now, @now)
-        ON CONFLICT(id) DO UPDATE SET
-          flow_count = ${table}.flow_count + 1,
-          verdict = excluded.verdict,
-          last_seen = excluded.last_seen
-      `).run({ id, src_workload: src.workload, src_namespace: src.namespace, dst_workload: dstWorkload, dst_namespace: dst.namespace, dst_port: portInfo.port, protocol: portInfo.protocol, verdict, has_policy: hasPolicy ? 1 : 0, now })
-    } else {
-      perfCount('hubble.db_update')
-      getDb().prepare(`UPDATE ${table} SET verdict = ?, last_seen = ? WHERE id = ?`).run(verdict, now, id)
-    }
-
-    // Emit SSE no máximo a cada 3s para não sobrecarregar o frontend, só
-    // pros visíveis (discovered_flows); flows de namespace ignorada não têm
-    // nada pra atualizar na tela agora mesmo.
-    if (table === 'discovered_flows') {
-      const lastEmit = g._hubbleLastSseEmit ?? 0
-      if (Date.now() - lastEmit > 3000) {
-        g._hubbleLastSseEmit = Date.now()
-        emit({ type: 'hubble_flow_new' })
-      }
-    }
-  } catch (e) {
-    console.error('[hubble] DB write error:', e)
-  }
+  queueFlowWrite(
+    { table, id, src_workload: src.workload, src_namespace: src.namespace, dst_workload: dstWorkload, dst_namespace: dst.namespace, dst_port: portInfo.port, protocol: portInfo.protocol, verdict, last_seen: now },
+    isNew,
+    () => flowHasPolicy(
+      { src_workload: src.workload, src_namespace: src.namespace, dst_workload: dstWorkload, dst_namespace: dst.namespace, dst_port: portInfo.port },
+      _policyCache,
+    ),
+  )
 }
 
 // ─── Start / stop stream ───────────────────────────────────────────────────
@@ -292,6 +414,7 @@ export function startHubbleStream(): void {
   g._hubbleStreaming = true
   refreshSvcPortCache()  // popula cache de ports antes dos primeiros flows
   refreshPolicyCache()   // popula cache de policies antes dos primeiros flows
+  startFlowWriter()
 
   try {
     const client = loadClient()
@@ -303,6 +426,7 @@ export function startHubbleStream(): void {
 
     stream.on('error', (err: Error) => {
       console.error('[hubble] stream error:', err.message)
+      stopFlowWriter()
       g._hubbleStreaming = false
       g._hubbleStream = undefined
       g._hubbleClient?.close()
@@ -317,6 +441,7 @@ export function startHubbleStream(): void {
 
     stream.on('end', () => {
       console.log('[hubble] stream ended')
+      stopFlowWriter()
       g._hubbleStreaming = false
       g._hubbleStream = undefined
       g._hubbleClient?.close()
@@ -331,6 +456,7 @@ export function startHubbleStream(): void {
 export function stopHubbleStream(): void {
   if (g._hubbleRetryTimer) { clearTimeout(g._hubbleRetryTimer); g._hubbleRetryTimer = undefined }
   g._hubbleStream?.destroy()
+  stopFlowWriter()
   g._hubbleClient?.close()
   g._hubbleStream = undefined
   g._hubbleClient = undefined
@@ -545,6 +671,7 @@ export function runRetentionCleanup(): void {
 // ignored_namespaces perde alguma entrada) ─────────────────────────────────
 export function migrateUnignoredFlows(newIgnoredNamespaces: string[]): void {
   try {
+    flushFlowWrites()
     const db = getDb()
     const rows = db.prepare('SELECT * FROM ignored_flows').all() as DiscoveredFlowRow[]
     if (rows.length === 0) return
@@ -630,6 +757,9 @@ export function getDiscoveredFlows(): CiliumFlowSummary[] {
 }
 
 export function clearDiscoveredFlows(): void {
+  // Descarta o que ainda não foi gravado: senão o próximo flush recriaria
+  // as linhas que o usuário acabou de limpar.
+  _pendingFlows.clear()
   const db = getDb()
   db.prepare('DELETE FROM discovered_flows').run()
   db.prepare('DELETE FROM ignored_flows').run()
@@ -640,6 +770,7 @@ export function clearDiscoveredFlows(): void {
 // on: the fixed baseline drafts are compared against. Never written back
 // into discovered_flows: live Hubble ingestion keeps running untouched.
 export function snapshotFlowsForDraftMode(): void {
+  flushFlowWrites()
   const db = getDb()
   db.exec('DELETE FROM draft_mode_flows')
   db.exec('INSERT INTO draft_mode_flows SELECT * FROM discovered_flows')
