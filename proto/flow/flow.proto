@@ -66,3 +66,14 @@ message UDP {
   uint32 source_port = 1;
   uint32 destination_port = 2;
 }
+
+// Server-side filter for GetFlowsRequest.whitelist: only the two fields
+// floodgate uses. Both field numbers confirmed live against a real Hubble
+// Relay (kind-pop-os, 2026-10-15): verdict [DROPPED] returned only DROPPED
+// flows, and reply [true] returned only reply flows (all FORWARDED, none
+// DROPPED), reply [false] everything else. Within one filter the fields are
+// ANDed; values inside a repeated field are ORed.
+message FlowFilter {
+  repeated Verdict verdict = 5;
+  repeated bool reply = 15;
+}

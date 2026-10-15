@@ -13,6 +13,11 @@ service Observer {
 message GetFlowsRequest {
   uint64 number = 1;
   bool follow = 3;
+  // Field 6 confirmed live against a real Hubble Relay (kind-pop-os,
+  // 2026-10-15): a whitelist of verdict DROPPED returned only DROPPED flows.
+  // Field 4 is NOT the whitelist: tried first, the relay silently ignored it
+  // and streamed everything.
+  repeated flow.FlowFilter whitelist = 6;
   google.protobuf.Timestamp since = 7;
   google.protobuf.Timestamp until = 8;
 }

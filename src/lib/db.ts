@@ -184,7 +184,8 @@ function initDb(): DbType {
       flow_count   INTEGER NOT NULL DEFAULT 1,
       has_policy   INTEGER NOT NULL DEFAULT 0,
       first_seen   TEXT NOT NULL,
-      last_seen    TEXT NOT NULL
+      last_seen    TEXT NOT NULL,
+      rev          INTEGER NOT NULL DEFAULT 0
     );
 
     -- Snapshot of discovered_flows taken when Modo Rascunho is activated:
@@ -202,7 +203,8 @@ function initDb(): DbType {
       flow_count   INTEGER NOT NULL DEFAULT 1,
       has_policy   INTEGER NOT NULL DEFAULT 0,
       first_seen   TEXT NOT NULL,
-      last_seen    TEXT NOT NULL
+      last_seen    TEXT NOT NULL,
+      rev          INTEGER NOT NULL DEFAULT 0
     );
 
     -- Flows capturados de/para uma namespace que está em "Ignoradas",
@@ -221,7 +223,8 @@ function initDb(): DbType {
       flow_count   INTEGER NOT NULL DEFAULT 1,
       has_policy   INTEGER NOT NULL DEFAULT 0,
       first_seen   TEXT NOT NULL,
-      last_seen    TEXT NOT NULL
+      last_seen    TEXT NOT NULL,
+      rev          INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
@@ -235,6 +238,28 @@ function initDb(): DbType {
     CREATE INDEX IF NOT EXISTS idx_discovered_flows_first_seen ON discovered_flows(first_seen);
     CREATE INDEX IF NOT EXISTS idx_ignored_flows_last_seen ON ignored_flows(last_seen);
     CREATE INDEX IF NOT EXISTS idx_ignored_flows_first_seen ON ignored_flows(first_seen);
+  `)
+
+  // ── Migration: rev on the flow tables ─────────────────────────────────────
+  // Per-row change counter (hubble.ts nextFlowRev): lets a client ask for
+  // only the rows changed since the copy it already holds. Added to all
+  // three tables because draft_mode_flows/ignored_flows are filled with
+  // SELECT * from discovered_flows and must keep the same column order.
+  for (const table of ['discovered_flows', 'draft_mode_flows', 'ignored_flows']) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'rev')) db.exec(`ALTER TABLE ${table} ADD COLUMN rev INTEGER NOT NULL DEFAULT 0`)
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_discovered_flows_rev ON discovered_flows(rev)')
+  // Rows removed from discovered_flows by retention or the row cap, kept
+  // briefly so a delta can tell clients to drop them (see hubble.ts
+  // deleteDiscoveredFlowsInChunks). Pruned after an hour.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS discovered_flows_deleted (
+      id         TEXT NOT NULL,
+      rev        INTEGER NOT NULL,
+      deleted_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_discovered_flows_deleted_rev ON discovered_flows_deleted(rev);
   `)
 
   // ── Seed default admin user ────────────────────────────────────────────────

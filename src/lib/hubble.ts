@@ -29,6 +29,52 @@ const HUBBLE_ADDR = process.env.HUBBLE_RELAY_ADDR ?? 'hubble-relay.kube-system.s
 // too low, not doing its job.
 const MAX_FLOW_ROWS = 50_000
 
+// ─── Revisões (o que mudou desde a cópia do cliente) ──────────────────────
+// Every write to a discovered_flows row stamps it with a rev higher than any
+// before it, so "rows with rev > N" is exactly what changed since a client
+// saw rev N. Rows removed by retention or the row cap leave a tombstone
+// (discovered_flows_deleted) with its own rev, so a delta also lists what
+// to drop. Tombstones are pruned after an hour; a client older than that,
+// and any delete without tombstones (clearing everything, the one-time
+// normalization) start a new generation instead, and a client holding an
+// older generation gets the full list again. The generation is random per
+// process (on global: shared by every route bundle), so a restart also
+// forces a full reload instead of trusting a counter from before it.
+const _flowGen = global as typeof global & { _hubbleFlowGeneration?: string; _hubbleTombstoneFloor?: number }
+function flowGeneration(): string {
+  return (_flowGen._hubbleFlowGeneration ??= Math.random().toString(36).slice(2, 10))
+}
+function bumpFlowGeneration(): void {
+  _flowGen._hubbleFlowGeneration = Math.random().toString(36).slice(2, 10)
+}
+// Highest rev ever handed out, live rows and tombstones alike: taking it
+// from live rows alone would reuse a rev after its row got deleted.
+function maxFlowRev(): number {
+  const r = getDb().prepare('SELECT MAX(m) AS m FROM (SELECT MAX(rev) AS m FROM discovered_flows UNION ALL SELECT MAX(rev) FROM discovered_flows_deleted)').get() as { m: number | null }
+  return r.m ?? 0
+}
+function nextFlowRev(): number {
+  return maxFlowRev() + 1
+}
+// Tombstones are kept for an hour, and at most MAX_TOMBSTONES of them (heavy
+// churn past the row cap can delete tens of thousands of rows a minute).
+// Whatever gets pruned raises the floor: a client whose version is older
+// than the floor can no longer get a correct delta and gets the full list.
+const TOMBSTONE_TTL_MS = 3_600_000
+const MAX_TOMBSTONES = 100_000
+export function pruneTombstones(): void {
+  const db = getDb()
+  const cutoff = new Date(Date.now() - TOMBSTONE_TTL_MS).toISOString()
+  const byAge = (db.prepare('SELECT MAX(rev) AS m FROM discovered_flows_deleted WHERE deleted_at < ?').get(cutoff) as { m: number | null }).m
+  const byCount = (db.prepare('SELECT rev AS m FROM discovered_flows_deleted ORDER BY rev DESC LIMIT 1 OFFSET ?').get(MAX_TOMBSTONES) as { m: number } | undefined)?.m ?? null
+  const upTo = Math.max(byAge ?? -1, byCount ?? -1)
+  if (upTo < 0) return
+  // Keep the newest tombstone even if pruned by age: it may hold the
+  // highest rev handed out (see maxFlowRev).
+  db.prepare('DELETE FROM discovered_flows_deleted WHERE rev <= ? AND rev < (SELECT MAX(rev) FROM discovered_flows_deleted)').run(upTo)
+  _flowGen._hubbleTombstoneFloor = Math.max(_flowGen._hubbleTombstoneFloor ?? 0, upTo)
+}
+
 type ObserverClient = grpc.Client & {
   GetFlows: (req: unknown, meta: grpc.Metadata) => grpc.ClientReadableStream<unknown>
 }
@@ -208,14 +254,15 @@ function flowStatements(): FlowStatements {
   const db = getDb()
   if (_flowStatements?.db === db) return _flowStatements.stmts
   const upsert = (table: FlowTable) => db.prepare(`
-    INSERT INTO ${table} (id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port, protocol, verdict, flow_count, has_policy, first_seen, last_seen)
-    VALUES (@id, @src_workload, @src_namespace, @dst_workload, @dst_namespace, @dst_port, @protocol, @verdict, @new_conns, @has_policy, @first_seen, @last_seen)
+    INSERT INTO ${table} (id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port, protocol, verdict, flow_count, has_policy, first_seen, last_seen, rev)
+    VALUES (@id, @src_workload, @src_namespace, @dst_workload, @dst_namespace, @dst_port, @protocol, @verdict, @new_conns, @has_policy, @first_seen, @last_seen, @rev)
     ON CONFLICT(id) DO UPDATE SET
       flow_count = ${table}.flow_count + excluded.flow_count,
       verdict = excluded.verdict,
-      last_seen = excluded.last_seen
+      last_seen = excluded.last_seen,
+      rev = excluded.rev
   `)
-  const update = (table: FlowTable) => db.prepare(`UPDATE ${table} SET verdict = @verdict, last_seen = @last_seen WHERE id = @id`)
+  const update = (table: FlowTable) => db.prepare(`UPDATE ${table} SET verdict = @verdict, last_seen = @last_seen, rev = @rev WHERE id = @id`)
   const stmts = {
     upsert: { discovered_flows: upsert('discovered_flows'), ignored_flows: upsert('ignored_flows') },
     update: { discovered_flows: update('discovered_flows'), ignored_flows: update('ignored_flows') },
@@ -251,13 +298,14 @@ export function flushFlowWrites(): void {
   try {
     const { upsert, update } = flowStatements()
     getDb().transaction(() => {
+      const rev = nextFlowRev()
       for (const f of batch) {
         if (f.new_conns > 0) {
           perfCount('hubble.db_upsert')
-          upsert[f.table].run(f)
+          upsert[f.table].run({ ...f, rev })
         } else {
           perfCount('hubble.db_update')
-          update[f.table].run({ id: f.id, verdict: f.verdict, last_seen: f.last_seen })
+          update[f.table].run({ id: f.id, verdict: f.verdict, last_seen: f.last_seen, rev })
         }
         if (f.table === 'discovered_flows') touchedDiscovered = true
       }
@@ -275,7 +323,7 @@ export function flushFlowWrites(): void {
     const lastEmit = g._hubbleLastSseEmit ?? 0
     if (Date.now() - lastEmit > 3000) {
       g._hubbleLastSseEmit = Date.now()
-      emit({ type: 'hubble_flow_new' })
+      emit({ type: 'hubble_flow_new', version: getDiscoveredFlowsSummary().version })
     }
   }
 }
@@ -419,7 +467,14 @@ export function startHubbleStream(): void {
   try {
     const client = loadClient()
     g._hubbleClient = client
-    const stream = client.GetFlows({ number: '0', follow: true }, new grpc.Metadata())
+    // Filtered at the relay: only the verdicts processFlow() keeps, and no
+    // reply packets (the server-to-client half of every connection, which
+    // processFlow() never wanted either). Roughly halves what the relay
+    // sends and this process decodes.
+    const stream = client.GetFlows({
+      number: '0', follow: true,
+      whitelist: [{ verdict: ['FORWARDED', 'DROPPED', 'AUDIT'], reply: [false] }],
+    }, new grpc.Metadata())
     g._hubbleStream = stream
 
     stream.on('data', processFlow)
@@ -499,9 +554,10 @@ async function reclassifyFlowPolicies(table: 'discovered_flows' | 'ignored_flows
   }
   perfCount('hubble.reclassify_evaluations', memo.size)
   perfCount('hubble.reclassify_writes', changes.length)
-  const updateStmt = db.prepare(`UPDATE ${table} SET has_policy = ? WHERE id = ?`)
+  const updateStmt = db.prepare(`UPDATE ${table} SET has_policy = ?, rev = ? WHERE id = ?`)
   const writeChunk = db.transaction((chunk: Array<[number, string]>) => {
-    for (const [value, id] of chunk) updateStmt.run(value, id)
+    const rev = nextFlowRev()
+    for (const [value, id] of chunk) updateStmt.run(value, rev, id)
   })
   for (let i = 0; i < changes.length; i += RECLASSIFY_WRITE_CHUNK) {
     writeChunk(changes.slice(i, i + RECLASSIFY_WRITE_CHUNK))
@@ -629,6 +685,7 @@ function normalizeFlowTable(table: 'discovered_flows' | 'ignored_flows'): void {
     del.run()
     for (const m of merged.values()) ins.run(m)
   })()
+  if (table === 'discovered_flows') bumpFlowGeneration()
 }
 
 // extractEndpoint() (above) always normalizes a workload before it's ever
@@ -653,17 +710,70 @@ export function normalizeStoredFlows(): void {
 // distinct external IP is a permanent row (no service-identity collapsing
 // like in-cluster traffic has), so this is the main source of unbounded
 // row growth: see hubble_internet_flow_retention_days in AppConfig.
-export function runRetentionCleanup(): void {
+const RETENTION_DELETE_CHUNK = 5_000
+
+// Deletes in chunks with a yield to the event loop between them: a first
+// cleanup over a large backlog (or a retention setting just shortened) used
+// to be a single DELETE holding the server for as long as it took.
+async function deleteInChunks(table: FlowTable, where: string, ...params: unknown[]): Promise<number> {
+  const db = getDb()
+  const select = db.prepare(`SELECT rowid AS r, id FROM ${table} WHERE ${where} LIMIT ${RETENTION_DELETE_CHUNK}`)
+  const del = db.prepare(`DELETE FROM ${table} WHERE rowid = ?`)
+  const tomb = db.prepare('INSERT INTO discovered_flows_deleted (id, rev, deleted_at) VALUES (?, ?, ?)')
+  // discovered_flows leaves a tombstone per row, in the same transaction,
+  // so clients get the removal as part of their next delta.
+  const chunk = db.transaction(() => {
+    const rows = select.all(...params) as Array<{ r: number; id: string }>
+    if (rows.length === 0) return 0
+    const rev = table === 'discovered_flows' ? nextFlowRev() : 0
+    const now = new Date().toISOString()
+    for (const row of rows) {
+      del.run(row.r)
+      if (table === 'discovered_flows') tomb.run(row.id, rev, now)
+    }
+    return rows.length
+  })
+  let total = 0
+  for (;;) {
+    const n = chunk() as number
+    total += n
+    if (n < RETENTION_DELETE_CHUNK) return total
+    await new Promise(res => setImmediate(res))
+  }
+}
+
+// Keeps a flow table at MAX_FLOW_ROWS rows, dropping the ones seen longest
+// ago. For discovered_flows this is also what keeps deltas usable: rows
+// past the cap would otherwise drop out of the capped list without being
+// deleted, which a "changed since" query can't express, so every client
+// would be stuck re-downloading the full list. Logged, since hitting it
+// means retention alone isn't keeping up.
+export async function capFlowTable(table: FlowTable): Promise<void> {
+  const count = (getDb().prepare(`SELECT COUNT(*) AS c FROM ${table}`).get() as { c: number }).c
+  if (count <= MAX_FLOW_ROWS) return
+  const cutoff = getDb().prepare(`SELECT last_seen FROM ${table} ORDER BY last_seen DESC LIMIT 1 OFFSET ?`).get(MAX_FLOW_ROWS) as { last_seen: string } | undefined
+  if (!cutoff) return
+  const deleted = await deleteInChunks(table, 'last_seen <= ?', cutoff.last_seen)
+  console.warn(`[hubble] ${table} passou de ${MAX_FLOW_ROWS} linhas: ${deleted} vistas há mais tempo removidas`)
+}
+
+export async function runRetentionCleanup(): Promise<void> {
   try {
     const cfg = getConfig()
     const staleDate = new Date(Date.now() - (cfg.hubble_flow_retention_days ?? 7) * 86400 * 1000).toISOString()
     const staleInternetDate = new Date(Date.now() - (cfg.hubble_internet_flow_retention_days ?? 1) * 86400 * 1000).toISOString()
-    const db = getDb()
     for (const table of ['discovered_flows', 'ignored_flows'] as const) {
-      db.prepare(`DELETE FROM ${table} WHERE dst_namespace != 'internet' AND last_seen < ?`).run(staleDate)
-      db.prepare(`DELETE FROM ${table} WHERE dst_namespace = 'internet' AND last_seen < ?`).run(staleInternetDate)
+      const deleted =
+        await deleteInChunks(table, "dst_namespace != 'internet' AND last_seen < ?", staleDate) +
+        await deleteInChunks(table, "dst_namespace = 'internet' AND last_seen < ?", staleInternetDate)
+      void deleted
     }
-  } catch { /* non-critical */ }
+    pruneTombstones()
+    await capFlowTable('ignored_flows')
+    await capFlowTable('discovered_flows')
+  } catch (e) {
+    console.error('[hubble] limpeza de retenção falhou:', e)
+  }
 }
 
 // ─── Migra de volta pra discovered_flows os flows de uma namespace que
@@ -673,33 +783,30 @@ export function migrateUnignoredFlows(newIgnoredNamespaces: string[]): void {
   try {
     flushFlowWrites()
     const db = getDb()
-    const rows = db.prepare('SELECT * FROM ignored_flows').all() as DiscoveredFlowRow[]
-    if (rows.length === 0) return
-
-    const stillIgnored = new Set(newIgnoredNamespaces)
     // Só migra quem não tem NENHUM dos dois lados ainda ignorado: um flow
     // entre duas namespaces ignoradas continua escondido até as duas saírem
-    // da lista.
-    const toMigrate = rows.filter(r => !stillIgnored.has(r.src_namespace) && !stillIgnored.has(r.dst_namespace))
-    if (toMigrate.length === 0) return
-
-    const upsert = db.prepare(`
-      INSERT INTO discovered_flows (id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port, protocol, verdict, flow_count, has_policy, first_seen, last_seen)
-      VALUES (@id, @src_workload, @src_namespace, @dst_workload, @dst_namespace, @dst_port, @protocol, @verdict, @flow_count, @has_policy, @first_seen, @last_seen)
-      ON CONFLICT(id) DO UPDATE SET
-        flow_count = discovered_flows.flow_count + excluded.flow_count,
-        verdict = excluded.verdict,
-        last_seen = CASE WHEN excluded.last_seen > discovered_flows.last_seen THEN excluded.last_seen ELSE discovered_flows.last_seen END,
-        first_seen = CASE WHEN excluded.first_seen < discovered_flows.first_seen THEN excluded.first_seen ELSE discovered_flows.first_seen END
-    `)
-    const del = db.prepare('DELETE FROM ignored_flows WHERE id = ?')
+    // da lista. Feito inteiro em SQL (INSERT ... SELECT), sem carregar a
+    // tabela na memória.
+    const stillIgnored = JSON.stringify(newIgnoredNamespaces)
+    const movable = `src_namespace NOT IN (SELECT value FROM json_each(@ignored)) AND dst_namespace NOT IN (SELECT value FROM json_each(@ignored))`
     db.transaction(() => {
-      for (const r of toMigrate) {
-        upsert.run(r)
-        del.run(r.id)
-      }
+      const rev = nextFlowRev()
+      const moved = db.prepare(`
+        INSERT INTO discovered_flows (id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port, protocol, verdict, flow_count, has_policy, first_seen, last_seen, rev)
+        SELECT id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port, protocol, verdict, flow_count, has_policy, first_seen, last_seen, @rev
+        FROM ignored_flows WHERE ${movable}
+        ON CONFLICT(id) DO UPDATE SET
+          flow_count = discovered_flows.flow_count + excluded.flow_count,
+          verdict = excluded.verdict,
+          rev = excluded.rev,
+          last_seen = CASE WHEN excluded.last_seen > discovered_flows.last_seen THEN excluded.last_seen ELSE discovered_flows.last_seen END,
+          first_seen = CASE WHEN excluded.first_seen < discovered_flows.first_seen THEN excluded.first_seen ELSE discovered_flows.first_seen END
+      `).run({ ignored: stillIgnored, rev }).changes
+      if (moved > 0) db.prepare(`DELETE FROM ignored_flows WHERE ${movable}`).run({ ignored: stillIgnored })
     })()
-  } catch { /* non-critical */ }
+  } catch (e) {
+    console.error('[hubble] migração de flows des-ignorados falhou:', e)
+  }
 }
 
 // ─── API pública ───────────────────────────────────────────────────────────
@@ -708,18 +815,59 @@ export async function checkHubbleAvailable(): Promise<boolean> {
 }
 
 // Cheap stand-in for "did the flow list change": one aggregate query instead
-// of serializing up to MAX_FLOW_ROWS rows. Every write path moves at least
-// one of these: inserts/deletes (count), traffic seen again (max last_seen,
-// since each update stamps it), new connections (flow_count total) and
-// reclassification (has_policy total). Lets clients skip refetching the
-// full list (and the server skip building it) while nothing changed.
+// of serializing up to MAX_FLOW_ROWS rows. The version is the generation
+// plus the highest rev (see nextFlowRev): every write raises the rev, every
+// delete starts a new generation, so it changes exactly when the list does.
+// It doubles as the token a client passes back to get only what changed
+// (getDiscoveredFlowsSince).
 export function getDiscoveredFlowsSummary(): { version: string; total: number; unprotected_dropped: number } {
   const r = getDb().prepare(`
-    SELECT COUNT(*) AS c, MAX(last_seen) AS m, TOTAL(flow_count) AS f, TOTAL(has_policy) AS h,
-           TOTAL(verdict = 'DROPPED' AND has_policy = 0) AS u
+    SELECT COUNT(*) AS c, TOTAL(verdict = 'DROPPED' AND has_policy = 0) AS u
     FROM discovered_flows
-  `).get() as { c: number; m: string | null; f: number; h: number; u: number }
-  return { version: `${r.c}-${r.m ?? ''}-${r.f}-${r.h}`, total: r.c, unprotected_dropped: r.u }
+  `).get() as { c: number; u: number }
+  return { version: `${flowGeneration()}.${maxFlowRev()}`, total: r.c, unprotected_dropped: r.u }
+}
+
+function toFlowSummary(r: Record<string, unknown>): CiliumFlowSummary {
+  return {
+    id: r.id as string,
+    src_workload: r.src_workload as string,
+    src_namespace: r.src_namespace as string,
+    dst_workload: r.dst_workload as string,
+    dst_namespace: r.dst_namespace as string,
+    dst_port: r.dst_port as number,
+    protocol: r.protocol as 'TCP' | 'UDP',
+    verdict: r.verdict as CiliumFlowSummary['verdict'],
+    flow_count: r.flow_count as number,
+    has_policy: Boolean(r.has_policy),
+    first_seen: r.first_seen as string,
+    last_seen: r.last_seen as string,
+  }
+}
+
+// Only the rows changed since `since` (a version from the summary or a
+// previous call), when that's safe: same generation (nothing deleted since)
+// and the table under MAX_FLOW_ROWS (above it, rows can fall out of the
+// capped list without being deleted). Otherwise the full list, flagged
+// `full` so the client replaces its copy instead of merging into it.
+export function getDiscoveredFlowsSince(since: string | null): { version: string; full: boolean; flows: CiliumFlowSummary[]; removed: string[] } {
+  const summary = getDiscoveredFlowsSummary()
+  const [gen, revStr] = (since ?? '').split('.')
+  const sinceRev = Number(revStr)
+  const deltaSafe = since && gen === flowGeneration() && Number.isInteger(sinceRev)
+    && sinceRev >= (_flowGen._hubbleTombstoneFloor ?? 0) // tombstones it would need are pruned
+    && summary.total <= MAX_FLOW_ROWS
+  if (deltaSafe) {
+    perfCount('flows.read_delta')
+    const db = getDb()
+    const rows = db.prepare('SELECT * FROM discovered_flows WHERE rev > ? ORDER BY first_seen DESC, id').all(sinceRev) as Array<Record<string, unknown>>
+    const live = new Set(rows.map(r => r.id as string))
+    // A row deleted and later seen again is live again: not removed.
+    const removed = (db.prepare('SELECT DISTINCT id FROM discovered_flows_deleted WHERE rev > ?').all(sinceRev) as Array<{ id: string }>)
+      .map(r => r.id).filter(id => !live.has(id))
+    return { version: summary.version, full: false, flows: rows.map(toFlowSummary), removed }
+  }
+  return { version: summary.version, full: true, flows: getDiscoveredFlows(), removed: [] }
 }
 
 export function getDiscoveredFlows(): CiliumFlowSummary[] {
@@ -740,20 +888,7 @@ export function getDiscoveredFlows(): CiliumFlowSummary[] {
       SELECT * FROM discovered_flows ORDER BY last_seen DESC, id LIMIT ?
     ) ORDER BY first_seen DESC, id
   `).all(MAX_FLOW_ROWS) as Array<Record<string, unknown>>
-  return rows.map(r => ({
-    id: r.id as string,
-    src_workload: r.src_workload as string,
-    src_namespace: r.src_namespace as string,
-    dst_workload: r.dst_workload as string,
-    dst_namespace: r.dst_namespace as string,
-    dst_port: r.dst_port as number,
-    protocol: r.protocol as 'TCP' | 'UDP',
-    verdict: r.verdict as CiliumFlowSummary['verdict'],
-    flow_count: r.flow_count as number,
-    has_policy: Boolean(r.has_policy),
-    first_seen: r.first_seen as string,
-    last_seen: r.last_seen as string,
-  }))
+  return rows.map(toFlowSummary)
 }
 
 export function clearDiscoveredFlows(): void {
@@ -763,6 +898,8 @@ export function clearDiscoveredFlows(): void {
   const db = getDb()
   db.prepare('DELETE FROM discovered_flows').run()
   db.prepare('DELETE FROM ignored_flows').run()
+  db.prepare('DELETE FROM discovered_flows_deleted').run()
+  bumpFlowGeneration()
 }
 
 // ── Modo Rascunho ────────────────────────────────────────────────────────
@@ -773,7 +910,9 @@ export function snapshotFlowsForDraftMode(): void {
   flushFlowWrites()
   const db = getDb()
   db.exec('DELETE FROM draft_mode_flows')
-  db.exec('INSERT INTO draft_mode_flows SELECT * FROM discovered_flows')
+  // Same row budget as the live list: only what getDiscoveredFlows() would
+  // show is worth comparing drafts against.
+  db.prepare('INSERT INTO draft_mode_flows SELECT * FROM discovered_flows ORDER BY last_seen DESC LIMIT ?').run(MAX_FLOW_ROWS)
 }
 
 export function getDraftModeFlows(): CiliumFlowSummary[] {
@@ -783,20 +922,7 @@ export function getDraftModeFlows(): CiliumFlowSummary[] {
       SELECT * FROM draft_mode_flows ORDER BY last_seen DESC, id LIMIT ?
     ) ORDER BY first_seen DESC, id
   `).all(MAX_FLOW_ROWS) as Array<Record<string, unknown>>
-  return rows.map(r => ({
-    id: r.id as string,
-    src_workload: r.src_workload as string,
-    src_namespace: r.src_namespace as string,
-    dst_workload: r.dst_workload as string,
-    dst_namespace: r.dst_namespace as string,
-    dst_port: r.dst_port as number,
-    protocol: r.protocol as 'TCP' | 'UDP',
-    verdict: r.verdict as CiliumFlowSummary['verdict'],
-    flow_count: r.flow_count as number,
-    has_policy: Boolean(r.has_policy),
-    first_seen: r.first_seen as string,
-    last_seen: r.last_seen as string,
-  }))
+  return rows.map(toFlowSummary)
 }
 
 export function clearDraftModeFlows(): void {

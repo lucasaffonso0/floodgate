@@ -217,7 +217,15 @@ export interface CiliumFlowSummary {
 export interface CiliumFlowsResponse {
   available: boolean
   streaming: boolean
+  // false: `flows` holds only the rows changed since the `since` version
+  // sent, to merge by id into the copy already held. true: the whole list,
+  // replacing that copy.
+  full: boolean
+  version: string
   flows: CiliumFlowSummary[]
+  // Delta only: ids removed since the `since` version (retention or the row
+  // cap), to drop from the copy held. Absent on a full list.
+  removed?: string[]
 }
 
 // GET /api/cilium/flows/summary: polled every cycle in place of the full

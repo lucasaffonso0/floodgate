@@ -10,11 +10,11 @@ export type SSEEvent =
   | { type: 'policy_deleted' }
   | { type: 'policies_paused' }
   | { type: 'policies_resumed' }
-  | { type: 'hubble_flow_new' }
+  | { type: 'hubble_flow_new'; version: string }
 
 type Writer = (chunk: string) => void
 
-const g = global as typeof global & { _sseWriters?: Set<Writer>; _sseHeartbeat?: ReturnType<typeof setInterval> }
+const g = global as typeof global & { _sseWriters?: Set<Writer>; _sseHeartbeat?: ReturnType<typeof setInterval>; _sseFlushTimer?: ReturnType<typeof setTimeout> }
 if (!g._sseWriters) g._sseWriters = new Set()
 
 // Heartbeat prunes writers whose connections died silently (proxy drops
@@ -37,10 +37,39 @@ export function addWriter(w: Writer)    { ensureHeartbeat(); g._sseWriters!.add(
 export function removeWriter(w: Writer) { g._sseWriters!.delete(w) }
 export function writerCount()           { return g._sseWriters!.size }
 
-export function emit(event: SSEEvent) {
+function broadcast(event: SSEEvent) {
   if (!g._sseWriters || g._sseWriters.size === 0) return
   const chunk = `data: ${JSON.stringify(event)}\n\n`
   for (const w of g._sseWriters) {
     try { w(chunk) } catch { g._sseWriters!.delete(w) }
+  }
+}
+
+// Change notifications are coalesced into one window: a bulk action (apply
+// all drafts, isolate N namespaces, import) emits one event per policy, and
+// every client answers each event with a full refresh. Identical events in
+// the window collapse into one; distinct ones are all still delivered, in
+// order. approval_created goes out immediately: it drives a toast and
+// carries a payload specific to that request.
+const COALESCE_MS = 500
+const pending = (g as typeof g & { _ssePending?: Map<string, SSEEvent> })
+function pendingEvents(): Map<string, SSEEvent> {
+  return (pending._ssePending ??= new Map())
+}
+
+function flushPending() {
+  g._sseFlushTimer = undefined
+  const events = [...pendingEvents().values()]
+  pendingEvents().clear()
+  for (const e of events) broadcast(e)
+}
+
+export function emit(event: SSEEvent) {
+  if (!g._sseWriters || g._sseWriters.size === 0) return
+  if (event.type === 'approval_created') { broadcast(event); return }
+  pendingEvents().set(JSON.stringify(event), event)
+  if (!g._sseFlushTimer) {
+    g._sseFlushTimer = setTimeout(flushPending, COALESCE_MS)
+    g._sseFlushTimer.unref?.()
   }
 }

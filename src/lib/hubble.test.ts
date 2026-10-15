@@ -13,8 +13,10 @@ vi.mock('./db', async () => {
       id TEXT PRIMARY KEY, src_workload TEXT NOT NULL, src_namespace TEXT NOT NULL,
       dst_workload TEXT NOT NULL, dst_namespace TEXT NOT NULL, dst_port INTEGER NOT NULL,
       protocol TEXT NOT NULL, verdict TEXT NOT NULL, flow_count INTEGER NOT NULL DEFAULT 1,
-      has_policy INTEGER NOT NULL DEFAULT 0, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL)`)
+      has_policy INTEGER NOT NULL DEFAULT 0, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+      rev INTEGER NOT NULL DEFAULT 0)`)
   }
+  db.exec('CREATE TABLE discovered_flows_deleted (id TEXT NOT NULL, rev INTEGER NOT NULL, deleted_at TEXT NOT NULL)')
   return { getDb: () => db }
 })
 vi.mock('./k8s', () => ({ listNetworkPolicies: vi.fn(), checkHubbleRelayReady: vi.fn(), listServices: vi.fn() }))
@@ -92,7 +94,7 @@ describe('updateFlowPolicies', () => {
     (getDb().prepare("SELECT has_policy FROM discovered_flows WHERE id = 'f1'").get() as { has_policy: number }).has_policy
 
   it('reclassifies even when no policy is left, clearing a stale has_policy', async () => {
-    getDb().prepare(`INSERT INTO discovered_flows VALUES ('f1','app','frontend','worker','backend',8080,'TCP','FORWARDED',1,1,'2026-01-01','2026-01-01')`).run()
+    getDb().prepare(`INSERT INTO discovered_flows VALUES ('f1','app','frontend','worker','backend',8080,'TCP','FORWARDED',1,1,'2026-01-01','2026-01-01',0)`).run()
 
     // A failing K8s read must not be mistaken for "zero policies": the
     // classification stays as it was until a real answer comes back.
@@ -111,32 +113,69 @@ describe('updateFlowPolicies', () => {
 
 describe('getDiscoveredFlowsSummary', () => {
   const db = () => getDb()
-  const insert = (id: string, verdict: string, hasPolicy: number, lastSeen: string) =>
-    db().prepare(`INSERT INTO discovered_flows VALUES (?, 'app','frontend','worker','backend',8080,'TCP',?,1,?,'2026-01-01',?)`).run(id, verdict, hasPolicy, lastSeen)
+  const insert = (id: string, verdict: string, hasPolicy: number, rev: number) =>
+    db().prepare(`INSERT INTO discovered_flows VALUES (?, 'app','frontend','worker','backend',8080,'TCP',?,1,?,'2026-01-01','2026-01-01',?)`).run(id, verdict, hasPolicy, rev)
 
   it('counts flows and unprotected drops, and its version moves only when the data does', async () => {
-    const { getDiscoveredFlowsSummary } = await import('./hubble')
+    const { getDiscoveredFlowsSummary, clearDiscoveredFlows } = await import('./hubble')
     db().prepare('DELETE FROM discovered_flows').run()
-    insert('a', 'DROPPED', 0, '2026-01-01T00:00:00Z')
-    insert('b', 'DROPPED', 1, '2026-01-01T00:00:00Z')
-    insert('c', 'FORWARDED', 0, '2026-01-01T00:00:00Z')
+    insert('a', 'DROPPED', 0, 1)
+    insert('b', 'DROPPED', 1, 1)
+    insert('c', 'FORWARDED', 0, 1)
 
     const s1 = getDiscoveredFlowsSummary()
     expect(s1.total).toBe(3)
     expect(s1.unprotected_dropped).toBe(1)
     expect(getDiscoveredFlowsSummary().version).toBe(s1.version) // nothing changed
 
-    db().prepare("UPDATE discovered_flows SET last_seen = '2026-01-02T00:00:00Z' WHERE id = 'c'").run()
+    db().prepare("UPDATE discovered_flows SET has_policy = 1, rev = 2 WHERE id = 'a'").run()
     const s2 = getDiscoveredFlowsSummary()
-    expect(s2.version).not.toBe(s1.version) // traffic seen again
+    expect(s2.version).not.toBe(s1.version) // a write stamps a higher rev
+    expect(s2.unprotected_dropped).toBe(0)
 
-    db().prepare("UPDATE discovered_flows SET has_policy = 1 WHERE id = 'a'").run()
-    const s3 = getDiscoveredFlowsSummary()
-    expect(s3.version).not.toBe(s2.version) // reclassified
-    expect(s3.unprotected_dropped).toBe(0)
+    clearDiscoveredFlows()
+    expect(getDiscoveredFlowsSummary().version).not.toBe(s2.version) // deletes start a new generation
+  })
+})
 
-    db().prepare("DELETE FROM discovered_flows WHERE id = 'b'").run()
-    expect(getDiscoveredFlowsSummary().version).not.toBe(s3.version) // retention/clear
+describe('getDiscoveredFlowsSince', () => {
+  const svc = (ns: string, name: string) => ({ namespace: ns, labels: [`k8s:app=${name}`], workloads: [{ name, kind: 'Deployment' }] })
+  const msg = (srcPort: number, dst = 'worker', verdict = 'FORWARDED') => ({ flow: {
+    verdict, source: svc('frontend', 'app'), destination: svc('backend', dst),
+    ip: { source: '10.0.0.1', destination: '10.0.0.2' },
+    l4: { TCP: { source_port: srcPort, destination_port: 8080 } },
+  } })
+  const ingest = async (...msgs: unknown[]) => {
+    const mod = await import('./hubble')
+    for (const m of msgs) mod.__testing.processFlow(m)
+    mod.flushFlowWrites()
+  }
+
+  it('returns only rows written after the given version, and the full list when it cannot', async () => {
+    const { getDiscoveredFlowsSince, clearDiscoveredFlows, invalidateIgnoredNamespacesCache } = await import('./hubble')
+    testConfig.ignored_namespaces = []
+    invalidateIgnoredNamespacesCache()
+    clearDiscoveredFlows()
+    await ingest(msg(50001, 'worker'), msg(50002, 'db'))
+
+    const first = getDiscoveredFlowsSince(null)
+    expect(first.full).toBe(true)
+    expect(first.flows.map(f => f.dst_workload).sort()).toEqual(['db', 'worker'])
+
+    expect(getDiscoveredFlowsSince(first.version)).toMatchObject({ full: false, flows: [], version: first.version })
+
+    await ingest(msg(50003, 'worker', 'DROPPED'))
+    const delta = getDiscoveredFlowsSince(first.version)
+    expect(delta.full).toBe(false)
+    expect(delta.flows.map(f => [f.dst_workload, f.verdict, f.flow_count])).toEqual([['worker', 'DROPPED', 2]])
+
+    clearDiscoveredFlows()
+    await ingest(msg(50004, 'cache'))
+    const afterClear = getDiscoveredFlowsSince(delta.version)
+    expect(afterClear.full).toBe(true) // a delete happened in between: rows must be replaced, not merged
+    expect(afterClear.flows.map(f => f.dst_workload)).toEqual(['cache'])
+
+    expect(getDiscoveredFlowsSince('garbage').full).toBe(true)
   })
 })
 
@@ -158,7 +197,7 @@ describe('updateFlowPolicies: memoized reclassification matches the naive per-ro
     const pick = <T,>(xs: T[]) => xs[rnd(xs.length)]
 
     db().prepare('DELETE FROM discovered_flows').run()
-    const ins = db().prepare(`INSERT INTO discovered_flows VALUES (?,?,?,?,?,?,'TCP','DROPPED',1,?,'2026-01-01','2026-01-01')`)
+    const ins = db().prepare(`INSERT INTO discovered_flows VALUES (?,?,?,?,?,?,'TCP','DROPPED',1,?,'2026-01-01','2026-01-01',0)`)
     for (let i = 0; i < 400; i++) {
       const internet = rnd(3) === 0
       ins.run(`r${i}`, pick(wls), pick(nss),
@@ -234,5 +273,75 @@ describe('processFlow ingestion semantics', () => {
     invalidateIgnoredNamespacesCache()
     expect(rows('discovered_flows')).toEqual([])
     expect(rows('ignored_flows')).toEqual([{ src_namespace: 'kube-system', dst_namespace: 'backend', verdict: 'FORWARDED', flow_count: 1 }])
+  })
+})
+
+describe('retention, caps and unignore migration', () => {
+  const db = () => getDb()
+  const row = (table: string, id: string, srcNs: string, dstNs: string, lastSeen: string, count = 1) =>
+    db().prepare(`INSERT INTO ${table} VALUES (?, 'app', ?, 'worker', ?, 8080, 'TCP', 'FORWARDED', ?, 0, ?, ?, 0)`).run(id, srcNs, dstNs, count, lastSeen, lastSeen)
+  const ids = (table: string) => (db().prepare(`SELECT id FROM ${table} ORDER BY id`).all() as Array<{ id: string }>).map(r => r.id)
+
+  it('moves flows back from ignored_flows only when neither side is still ignored, merging into existing rows', async () => {
+    const { migrateUnignoredFlows } = await import('./hubble')
+    db().prepare('DELETE FROM discovered_flows').run()
+    db().prepare('DELETE FROM ignored_flows').run()
+    row('discovered_flows', 'x', 'a', 'b', '2026-01-01T00:00:00Z', 2)
+    row('ignored_flows', 'x', 'a', 'b', '2026-01-03T00:00:00Z', 3)
+    row('ignored_flows', 'y', 'a', 'kube-system', '2026-01-01T00:00:00Z')
+    migrateUnignoredFlows(['kube-system'])
+    expect(ids('discovered_flows')).toEqual(['x'])
+    expect(ids('ignored_flows')).toEqual(['y'])
+    expect(db().prepare("SELECT flow_count, last_seen FROM discovered_flows WHERE id = 'x'").get())
+      .toEqual({ flow_count: 5, last_seen: '2026-01-03T00:00:00Z' })
+  })
+
+  it('deletes rows past retention (internet on its own, shorter window) and starts a new generation', async () => {
+    const { runRetentionCleanup, getDiscoveredFlowsSummary } = await import('./hubble')
+    db().prepare('DELETE FROM discovered_flows').run()
+    const now = Date.now()
+    const daysAgo = (d: number) => new Date(now - d * 86400_000).toISOString()
+    row('discovered_flows', 'old', 'a', 'b', daysAgo(8))
+    row('discovered_flows', 'recent', 'a', 'b', daysAgo(2))
+    row('discovered_flows', 'net-old', 'a', 'internet', daysAgo(2))
+    row('discovered_flows', 'net-new', 'a', 'internet', daysAgo(0.1))
+    const before = getDiscoveredFlowsSummary().version
+    await runRetentionCleanup()
+    expect(ids('discovered_flows')).toEqual(['net-new', 'recent'])
+    expect(getDiscoveredFlowsSummary().version).not.toBe(before)
+  })
+
+  it('reports rows removed by retention in the delta instead of forcing a full reload', async () => {
+    const { runRetentionCleanup, getDiscoveredFlowsSince } = await import('./hubble')
+    db().prepare('DELETE FROM discovered_flows').run()
+    const now = Date.now()
+    row('discovered_flows', 'stale', 'a', 'b', new Date(now - 8 * 86400_000).toISOString())
+    row('discovered_flows', 'fresh', 'a', 'b', new Date(now).toISOString())
+    const held = getDiscoveredFlowsSince(null)
+    await runRetentionCleanup()
+    const delta = getDiscoveredFlowsSince(held.version)
+    expect(delta.full).toBe(false)
+    expect(delta.removed).toEqual(['stale'])
+    expect(delta.flows).toEqual([])
+    expect(delta.version).not.toBe(held.version)
+  })
+
+  it('caps a flow table at 50,000 rows by dropping the ones seen longest ago, so deltas keep working', async () => {
+    const { capFlowTable, getDiscoveredFlowsSince } = await import('./hubble')
+    db().prepare('DELETE FROM discovered_flows').run()
+    const ins = db().prepare(`INSERT INTO discovered_flows VALUES (?, 'app', 'a', 'worker', 'b', 8080, 'TCP', 'FORWARDED', 1, 0, ?, ?, 0)`)
+    db().transaction(() => {
+      for (let i = 0; i < 50_003; i++) {
+        const t = new Date(Date.UTC(2026, 0, 1) + i * 1000).toISOString()
+        ins.run(`r${String(i).padStart(6, '0')}`, t, t)
+      }
+    })()
+    const before = getDiscoveredFlowsSince(null)
+    expect(getDiscoveredFlowsSince(before.version).full).toBe(true) // over the cap: no delta
+    await capFlowTable('discovered_flows')
+    expect((db().prepare('SELECT COUNT(*) AS c FROM discovered_flows').get() as { c: number }).c).toBe(50_000)
+    expect(ids('discovered_flows').slice(0, 2)).toEqual(['r000003', 'r000004'])
+    const after = getDiscoveredFlowsSince(null)
+    expect(getDiscoveredFlowsSince(after.version).full).toBe(false)
   })
 })
