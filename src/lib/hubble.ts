@@ -691,4 +691,4 @@ export function setDraftModeActive(active: boolean): void {
 // reclassification fix (excludeUnappliedGitOps, the sync_status-aware
 // fingerprint), tested in isolation from the gRPC stream / DB side effects
 // the rest of this file has. Not used by any application code path.
-export const __testing = { policyFingerprint, excludeUnappliedGitOps }
+export const __testing = { policyFingerprint, excludeUnappliedGitOps, processFlow }

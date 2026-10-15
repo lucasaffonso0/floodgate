@@ -18,7 +18,8 @@ vi.mock('./db', async () => {
   return { getDb: () => db }
 })
 vi.mock('./k8s', () => ({ listNetworkPolicies: vi.fn(), checkHubbleRelayReady: vi.fn(), listServices: vi.fn() }))
-vi.mock('./config', () => ({ getConfig: () => ({ ignored_namespaces: [], hubble_flow_retention_days: 7, hubble_internet_flow_retention_days: 1 }) }))
+const testConfig = vi.hoisted(() => ({ ignored_namespaces: [] as string[], hubble_flow_retention_days: 7, hubble_internet_flow_retention_days: 1 }))
+vi.mock('./config', () => ({ getConfig: () => testConfig }))
 vi.mock('./sse', () => ({ emit: vi.fn() }))
 
 const { __testing, updateFlowPolicies } = await import('./hubble')
@@ -143,8 +144,15 @@ describe('updateFlowPolicies: memoized reclassification matches the naive per-ro
   it('agrees with flowHasPolicy row by row on randomized flows and policies', async () => {
     const db = () => getDb()
     const { flowHasPolicy } = await import('./flowMatch')
-    let seed = 42
-    const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n }
+    let state = 42
+    // mulberry32: a deterministic PRNG with well-mixed low bits (a plain LCG
+    // alternates its lowest bit and degenerates on small moduli like rnd(2)).
+    const rnd = (n: number) => {
+      state = (state + 0x6D2B79F5) | 0
+      let t = Math.imul(state ^ (state >>> 15), 1 | state)
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+      return ((t ^ (t >>> 14)) >>> 0) % n
+    }
     const nss = ['frontend', 'backend', 'data']
     const wls = ['app', 'worker', 'db', 'cache']
     const pick = <T,>(xs: T[]) => xs[rnd(xs.length)]
@@ -179,5 +187,52 @@ describe('updateFlowPolicies: memoized reclassification matches the naive per-ro
         expect({ id: r.id, round, has: r.has_policy }).toEqual({ id: r.id, round, has: flowHasPolicy(r, policies) ? 1 : 0 })
       }
     }
+  })
+})
+
+// Pins ingestion semantics so batching the writes can't change them:
+// flow_count counts distinct connections (source ports), repeats of a
+// connection only refresh verdict/last_seen, the latest verdict wins, and
+// flows touching an ignored namespace land in ignored_flows.
+describe('processFlow ingestion semantics', () => {
+  const svc = (ns: string, name: string) => ({ namespace: ns, labels: [`k8s:app=${name}`], workloads: [{ name, kind: 'Deployment' }] })
+  const msg = (opts: { srcPort: number; verdict?: string; srcNs?: string; dstNs?: string }) => ({ flow: {
+    verdict: opts.verdict ?? 'FORWARDED',
+    source: svc(opts.srcNs ?? 'frontend', 'app'),
+    destination: svc(opts.dstNs ?? 'backend', 'worker'),
+    ip: { source: '10.0.0.1', destination: '10.0.0.2' },
+    l4: { TCP: { source_port: opts.srcPort, destination_port: 8080 } },
+  } })
+  const run = async (msgs: unknown[]) => {
+    const mod = await import('./hubble') as typeof import('./hubble') & { flushFlowWrites?: () => void }
+    for (const m of msgs) mod.__testing.processFlow(m)
+    mod.flushFlowWrites?.()
+  }
+  const rows = (table: string) => getDb().prepare(`SELECT src_namespace, dst_namespace, verdict, flow_count FROM ${table}`).all() as Array<{ src_namespace: string; dst_namespace: string; verdict: string; flow_count: number }>
+
+  it('counts distinct connections, treats a repeated connection as an update, and keeps the latest verdict', async () => {
+    getDb().prepare('DELETE FROM discovered_flows').run()
+    getDb().prepare('DELETE FROM ignored_flows').run()
+    testConfig.ignored_namespaces = []
+    await run([
+      msg({ srcPort: 40001 }),
+      msg({ srcPort: 40001 }),                       // same connection again: not a new one
+      msg({ srcPort: 40002 }),                       // a second connection
+      msg({ srcPort: 40002, verdict: 'DROPPED' }),   // latest verdict for the pair
+    ])
+    expect(rows('discovered_flows')).toEqual([{ src_namespace: 'frontend', dst_namespace: 'backend', verdict: 'DROPPED', flow_count: 2 }])
+  })
+
+  it('routes flows touching an ignored namespace to ignored_flows', async () => {
+    getDb().prepare('DELETE FROM discovered_flows').run()
+    getDb().prepare('DELETE FROM ignored_flows').run()
+    const { invalidateIgnoredNamespacesCache } = await import('./hubble')
+    testConfig.ignored_namespaces = ['kube-system']
+    invalidateIgnoredNamespacesCache()
+    await run([msg({ srcPort: 41001, srcNs: 'kube-system' })])
+    testConfig.ignored_namespaces = []
+    invalidateIgnoredNamespacesCache()
+    expect(rows('discovered_flows')).toEqual([])
+    expect(rows('ignored_flows')).toEqual([{ src_namespace: 'kube-system', dst_namespace: 'backend', verdict: 'FORWARDED', flow_count: 1 }])
   })
 })
