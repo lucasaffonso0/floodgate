@@ -385,8 +385,31 @@ export async function createNamespaceRestrictPolicyViaGit(
 // would silently leave the intra/internet companion policies hitting the
 // live K8s API under GitOps.
 export async function isolateNamespaceViaGit(req: IsolateNamespaceRequest): Promise<{ created: number; skipped: number }> {
+  const { ops, summary } = buildIsolateOps(req)
+  if (ops.length === 0) return { created: 0, skipped: 0 }
+  await commitPolicyFilesTracked(ops, `floodgate: isolate ${req.namespace} (${summary.join(', ')})`)
+  return { created: ops.length, skipped: 0 }
+}
+
+// Bulk isolation ("Isolar N expostos", "Completar isolamento"): every
+// namespace's files in ONE commit, instead of one commit (and one push, and
+// one ArgoCD sync) per namespace.
+export async function isolateNamespacesViaGit(reqs: IsolateNamespaceRequest[]): Promise<Array<{ namespace: string; created: number; skipped: number }>> {
+  const all: GitFileOp[] = []
+  const results = reqs.map(req => {
+    const { ops } = buildIsolateOps(req)
+    all.push(...ops)
+    return { namespace: req.namespace, created: ops.length, skipped: 0 }
+  })
+  if (all.length > 0) {
+    await commitPolicyFilesTracked(all, `floodgate: isolate ${reqs.length} namespace(s) (${reqs.map(r => r.namespace).join(', ')})`)
+  }
+  return results
+}
+
+function buildIsolateOps(req: IsolateNamespaceRequest): { ops: GitFileOp[]; summary: string[] } {
   const directions: ('ingress' | 'egress')[] = req.direction === 'both' ? ['ingress', 'egress'] : [req.direction]
-  const ops: { action: 'write'; path: string; content: string }[] = []
+  const ops: GitFileOp[] = []
   const summary: string[] = []
 
   for (const dir of directions) {
@@ -466,9 +489,7 @@ export async function isolateNamespaceViaGit(req: IsolateNamespaceRequest): Prom
     summary.push('egress-internet')
   }
 
-  if (ops.length === 0) return { created: 0, skipped: 0 }
-  await commitPolicyFilesTracked(ops, `floodgate: isolate ${req.namespace} (${summary.join(', ')})`)
-  return { created: ops.length, skipped: 0 }
+  return { ops, summary }
 }
 
 export async function createCidrPolicyViaGit(req: CidrPolicyRequest): Promise<NetworkPolicyInfo> {

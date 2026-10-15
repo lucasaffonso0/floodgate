@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
-import { getConfig, setConfig, isNamespaceWatched, setAutoDefaultDenyBaseline } from '@/lib/config'
+import { getConfig, setConfig, namespaceWatchFilter, setAutoDefaultDenyBaseline } from '@/lib/config'
 import { listServices } from '@/lib/k8s'
 import { migrateUnignoredFlows, invalidateIgnoredNamespacesCache } from '@/lib/hubble'
 import { apiError, parseBody } from '@/lib/api-helpers'
@@ -87,8 +87,9 @@ export async function PUT(req: NextRequest) {
     // auto-deny. Re-flip it off and on later and the snapshot is retaken.
     if (body.auto_default_deny_scope === 'future_only' && previous.auto_default_deny_scope !== 'future_only') {
       const services = await listServices()
+      const watched = namespaceWatchFilter()
       const baseline = [...new Set(
-        services.map(s => s.namespace).filter(ns => ns !== SELF_NAMESPACE && isNamespaceWatched(ns))
+        services.map(s => s.namespace).filter(ns => ns !== SELF_NAMESPACE && watched(ns))
       )]
       setAutoDefaultDenyBaseline(baseline)
     }

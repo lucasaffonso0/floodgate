@@ -516,3 +516,42 @@ describe('exportManagedPoliciesYAML: WRITE_MODE branch', () => {
     expect(readNamespacedNetworkPolicy).not.toHaveBeenCalled()
   })
 })
+
+describe('isolateNamespaces: bulk isolation', () => {
+  const reqs = [
+    { namespace: 'web', direction: 'both' as const, allow_intra_namespace: true, allow_egress_internet: false },
+    { namespace: 'jobs', direction: 'ingress' as const, allow_intra_namespace: false, allow_egress_internet: false },
+  ]
+
+  it('gitops mode: every namespace in ONE commit', async () => {
+    process.env.WRITE_MODE = 'gitops'
+    const { isolateNamespaces } = await import('./k8s')
+    const results = await isolateNamespaces(reqs)
+    expect(commitPolicyFiles).toHaveBeenCalledTimes(1)
+    const [ops, message] = commitPolicyFiles.mock.calls[0] as unknown as [Array<{ path: string }>, string]
+    expect(ops.map(o => o.path).sort()).toEqual([
+      'jobs/floodgate-ns-deny-ingress-jobs.yaml',
+      'web/floodgate-intra-egress-web.yaml',
+      'web/floodgate-intra-ingress-web.yaml',
+      'web/floodgate-ns-deny-egress-web.yaml',
+      'web/floodgate-ns-deny-ingress-web.yaml',
+    ])
+    expect(message).toContain('2 namespace(s)')
+    expect(results).toEqual([
+      { namespace: 'web', created: 4, skipped: 0 },
+      { namespace: 'jobs', created: 1, skipped: 0 },
+    ])
+  })
+
+  it('direct mode: one namespace failing does not stop the others, and is reported', async () => {
+    createNamespacedNetworkPolicy.mockImplementation(async ({ namespace }: { namespace: string }) => {
+      if (namespace === 'web') throw new Error('admission webhook denied')
+      return { metadata: { name: 'x', namespace } }
+    })
+    const { isolateNamespaces } = await import('./k8s')
+    const results = await isolateNamespaces(reqs)
+    expect(results[0]).toMatchObject({ namespace: 'web', created: 0, error: 'admission webhook denied' })
+    expect(results[1]).toMatchObject({ namespace: 'jobs', created: 1, skipped: 0 })
+    expect(results[1].error).toBeUndefined()
+  })
+})

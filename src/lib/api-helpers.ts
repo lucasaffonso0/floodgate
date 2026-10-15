@@ -1,5 +1,8 @@
 import 'server-only'
 import { NextRequest, NextResponse } from 'next/server'
+import { createHash } from 'crypto'
+import { gzip } from 'zlib'
+import { promisify } from 'util'
 
 // Errors whose message is safe and useful to show to the end user
 // (thrown deliberately by our own code, e.g. k8s.ts validations).
@@ -62,4 +65,47 @@ export function invalidPortsMessage(dstPorts: unknown): string | null {
     }
   }
   return null
+}
+
+// Next doesn't compress route handler responses, and the big ones (the
+// flow list, Services/NetworkPolicies on a large cluster) are very
+// repetitive JSON that gzips around 10x. Compressed off the main thread
+// (zlib's async API runs in the libuv pool), only above a size where it
+// pays off, and only for clients that ask for it.
+const gzipAsync = promisify(gzip)
+const COMPRESS_ABOVE_BYTES = 16 * 1024
+
+export function acceptsGzip(req: NextRequest | Request): boolean {
+  return /\bgzip\b/.test(req.headers.get('accept-encoding') ?? '')
+}
+
+export async function gzipBody(body: string): Promise<Buffer> {
+  return gzipAsync(body)
+}
+
+// Response for an already-serialized JSON body, gzipped when worthwhile.
+// `gz` lets a caller pass a pre-compressed copy it keeps cached.
+export async function jsonBody(
+  req: NextRequest | Request, body: string, headers: Record<string, string> = {}, gz?: Buffer,
+): Promise<NextResponse> {
+  const base = { ...headers, 'Content-Type': 'application/json', Vary: 'Accept-Encoding' }
+  if (body.length >= COMPRESS_ABOVE_BYTES && acceptsGzip(req)) {
+    const compressed = gz ?? await gzipAsync(body)
+    return new NextResponse(new Uint8Array(compressed), { status: 200, headers: { ...base, 'Content-Encoding': 'gzip' } })
+  }
+  return new NextResponse(body, { status: 200, headers: base })
+}
+
+// JSON response with an ETag over its body. `private, no-cache` makes the
+// browser keep it but revalidate on every request: when nothing changed the
+// server answers an empty 304 and the browser hands the app the copy it
+// already has (transparent to axios). For the big lists every open page
+// polls every 15s (Services, NetworkPolicies, layout), that's most polls on
+// a large cluster carrying no body at all.
+export async function jsonWithEtag(req: NextRequest | Request, data: unknown): Promise<NextResponse> {
+  const body = JSON.stringify(data)
+  const etag = `"${createHash('sha1').update(body).digest('base64url')}"`
+  const headers = { ETag: etag, 'Cache-Control': 'private, no-cache' }
+  if (req.headers.get('if-none-match') === etag) return new NextResponse(null, { status: 304, headers })
+  return jsonBody(req, body, headers)
 }

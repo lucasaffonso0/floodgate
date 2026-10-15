@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser, canManageNamespace } from '@/lib/auth'
 import { getDb } from '@/lib/db'
-import { parseBody } from '@/lib/api-helpers'
+import { parseBody, jsonWithEtag } from '@/lib/api-helpers'
 import { listServices } from '@/lib/k8s'
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const user = await getCurrentUser()
   if (!user) return NextResponse.json({ detail: 'Unauthorized' }, { status: 401 })
 
@@ -40,7 +40,7 @@ export async function GET() {
 
   const visibleLocks = locks.filter(r => r.namespace !== '__meta__' && r.namespace !== '__global__')
 
-  return NextResponse.json({
+  return jsonWithEtag(req, {
     layouts: rows.map(r => ({ ...r, locked: r.locked === 1 })),
     namespace_locks: visibleLocks.map(r => ({ ...r, locked: r.locked === 1, x: r.x ?? null, y: r.y ?? null })),
     namespaces: allNamespaces,

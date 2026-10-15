@@ -8,9 +8,10 @@ import { identityLabels } from '@/lib/podIdentity'
 import { getWriteMode } from '@/lib/writeMode'
 import { perfCount } from '@/lib/perfMetrics'
 import { cachedRead, invalidateReads } from '@/lib/readCache'
+import { watchedItems } from '@/lib/k8sWatch'
 import {
   createRestrictPolicyViaGit, deleteNetworkPolicyViaGit, createNetworkPolicyViaGit, createEgressNetworkPolicyViaGit,
-  createNamespaceIngressPolicyViaGit, createNamespaceRestrictPolicyViaGit, isolateNamespaceViaGit, createCidrPolicyViaGit,
+  createNamespaceIngressPolicyViaGit, createNamespaceRestrictPolicyViaGit, isolateNamespaceViaGit, isolateNamespacesViaGit, createCidrPolicyViaGit,
   getPolicyYAMLViaGit, applyPolicyYAMLViaGit, adoptPolicyViaGit, unadoptPolicyViaGit, patchNetworkPolicyPortViaGit,
   mergeGitSyncStatus, deleteNetworkPoliciesBatchViaGit,
 } from '@/lib/k8s-gitops'
@@ -106,11 +107,11 @@ export async function listServices(): Promise<ServiceInfo[]> {
 }
 
 async function listServicesUncached(): Promise<ServiceInfo[]> {
-  perfCount('k8s.list_services')
-  const list = await core.listServiceForAllNamespaces()
+  const items = watchedItems<k8s.V1Service>('services', kc, () => core.listServiceForAllNamespaces())
+    ?? (perfCount('k8s.list_services'), (await core.listServiceForAllNamespaces()).items)
   const result: ServiceInfo[] = []
 
-  for (const svc of list.items) {
+  for (const svc of items) {
     const selector = svc.spec?.selector
     if (!selector || Object.keys(selector).length === 0) continue
 
@@ -284,9 +285,9 @@ function detectPolicyMeta(spec: k8s.V1NetworkPolicySpec): {
 
 export async function listNamespaceNames(): Promise<Set<string>> {
   const names = await cachedRead('k8s:namespaces', READ_CACHE_TTL_MS, async () => {
-    perfCount('k8s.list_namespaces')
-    const list = await core.listNamespace()
-    return list.items.map(ns => ns.metadata!.name!)
+    const items = watchedItems<k8s.V1Namespace>('namespaces', kc, () => core.listNamespace())
+      ?? (perfCount('k8s.list_namespaces'), (await core.listNamespace()).items)
+    return items.map(ns => ns.metadata!.name!)
   })
   return new Set(names)
 }
@@ -298,13 +299,19 @@ export async function listNetworkPolicies(allPolicies = false): Promise<NetworkP
 }
 
 async function listNetworkPoliciesUncached(allPolicies: boolean): Promise<NetworkPolicyInfo[]> {
-  perfCount(allPolicies ? 'k8s.list_policies_all' : 'k8s.list_policies_managed')
-  const labelSel = allPolicies ? undefined : `managed-by=${MANAGED_BY}`
-  const list = await networking.listNetworkPolicyForAllNamespaces(
-    labelSel ? { labelSelector: labelSel } : undefined
-  )
+  // One watch over every policy serves both views: the managed one filters
+  // by label here instead of asking the API server to.
+  const watched = watchedItems<k8s.V1NetworkPolicy>('networkpolicies', kc, () => networking.listNetworkPolicyForAllNamespaces())
+  let items: k8s.V1NetworkPolicy[]
+  if (watched) {
+    items = allPolicies ? watched : watched.filter(p => p.metadata?.labels?.['managed-by'] === MANAGED_BY)
+  } else {
+    perfCount(allPolicies ? 'k8s.list_policies_all' : 'k8s.list_policies_managed')
+    const labelSel = allPolicies ? undefined : `managed-by=${MANAGED_BY}`
+    items = (await networking.listNetworkPolicyForAllNamespaces(labelSel ? { labelSelector: labelSel } : undefined)).items
+  }
 
-  const result = list.items.map((p: k8s.V1NetworkPolicy) => {
+  const result = items.map((p: k8s.V1NetworkPolicy) => {
     const labels = p.metadata?.labels ?? {}
     const managed = labels['managed-by'] === MANAGED_BY
     const spec = p.spec!
@@ -743,6 +750,23 @@ export async function createNamespaceRestrictPolicy(
     if (getK8sStatus(e) === 409) return { name: policyName, namespace, created: false }
     throw e
   }
+}
+
+// Several namespaces in one call. GitOps: one commit for all of them. Direct:
+// one namespace after another; a failure is reported for that namespace and
+// the rest still go through (same best-effort the UI used to do by looping
+// over single calls).
+export async function isolateNamespaces(reqs: IsolateNamespaceRequest[]): Promise<Array<{ namespace: string; created: number; skipped: number; error?: string }>> {
+  if (getWriteMode() === 'gitops') return isolateNamespacesViaGit(reqs)
+  const results: Array<{ namespace: string; created: number; skipped: number; error?: string }> = []
+  for (const req of reqs) {
+    try {
+      results.push({ namespace: req.namespace, ...await isolateNamespace(req) })
+    } catch (e) {
+      results.push({ namespace: req.namespace, created: 0, skipped: 0, error: e instanceof Error ? e.message : String(e) })
+    }
+  }
+  return results
 }
 
 export async function isolateNamespace(req: IsolateNamespaceRequest): Promise<{ created: number; skipped: number }> {

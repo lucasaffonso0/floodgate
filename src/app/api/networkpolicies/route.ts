@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { listNetworkPolicies, createNetworkPolicy, getPolicyYAML, deleteNetworkPoliciesBatch } from '@/lib/k8s'
 import { getCurrentUser, canManageNamespace } from '@/lib/auth'
 import { isNamespaceWatched } from '@/lib/config'
-import { apiError, parseBody, invalidPortsMessage } from '@/lib/api-helpers'
+import { apiError, parseBody, invalidPortsMessage, jsonWithEtag } from '@/lib/api-helpers'
 import { logAudit } from '@/lib/audit'
 import { saveManagedPolicy, removeManagedPolicy } from '@/lib/autosync'
 import { emit } from '@/lib/sse'
@@ -12,7 +12,7 @@ export async function GET(req: NextRequest) {
   if (!user) return NextResponse.json({ detail: 'Unauthorized' }, { status: 401 })
   try {
     const all = req.nextUrl.searchParams.get('all') === 'true'
-    return NextResponse.json(await listNetworkPolicies(all))
+    return jsonWithEtag(req, await listNetworkPolicies(all))
   } catch (e) {
     return apiError(e, 'Falha ao listar policies')
   }

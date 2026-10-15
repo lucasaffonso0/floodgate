@@ -104,8 +104,15 @@ export function setAutoDefaultDenyBaseline(namespaces: string[]): void {
 }
 
 export function isNamespaceWatched(namespace: string): boolean {
+  return namespaceWatchFilter()(namespace)
+}
+
+// Same check, with the config read once: for filtering many namespaces at
+// a time (getConfig() is a couple dozen queries, and calling
+// isNamespaceWatched per Service made listing 5,000 Services take seconds).
+export function namespaceWatchFilter(): (namespace: string) => boolean {
   const cfg = getConfig()
-  if (cfg.ignored_namespaces.includes(namespace)) return false
-  if (cfg.watched_namespaces.length > 0) return cfg.watched_namespaces.includes(namespace)
-  return true
+  const ignored = new Set(cfg.ignored_namespaces)
+  const watched = cfg.watched_namespaces.length > 0 ? new Set(cfg.watched_namespaces) : null
+  return ns => !ignored.has(ns) && (!watched || watched.has(ns))
 }
