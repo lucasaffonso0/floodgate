@@ -7,7 +7,8 @@ import { getWriteMode } from './writeMode'
 import { refreshRepoInBackground } from './git'
 import { clearAllPendingOps, expireStalePendingOps } from './gitopsPendingOps'
 import { resetStuckApprovals, expireStaleApprovalApplies } from './approvalApply'
-import { startPerfLogging } from './perfMetrics'
+import { startPerfLogging, perfCount } from './perfMetrics'
+import { nonOverlapping } from './nonOverlapping'
 
 const TICK_MS = 15_000
 // Cleanup de retenção uma vez por hora
@@ -159,6 +160,9 @@ if (!g._floodgateSchedulerStarted) {
   // Mesma lógica pra approval_requests.applying, ver approvalApply.ts.
   resetStuckApprovals()
   startPerfLogging()
-  setInterval(tick, TICK_MS)
+  // A tick awaits network work (K8s, git, S3 backup, Hubble
+  // reclassification). If one runs past TICK_MS, the next is skipped
+  // instead of overlapping it and running autosync/reclassify twice at once.
+  setInterval(nonOverlapping(tick, () => perfCount('scheduler.tick_skipped')), TICK_MS)
   console.log('[floodgate] background scheduler started')
 }
