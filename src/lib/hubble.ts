@@ -7,6 +7,7 @@ import { getDb } from './db'
 import { listNetworkPolicies, checkHubbleRelayReady, listServices } from './k8s'
 import { getConfig } from './config'
 import { emit } from './sse'
+import { perfCount } from './perfMetrics'
 import { normalizeWorkload, flowHasPolicy, isWorldEndpoint } from './flowMatch'
 import type { CiliumFlowSummary, NetworkPolicyInfo } from '@/types'
 
@@ -182,6 +183,7 @@ function processFlow(msg: unknown): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const flow = (msg as any)?.flow
   if (!flow) return
+  perfCount('hubble.received')
   if (flow.is_reply === true) return
 
   const src = extractEndpoint(flow.source)
@@ -248,6 +250,7 @@ function processFlow(msg: unknown): void {
 
   try {
     if (isNew) {
+      perfCount('hubble.db_upsert')
       const hasPolicy = flowHasPolicy(
         { src_workload: src.workload, src_namespace: src.namespace, dst_workload: dstWorkload, dst_namespace: dst.namespace, dst_port: portInfo.port },
         _policyCache,
@@ -261,6 +264,7 @@ function processFlow(msg: unknown): void {
           last_seen = excluded.last_seen
       `).run({ id, src_workload: src.workload, src_namespace: src.namespace, dst_workload: dstWorkload, dst_namespace: dst.namespace, dst_port: portInfo.port, protocol: portInfo.protocol, verdict, has_policy: hasPolicy ? 1 : 0, now })
     } else {
+      perfCount('hubble.db_update')
       getDb().prepare(`UPDATE ${table} SET verdict = ?, last_seen = ? WHERE id = ?`).run(verdict, now, id)
     }
 
@@ -538,6 +542,7 @@ export async function checkHubbleAvailable(): Promise<boolean> {
 
 export function getDiscoveredFlows(): CiliumFlowSummary[] {
   const db = getDb()
+  perfCount('flows.read_full')
   // Two different concerns, deliberately kept apart:
   // - WHICH rows survive the MAX_FLOW_ROWS cap: by last_seen, so a flow
   //   still happening right now is never pushed out in favor of one just

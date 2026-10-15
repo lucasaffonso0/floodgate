@@ -174,6 +174,17 @@ kubectl apply -f test-apps/
 | `S3_ACCESS_KEY_ID` | none | Access key with write access to the backup bucket |
 | `S3_SECRET_ACCESS_KEY` | none | Secret for the access key above |
 | `WRITE_MODE` | `direct` | `direct` or `gitops`, see [Write modes](#write-modes-direct-vs-gitops) below |
+| `HUBBLE_RELAY_ADDR` | `hubble-relay.kube-system.svc.cluster.local:80` | Hubble Relay gRPC address used by flow discovery |
+| `FLOODGATE_PERF_LOG` | unset | Set to `1` to log event-loop delay, memory and K8s/git/flow counters every 60 s (`[perf]` lines) |
+
+### Load testing
+
+`scripts/perf/` has dependency-free tools to measure the app at scale; each file's header explains its options:
+
+- `gen-scale-cluster.mjs`: synthetic cluster manifests (e.g. 1,000 namespaces / 5,000 Services), `| kubectl apply -f -`.
+- `fake-hubble-relay.mjs`: a fake Hubble Relay streaming synthetic flows at a chosen rate; run the app with `HUBBLE_RELAY_ADDR=localhost:4245`.
+- `seed-flows.mjs`: inserts N synthetic flows straight into the dev database.
+- `measure.mjs`: simulates N admins polling the main page and reports latency and payload size per endpoint.
 
 ---
 

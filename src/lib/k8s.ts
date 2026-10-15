@@ -6,6 +6,7 @@ import { UserFacingError } from '@/lib/api-helpers'
 import { normalizeWorkload } from '@/lib/flowMatch'
 import { identityLabels } from '@/lib/podIdentity'
 import { getWriteMode } from '@/lib/writeMode'
+import { perfCount } from '@/lib/perfMetrics'
 import {
   createRestrictPolicyViaGit, deleteNetworkPolicyViaGit, createNetworkPolicyViaGit, createEgressNetworkPolicyViaGit,
   createNamespaceIngressPolicyViaGit, createNamespaceRestrictPolicyViaGit, isolateNamespaceViaGit, createCidrPolicyViaGit,
@@ -80,6 +81,7 @@ function parseIntOrString(val: unknown, fallback: number): number {
 }
 
 export async function listServices(): Promise<ServiceInfo[]> {
+  perfCount('k8s.list_services')
   const list = await core.listServiceForAllNamespaces()
   const result: ServiceInfo[] = []
 
@@ -256,11 +258,13 @@ function detectPolicyMeta(spec: k8s.V1NetworkPolicySpec): {
 }
 
 export async function listNamespaceNames(): Promise<Set<string>> {
+  perfCount('k8s.list_namespaces')
   const list = await core.listNamespace()
   return new Set(list.items.map(ns => ns.metadata!.name!))
 }
 
 export async function listNetworkPolicies(allPolicies = false): Promise<NetworkPolicyInfo[]> {
+  perfCount(allPolicies ? 'k8s.list_policies_all' : 'k8s.list_policies_managed')
   const labelSel = allPolicies ? undefined : `managed-by=${MANAGED_BY}`
   const list = await networking.listNetworkPolicyForAllNamespaces(
     labelSel ? { labelSelector: labelSel } : undefined

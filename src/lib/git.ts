@@ -3,6 +3,7 @@ import simpleGit, { type SimpleGit } from 'simple-git'
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, chmodSync } from 'fs'
 import { dirname, join, relative } from 'path'
 import { UserFacingError } from './api-helpers'
+import { perfCount } from './perfMetrics'
 import { getGitOpsConnection, hasGitOpsCredentials as hasGitOpsCredentialsFromConfig } from './gitopsConfig'
 
 const LOCAL_REPO_PATH = '/data/gitops-repo'
@@ -411,6 +412,7 @@ export async function listPolicyFiles(): Promise<string[]> {
 // network), but still redundant work. Read everything already on disk
 // locally in one pass instead.
 export async function listPolicyFilesWithContent(): Promise<Array<{ path: string; content: string }>> {
+  perfCount('git.read_all_files')
   const cfg = buildRealConfig()
   await ensureRepoCloned(cfg)
   const root = join(cfg.localPath, cfg.repoSubpath)

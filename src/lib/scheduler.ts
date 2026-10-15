@@ -7,6 +7,7 @@ import { getWriteMode } from './writeMode'
 import { refreshRepoInBackground } from './git'
 import { clearAllPendingOps, expireStalePendingOps } from './gitopsPendingOps'
 import { resetStuckApprovals, expireStaleApprovalApplies } from './approvalApply'
+import { startPerfLogging } from './perfMetrics'
 
 const TICK_MS = 15_000
 // Cleanup de retenção uma vez por hora
@@ -157,6 +158,7 @@ if (!g._floodgateSchedulerStarted) {
   clearAllPendingOps()
   // Mesma lógica pra approval_requests.applying, ver approvalApply.ts.
   resetStuckApprovals()
+  startPerfLogging()
   setInterval(tick, TICK_MS)
   console.log('[floodgate] background scheduler started')
 }
