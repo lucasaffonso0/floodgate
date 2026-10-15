@@ -1,3 +1,6 @@
+{{- if or (gt (int .Values.replicaCount) 1) .Values.autoscaling.enabled }}
+{{- fail "floodgate must run as a single replica (SQLite on a ReadWriteOnce volume, in-process scheduler and SSE): set replicaCount to 1 and autoscaling.enabled to false" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,6 +11,8 @@ spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
+  strategy:
+    type: {{ .Values.strategy.type | default "Recreate" }}
   selector:
     matchLabels:
       {{- include "base.selectorLabels" . | nindent 6 }}
