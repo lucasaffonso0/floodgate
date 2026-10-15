@@ -7,6 +7,7 @@ import { normalizeWorkload } from '@/lib/flowMatch'
 import { identityLabels } from '@/lib/podIdentity'
 import { getWriteMode } from '@/lib/writeMode'
 import { perfCount } from '@/lib/perfMetrics'
+import { cachedRead, invalidateReads } from '@/lib/readCache'
 import {
   createRestrictPolicyViaGit, deleteNetworkPolicyViaGit, createNetworkPolicyViaGit, createEgressNetworkPolicyViaGit,
   createNamespaceIngressPolicyViaGit, createNamespaceRestrictPolicyViaGit, isolateNamespaceViaGit, createCidrPolicyViaGit,
@@ -43,7 +44,23 @@ const kc = new k8s.KubeConfig()
 kc.loadFromDefault()
 
 const core = kc.makeApiClient(k8s.CoreV1Api)
-const networking = kc.makeApiClient(k8s.NetworkingV1Api)
+// Every NetworkPolicy write floodgate makes in direct mode goes through
+// this client, so wrapping it is the one place that keeps the read cache
+// (readCache.ts) honest: any create/replace/patch/delete invalidates
+// cached lists once it settles, success or failure.
+const networking = (() => {
+  const client = kc.makeApiClient(k8s.NetworkingV1Api)
+  return new Proxy(client, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver)
+      if (typeof value !== 'function' || typeof prop !== 'string' || !/^(create|replace|patch|delete)/.test(prop)) return value
+      return (...args: unknown[]) => {
+        const result = (value as (...a: unknown[]) => unknown).apply(target, args)
+        return Promise.resolve(result).finally(invalidateReads)
+      }
+    },
+  })
+})()
 const apps = kc.makeApiClient(k8s.AppsV1Api)
 
 // @kubernetes/client-node models V1NetworkPolicyIngressRule.from as `_from`
@@ -80,7 +97,15 @@ function parseIntOrString(val: unknown, fallback: number): number {
   return fallback
 }
 
+// Cached for READ_CACHE_TTL_MS: see readCache.ts. Every poll of every open
+// browser, the scheduler and Hubble all list the whole cluster.
+const READ_CACHE_TTL_MS = 5_000
+
 export async function listServices(): Promise<ServiceInfo[]> {
+  return cachedRead('k8s:services', READ_CACHE_TTL_MS, listServicesUncached)
+}
+
+async function listServicesUncached(): Promise<ServiceInfo[]> {
   perfCount('k8s.list_services')
   const list = await core.listServiceForAllNamespaces()
   const result: ServiceInfo[] = []
@@ -258,12 +283,21 @@ function detectPolicyMeta(spec: k8s.V1NetworkPolicySpec): {
 }
 
 export async function listNamespaceNames(): Promise<Set<string>> {
-  perfCount('k8s.list_namespaces')
-  const list = await core.listNamespace()
-  return new Set(list.items.map(ns => ns.metadata!.name!))
+  const names = await cachedRead('k8s:namespaces', READ_CACHE_TTL_MS, async () => {
+    perfCount('k8s.list_namespaces')
+    const list = await core.listNamespace()
+    return list.items.map(ns => ns.metadata!.name!)
+  })
+  return new Set(names)
 }
 
+// Cached as a whole, GitOps sync status included: k8s-gitops.ts's commit
+// path and the repo refresh invalidate it alongside direct-mode writes.
 export async function listNetworkPolicies(allPolicies = false): Promise<NetworkPolicyInfo[]> {
+  return cachedRead(`k8s:policies:${allPolicies ? 'all' : 'managed'}`, READ_CACHE_TTL_MS, () => listNetworkPoliciesUncached(allPolicies))
+}
+
+async function listNetworkPoliciesUncached(allPolicies: boolean): Promise<NetworkPolicyInfo[]> {
   perfCount(allPolicies ? 'k8s.list_policies_all' : 'k8s.list_policies_managed')
   const labelSel = allPolicies ? undefined : `managed-by=${MANAGED_BY}`
   const list = await networking.listNetworkPolicyForAllNamespaces(

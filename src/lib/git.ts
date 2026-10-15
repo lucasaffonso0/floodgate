@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync
 import { dirname, join, relative } from 'path'
 import { UserFacingError } from './api-helpers'
 import { perfCount } from './perfMetrics'
+import { invalidateReads } from './readCache'
 import { getGitOpsConnection, hasGitOpsCredentials as hasGitOpsCredentialsFromConfig } from './gitopsConfig'
 
 const LOCAL_REPO_PATH = '/data/gitops-repo'
@@ -367,6 +368,9 @@ export async function refreshRepoInBackground(): Promise<{ ok: true } | { ok: fa
       const cfg = buildRealConfig()
       const git = await ensureRepoReady(cfg)
       _lastCommitAuthors = await computeLastCommitAuthors(cfg, git)
+      // The repo may now differ (someone pushed outside floodgate): cached
+      // policy lists carry sync status derived from it.
+      invalidateReads()
       return { ok: true }
     } catch (e) {
       const error = e instanceof Error ? e.message : String(e)

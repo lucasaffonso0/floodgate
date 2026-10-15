@@ -12,6 +12,7 @@ import {
 } from './git'
 import { startPendingOp, finishPendingOp, listPendingOps } from './gitopsPendingOps'
 import { getGitOpsConfig } from './gitopsConfig'
+import { invalidateReads } from './readCache'
 import type {
   RestrictPolicyRequest, NetworkPolicyInfo, CreatePolicyRequest, NamespaceIngressRequest,
   CidrPolicyRequest, IsolateNamespaceRequest, PortSpec,
@@ -44,10 +45,15 @@ async function commitPolicyFilesTracked(ops: GitFileOp[], commitMessage: string)
     })
     .filter((k): k is { namespace: string; name: string; kind: 'apply' | 'delete' } => k !== null)
   keys.forEach(k => startPendingOp(k.namespace, k.name, k.kind))
+  // Cached policy lists embed the pending/sync state: invalidate as the
+  // write starts (so "aplicando" shows right away) and again once it
+  // settles (so the result shows right away).
+  invalidateReads()
   try {
     return await commitPolicyFilesRaw(ops, commitMessage)
   } finally {
     keys.forEach(k => finishPendingOp(k.namespace, k.name))
+    invalidateReads()
   }
 }
 

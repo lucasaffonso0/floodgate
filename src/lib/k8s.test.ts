@@ -63,7 +63,12 @@ vi.mock('./gitopsConfig', () => ({ getGitOpsConfig }))
 const notFound = () => Object.assign(new Error('not found'), { statusCode: 404 })
 const forbidden = () => Object.assign(new Error('forbidden'), { statusCode: 403 })
 
+const { invalidateReads } = await import('./readCache')
+
 beforeEach(() => {
+  // List reads are cached for a few seconds (readCache.ts); each test sets
+  // its own mocked K8s response and must not get the previous test's.
+  invalidateReads()
   // resetAllMocks (not clearAllMocks): each test sets its own
   // mockResolvedValue/mockRejectedValue per tier, and a leftover
   // implementation from a previous test would silently change which tier
@@ -308,6 +313,31 @@ describe('createRestrictPolicy: WRITE_MODE branch', () => {
     expect(replaceNamespacedNetworkPolicy).not.toHaveBeenCalled()
     expect(commitPolicyFiles).toHaveBeenCalledTimes(1)
     expect(result.sync_status).toBe('pending_argocd')
+  })
+})
+
+describe('read cache', () => {
+  it('serves repeated policy lists from cache, and refetches after a direct-mode write', async () => {
+    const { listNetworkPolicies, deleteNetworkPolicy } = await import('./k8s')
+    listNetworkPolicyForAllNamespaces.mockResolvedValue({ items: [] })
+    deleteNamespacedNetworkPolicy.mockResolvedValue({})
+    await listNetworkPolicies(false)
+    await listNetworkPolicies(false)
+    expect(listNetworkPolicyForAllNamespaces).toHaveBeenCalledTimes(1)
+    await deleteNetworkPolicy('backend', 'some-policy')
+    await listNetworkPolicies(false)
+    expect(listNetworkPolicyForAllNamespaces).toHaveBeenCalledTimes(2)
+  })
+
+  it('refetches after a gitops-mode write too', async () => {
+    process.env.WRITE_MODE = 'gitops'
+    const { listNetworkPolicies, deleteNetworkPolicy } = await import('./k8s')
+    listNetworkPolicyForAllNamespaces.mockResolvedValue({ items: [] })
+    listPolicyFilesWithContent.mockResolvedValue([{ path: 'backend/some-policy.yaml', content: '' }])
+    await listNetworkPolicies(false)
+    await deleteNetworkPolicy('backend', 'some-policy')
+    await listNetworkPolicies(false)
+    expect(listNetworkPolicyForAllNamespaces).toHaveBeenCalledTimes(2)
   })
 })
 
