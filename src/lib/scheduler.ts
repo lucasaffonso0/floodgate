@@ -1,7 +1,7 @@
 import 'server-only'
 import { getDb } from './db'
 import { checkDrift, runAutosync } from './autosync'
-import { startHubbleStream, stopHubbleStream, isHubbleStreaming, updateFlowPolicies, runRetentionCleanup, normalizeStoredFlows } from './hubble'
+import { startHubbleStream, stopHubbleStream, isHubbleStreaming, updateFlowPolicies, runRetentionCleanup, normalizeStoredFlows, capFlowTable, pruneTombstones } from './hubble'
 import { runBackup, nextBackupFireTime, readLastBackupRun, saveLastBackupRun } from './backup'
 import { getWriteMode } from './writeMode'
 import { refreshRepoInBackground } from './git'
@@ -9,6 +9,7 @@ import { clearAllPendingOps, expireStalePendingOps } from './gitopsPendingOps'
 import { resetStuckApprovals, expireStaleApprovalApplies } from './approvalApply'
 import { startPerfLogging, perfCount } from './perfMetrics'
 import { nonOverlapping } from './nonOverlapping'
+import { runAutoDefaultDeny } from './autoDefaultDeny'
 
 const TICK_MS = 15_000
 // Cleanup de retenção uma vez por hora
@@ -112,15 +113,23 @@ async function tick() {
       }
     }
 
+    // Auto default-deny: cheap when there's nothing to do (cached/watched
+    // lists, an in-memory check per namespace); see autoDefaultDeny.ts.
+    try { await runAutoDefaultDeny() } catch (e) { console.error('[auto-default-deny] falhou:', e) }
+
     // Hubble streaming
     const hubbleEnabled = readHubbleEnabled()
     if (hubbleEnabled) {
       if (!isHubbleStreaming()) startHubbleStream()
       normalizeStoredFlows()
+      // Every tick, not hourly with retention: between cleanups, a table
+      // over the cap forces every client into full downloads (see capFlowTable).
+      await capFlowTable('discovered_flows')
+      pruneTombstones()
       await updateFlowPolicies()
       if (Date.now() - lastRetentionCleanup > 3_600_000) {
         lastRetentionCleanup = Date.now()
-        runRetentionCleanup()
+        await runRetentionCleanup()
       }
     } else {
       if (isHubbleStreaming()) stopHubbleStream()
