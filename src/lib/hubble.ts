@@ -549,6 +549,21 @@ export async function checkHubbleAvailable(): Promise<boolean> {
   return checkHubbleRelayReady()
 }
 
+// Cheap stand-in for "did the flow list change": one aggregate query instead
+// of serializing up to MAX_FLOW_ROWS rows. Every write path moves at least
+// one of these: inserts/deletes (count), traffic seen again (max last_seen,
+// since each update stamps it), new connections (flow_count total) and
+// reclassification (has_policy total). Lets clients skip refetching the
+// full list (and the server skip building it) while nothing changed.
+export function getDiscoveredFlowsSummary(): { version: string; total: number; unprotected_dropped: number } {
+  const r = getDb().prepare(`
+    SELECT COUNT(*) AS c, MAX(last_seen) AS m, TOTAL(flow_count) AS f, TOTAL(has_policy) AS h,
+           TOTAL(verdict = 'DROPPED' AND has_policy = 0) AS u
+    FROM discovered_flows
+  `).get() as { c: number; m: string | null; f: number; h: number; u: number }
+  return { version: `${r.c}-${r.m ?? ''}-${r.f}-${r.h}`, total: r.c, unprotected_dropped: r.u }
+}
+
 export function getDiscoveredFlows(): CiliumFlowSummary[] {
   const db = getDb()
   perfCount('flows.read_full')

@@ -107,3 +107,34 @@ describe('updateFlowPolicies', () => {
     expect(hasPolicy()).toBe(0)
   })
 })
+
+describe('getDiscoveredFlowsSummary', () => {
+  const db = () => getDb()
+  const insert = (id: string, verdict: string, hasPolicy: number, lastSeen: string) =>
+    db().prepare(`INSERT INTO discovered_flows VALUES (?, 'app','frontend','worker','backend',8080,'TCP',?,1,?,'2026-01-01',?)`).run(id, verdict, hasPolicy, lastSeen)
+
+  it('counts flows and unprotected drops, and its version moves only when the data does', async () => {
+    const { getDiscoveredFlowsSummary } = await import('./hubble')
+    db().prepare('DELETE FROM discovered_flows').run()
+    insert('a', 'DROPPED', 0, '2026-01-01T00:00:00Z')
+    insert('b', 'DROPPED', 1, '2026-01-01T00:00:00Z')
+    insert('c', 'FORWARDED', 0, '2026-01-01T00:00:00Z')
+
+    const s1 = getDiscoveredFlowsSummary()
+    expect(s1.total).toBe(3)
+    expect(s1.unprotected_dropped).toBe(1)
+    expect(getDiscoveredFlowsSummary().version).toBe(s1.version) // nothing changed
+
+    db().prepare("UPDATE discovered_flows SET last_seen = '2026-01-02T00:00:00Z' WHERE id = 'c'").run()
+    const s2 = getDiscoveredFlowsSummary()
+    expect(s2.version).not.toBe(s1.version) // traffic seen again
+
+    db().prepare("UPDATE discovered_flows SET has_policy = 1 WHERE id = 'a'").run()
+    const s3 = getDiscoveredFlowsSummary()
+    expect(s3.version).not.toBe(s2.version) // reclassified
+    expect(s3.unprotected_dropped).toBe(0)
+
+    db().prepare("DELETE FROM discovered_flows WHERE id = 'b'").run()
+    expect(getDiscoveredFlowsSummary().version).not.toBe(s3.version) // retention/clear
+  })
+})
