@@ -138,3 +138,46 @@ describe('getDiscoveredFlowsSummary', () => {
     expect(getDiscoveredFlowsSummary().version).not.toBe(s3.version) // retention/clear
   })
 })
+
+describe('updateFlowPolicies: memoized reclassification matches the naive per-row result', () => {
+  it('agrees with flowHasPolicy row by row on randomized flows and policies', async () => {
+    const db = () => getDb()
+    const { flowHasPolicy } = await import('./flowMatch')
+    let seed = 42
+    const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n }
+    const nss = ['frontend', 'backend', 'data']
+    const wls = ['app', 'worker', 'db', 'cache']
+    const pick = <T,>(xs: T[]) => xs[rnd(xs.length)]
+
+    db().prepare('DELETE FROM discovered_flows').run()
+    const ins = db().prepare(`INSERT INTO discovered_flows VALUES (?,?,?,?,?,?,'TCP','DROPPED',1,?,'2026-01-01','2026-01-01')`)
+    for (let i = 0; i < 400; i++) {
+      const internet = rnd(3) === 0
+      ins.run(`r${i}`, pick(wls), pick(nss),
+        internet ? `203.0.113.${rnd(250)}` : pick(wls),
+        internet ? 'internet' : pick(nss),
+        internet ? 443 : pick([80, 8080, 5432]), rnd(2))
+    }
+
+    for (let round = 0; round < 5; round++) {
+      const policies = Array.from({ length: 12 }, (_, j) => {
+        const type = pick(['allow', 'allow-namespace', 'allow-egress', 'restrict-ingress', 'restrict-egress', 'allow-intranamespace'] as const)
+        const ns = pick(nss)
+        return policy({
+          name: `p${round}-${j}`, namespace: ns, policy_type: type,
+          src_workload: type === 'allow-namespace' ? '' : pick([...wls, '']),
+          src_namespace: pick(nss),
+          dst_service: type.startsWith('restrict') && rnd(2) ? '' : pick([...wls, 'internet']),
+          dst_port: pick([80, 8080, 5432]), dst_ports: [{ port: pick([80, 8080, 5432]), protocol: 'TCP' as const }],
+          policy_types: [rnd(2) ? 'Ingress' : 'Egress'],
+        })
+      })
+      vi.mocked(listNetworkPolicies).mockResolvedValueOnce(policies)
+      await updateFlowPolicies()
+      const rows = db().prepare('SELECT * FROM discovered_flows').all() as Array<{ id: string; src_workload: string; src_namespace: string; dst_workload: string; dst_namespace: string; dst_port: number; has_policy: number }>
+      for (const r of rows) {
+        expect({ id: r.id, round, has: r.has_policy }).toEqual({ id: r.id, round, has: flowHasPolicy(r, policies) ? 1 : 0 })
+      }
+    }
+  })
+})

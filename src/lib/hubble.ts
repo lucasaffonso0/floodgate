@@ -338,18 +338,49 @@ export function stopHubbleStream(): void {
   console.log('[hubble] stream stopped')
 }
 
-function reclassifyFlowPolicies(table: 'discovered_flows' | 'ignored_flows', allPolicies: NetworkPolicyInfo[]): void {
+// flowHasPolicy() only depends on these fields, and for an internet-bound
+// flow only on its source (the external IP and port never matter there:
+// coverage is the source's internet-egress posture). Rows sharing a key
+// share the answer, so a table of tens of thousands of internet rows needs
+// a few hundred evaluations instead of one per row.
+function classificationKey(f: { src_workload: string; src_namespace: string; dst_workload: string; dst_namespace: string; dst_port: number }): string {
+  return f.dst_namespace === 'internet'
+    ? `${f.src_namespace}|${f.src_workload}|internet`
+    : `${f.src_namespace}|${f.src_workload}|${f.dst_namespace}|${f.dst_workload}|${f.dst_port}`
+}
+
+const RECLASSIFY_WRITE_CHUNK = 2_000
+
+// Memoized per classificationKey, writes only rows whose value actually
+// changed, and in chunks that yield to the event loop between them, so a
+// policy change over a large table never stalls the server in one block.
+async function reclassifyFlowPolicies(table: 'discovered_flows' | 'ignored_flows', allPolicies: NetworkPolicyInfo[]): Promise<void> {
   const db = getDb()
-  const flows = db.prepare(`SELECT id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port FROM ${table}`).all() as Array<{
-    id: string; src_workload: string; src_namespace: string; dst_workload: string; dst_namespace: string; dst_port: number
+  const flows = db.prepare(`SELECT id, src_workload, src_namespace, dst_workload, dst_namespace, dst_port, has_policy FROM ${table}`).all() as Array<{
+    id: string; src_workload: string; src_namespace: string; dst_workload: string; dst_namespace: string; dst_port: number; has_policy: number
   }>
   if (flows.length === 0) return
-  const updateStmt = db.prepare(`UPDATE ${table} SET has_policy = ? WHERE id = ?`)
-  db.transaction(() => {
-    for (const f of flows) {
-      updateStmt.run(flowHasPolicy(f, allPolicies) ? 1 : 0, f.id)
+  const memo = new Map<string, number>()
+  const changes: Array<[number, string]> = []
+  for (const f of flows) {
+    const key = classificationKey(f)
+    let value = memo.get(key)
+    if (value === undefined) {
+      value = flowHasPolicy(f, allPolicies) ? 1 : 0
+      memo.set(key, value)
     }
-  })()
+    if (value !== f.has_policy) changes.push([value, f.id])
+  }
+  perfCount('hubble.reclassify_evaluations', memo.size)
+  perfCount('hubble.reclassify_writes', changes.length)
+  const updateStmt = db.prepare(`UPDATE ${table} SET has_policy = ? WHERE id = ?`)
+  const writeChunk = db.transaction((chunk: Array<[number, string]>) => {
+    for (const [value, id] of chunk) updateStmt.run(value, id)
+  })
+  for (let i = 0; i < changes.length; i += RECLASSIFY_WRITE_CHUNK) {
+    writeChunk(changes.slice(i, i + RECLASSIFY_WRITE_CHUNK))
+    if (i + RECLASSIFY_WRITE_CHUNK < changes.length) await new Promise(res => setImmediate(res))
+  }
 }
 
 // reclassifyFlowPolicies() is O(flows × policies): checking every flow's
@@ -423,8 +454,8 @@ export async function updateFlowPolicies(): Promise<void> {
     if (fingerprint === _lastPolicyFingerprint) return
     _lastPolicyFingerprint = fingerprint
 
-    reclassifyFlowPolicies('discovered_flows', applied)
-    reclassifyFlowPolicies('ignored_flows', applied)
+    await reclassifyFlowPolicies('discovered_flows', applied)
+    await reclassifyFlowPolicies('ignored_flows', applied)
   } catch { /* non-critical */ }
 }
 
