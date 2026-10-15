@@ -11,10 +11,12 @@
 //   --clients (5)      concurrent simulated browsers, all polling at once
 //   --rounds (10)      polls per client
 //   --interval (0)     ms between a client's polls (15000 mimics the real page)
-//   --flows (none)     how the full flow list is fetched each poll:
+//   --flows (none)     how flows are fetched each poll:
 //                        none        nothing on screen uses flows: summary only (today's default page)
-//                        conditional Descoberta/"Tráfego ao vivo" open: summary, plus the list
-//                                    with If-None-Match only when the summary version changed
+//                        conditional Descoberta open: summary, plus only the rows changed since the
+//                                    version held (?since=) when the summary version moved
+//                        edges       only "Tráfego ao vivo" on: summary, plus the pre-aggregated
+//                                    graph edges (If-None-Match) when the version moved
 //                        always      the old page: the full list every poll, unconditionally
 
 import { parseArgs } from './args.mjs'
@@ -29,8 +31,8 @@ const CLIENTS = Number(args.clients)
 const ROUNDS = Number(args.rounds)
 const INTERVAL = Number(args.interval)
 const FLOWS_MODE = String(args.flows)
-if (!['none', 'conditional', 'always'].includes(FLOWS_MODE)) {
-  console.error('--flows must be none, conditional or always')
+if (!['none', 'conditional', 'edges', 'always'].includes(FLOWS_MODE)) {
+  console.error('--flows must be none, conditional, edges or always')
   process.exit(1)
 }
 
@@ -43,7 +45,7 @@ const ENDPOINTS = [
   '/api/approval-requests?status=pending',
   ...(FLOWS_MODE === 'always' ? [] : ['/api/cilium/flows/summary']),
 ]
-const FLOWS = '/api/cilium/flows'
+const FLOWS = FLOWS_MODE === 'edges' ? '/api/cilium/flows/edges' : '/api/cilium/flows'
 const ALL = [...ENDPOINTS, ...(FLOWS_MODE === 'none' ? [] : [FLOWS])]
 
 async function login() {
@@ -61,10 +63,12 @@ async function login() {
 const samples = new Map(ALL.map(e => [e, { ms: [], bytes: [], errors: 0, notModified: 0 }]))
 const pollMs = []
 
-async function timed(cookie, endpoint, extraHeaders = {}) {
+// `endpoint` is the row this sample is reported under; `query` is appended
+// to the request only (so ?since=... calls still group under one row).
+async function timed(cookie, endpoint, extraHeaders = {}, query = '') {
   const t0 = performance.now()
   try {
-    const res = await fetch(BASE + endpoint, { headers: { cookie, ...extraHeaders } })
+    const res = await fetch(BASE + endpoint + query, { headers: { cookie, ...extraHeaders } })
     const body = await res.arrayBuffer()
     const s = samples.get(endpoint)
     s.ms.push(performance.now() - t0)
@@ -79,21 +83,25 @@ async function timed(cookie, endpoint, extraHeaders = {}) {
 }
 
 async function client(cookie) {
-  let etag = null
+  let version = null
   for (let r = 0; r < ROUNDS; r++) {
     const t0 = performance.now()
     const results = await Promise.all(ENDPOINTS.map(e => timed(cookie, e)))
     if (FLOWS_MODE === 'always') {
       await timed(cookie, FLOWS)
-    } else if (FLOWS_MODE === 'conditional') {
-      // Same rule as page.tsx: fetch the list only when the summary's
-      // version differs from the copy already held.
+    } else if (FLOWS_MODE !== 'none') {
+      // Same rule as page.tsx: fetch only when the summary's version differs
+      // from the one already held.
       const raw = results[ENDPOINTS.indexOf('/api/cilium/flows/summary')]
       let summary = null
       try { summary = raw ? JSON.parse(Buffer.from(raw.body).toString('utf8')) : null } catch { /* not JSON */ }
-      if (summary && `"${summary.version}"` !== etag) {
-        const res = await timed(cookie, FLOWS, etag ? { 'If-None-Match': etag } : {})
-        if (res?.status === 200) etag = res.etag
+      if (summary && summary.version !== version) {
+        const res = FLOWS_MODE === 'edges'
+          ? await timed(cookie, FLOWS, version ? { 'If-None-Match': `"${version}"` } : {})
+          : await timed(cookie, FLOWS, {}, version ? `?since=${encodeURIComponent(version)}` : '')
+        if (res?.status === 200) {
+          try { version = JSON.parse(Buffer.from(res.body).toString('utf8')).version } catch { /* keep */ }
+        }
       }
     }
     pollMs.push(performance.now() - t0)

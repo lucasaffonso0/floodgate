@@ -78,10 +78,14 @@ function getFlows(call) {
   let paused = false
   const timer = setInterval(() => {
     if (paused) return
+    // Writes the whole tick's batch, then waits for 'drain' before the next
+    // one if the stream reported backpressure. Stopping at the first false
+    // instead capped the rate at a few hundred flows/s regardless of
+    // --rate, since gRPC signals backpressure after only a few KB.
     for (let i = 0; i < perTick; i++) {
       const ok = call.write({ flow: nextFlow(), node_name: 'fake-relay', time: { seconds: String(Math.floor(Date.now() / 1000)), nanos: 0 } })
       sentTotal++; sentWindow++
-      if (!ok) { paused = true; call.once('drain', () => { paused = false }); break }
+      if (!ok && !paused) { paused = true; call.once('drain', () => { paused = false }) }
     }
   }, 50)
   const stop = () => { clearInterval(timer); console.log('[fake-relay] client disconnected') }
