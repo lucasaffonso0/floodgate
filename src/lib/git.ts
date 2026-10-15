@@ -1,6 +1,6 @@
 import 'server-only'
 import simpleGit, { type SimpleGit } from 'simple-git'
-import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, chmodSync } from 'fs'
+import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, chmodSync, renameSync } from 'fs'
 import { dirname, join, relative } from 'path'
 import { UserFacingError } from './api-helpers'
 import { perfCount } from './perfMetrics'
@@ -251,21 +251,36 @@ function withGitLock<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 
+// buildRealConfig() runs on every repo read, outside withGitLock, while a
+// push's ssh process may be reading the key. Rewriting in place truncated
+// the file under it; now an unchanged file is never rewritten, and a
+// changed one is replaced atomically (temp file + rename), so ssh only
+// ever sees the old key or the new one. Permissions are re-tightened every
+// time: the pod's fsGroup makes the kubelet re-add group rw bits to
+// everything on /data at each start, and ssh refuses a group-readable key
+// ("UNPROTECTED PRIVATE KEY FILE").
+function writeSecretFile(path: string, content: string, mode: number): void {
+  let current: string | null = null
+  try { current = readFileSync(path, 'utf8') } catch { /* not written yet */ }
+  if (current !== content) {
+    const tmp = `${path}.tmp-${process.pid}`
+    writeFileSync(tmp, content, { mode })
+    chmodSync(tmp, mode)
+    renameSync(tmp, path)
+  }
+  chmodSync(path, mode)
+}
+
 function buildRealConfig(): GitOpsRepoConfig {
   const conn = getGitOpsConnection()
   if (!conn.repo_url || !conn.ssh_private_key) {
     throw new UserFacingError('GitOps ativo, mas o repositório não foi configurado. Configure em Config → GitOps.', 503)
   }
   mkdirSync(dirname(SSH_KEY_PATH), { recursive: true })
-  const key = conn.ssh_private_key.endsWith('\n') ? conn.ssh_private_key : conn.ssh_private_key + '\n'
-  writeFileSync(SSH_KEY_PATH, key, { mode: 0o600 })
-  // writeFileSync's mode only applies when the file is created. The pod's
-  // fsGroup makes the kubelet re-add group rw bits to everything on /data
-  // at every start, so an existing key comes back as 0660 and ssh refuses
-  // it ("UNPROTECTED PRIVATE KEY FILE"). Re-tighten on every write.
   chmodSync(dirname(SSH_KEY_PATH), 0o700)
-  chmodSync(SSH_KEY_PATH, 0o600)
-  if (conn.ssh_known_hosts) writeFileSync(SSH_KNOWN_HOSTS_PATH, conn.ssh_known_hosts, 'utf8')
+  const key = conn.ssh_private_key.endsWith('\n') ? conn.ssh_private_key : conn.ssh_private_key + '\n'
+  writeSecretFile(SSH_KEY_PATH, key, 0o600)
+  if (conn.ssh_known_hosts) writeSecretFile(SSH_KNOWN_HOSTS_PATH, conn.ssh_known_hosts, 0o644)
   return {
     localPath: LOCAL_REPO_PATH,
     repoUrl: conn.repo_url,
@@ -423,4 +438,4 @@ export async function listPolicyFilesWithContent(): Promise<Array<{ path: string
 // rebase machinery against an explicit config (e.g. a throwaway local bare
 // repo), bypassing gitopsConfig.ts/the DB and the SSH key file dance
 // entirely. Not used by any application code path.
-export const __testing = { ensureRepoReady, ensureRepoCloned, applyFileOps, commitAndPush, withGitLock, listFilesRecursive, addAndCommitIfChanged, computeLastCommitAuthors }
+export const __testing = { ensureRepoReady, ensureRepoCloned, applyFileOps, commitAndPush, withGitLock, listFilesRecursive, addAndCommitIfChanged, computeLastCommitAuthors, writeSecretFile }

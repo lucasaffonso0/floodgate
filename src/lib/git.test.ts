@@ -326,3 +326,38 @@ describe('git.ts (real local bare repo, no SSH/DB involved)', () => {
     }
   }, 10_000)
 })
+
+describe('writeSecretFile', () => {
+  const { statSync, chmodSync } = require('fs') as typeof import('fs')
+  const mode = (p: string) => statSync(p).mode & 0o777
+
+  it('writes the content with the requested mode', () => {
+    const p = join(mkdtempSync(join(tmpdir(), 'floodgate-key-')), 'gitops_key')
+    __testing.writeSecretFile(p, 'KEY-A\n', 0o600)
+    expect(readFileSync(p, 'utf8')).toBe('KEY-A\n')
+    expect(mode(p)).toBe(0o600)
+  })
+
+  // Every repo read used to truncate and rewrite the key in place, racing a
+  // concurrent push's ssh process reading it. Same content now leaves the
+  // file untouched (same inode), and a change replaces it atomically.
+  it('does not rewrite an unchanged key, but still re-tightens permissions loosened by fsGroup', () => {
+    const p = join(mkdtempSync(join(tmpdir(), 'floodgate-key-')), 'gitops_key')
+    __testing.writeSecretFile(p, 'KEY-A\n', 0o600)
+    const inode = statSync(p).ino
+    chmodSync(p, 0o660)
+    __testing.writeSecretFile(p, 'KEY-A\n', 0o600)
+    expect(statSync(p).ino).toBe(inode)
+    expect(mode(p)).toBe(0o600)
+  })
+
+  it('replaces a changed key via a new file (never truncating the one in use)', () => {
+    const p = join(mkdtempSync(join(tmpdir(), 'floodgate-key-')), 'gitops_key')
+    __testing.writeSecretFile(p, 'KEY-A\n', 0o600)
+    const inode = statSync(p).ino
+    __testing.writeSecretFile(p, 'KEY-B\n', 0o600)
+    expect(readFileSync(p, 'utf8')).toBe('KEY-B\n')
+    expect(statSync(p).ino).not.toBe(inode)
+    expect(mode(p)).toBe(0o600)
+  })
+})
