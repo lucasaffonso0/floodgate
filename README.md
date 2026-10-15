@@ -128,6 +128,8 @@ make dev   # → http://localhost:3000
 
 Uses `~/.kube/config` directly. No Docker required. File changes reload in under 1 s.
 
+Flow discovery (Descoberta) needs the Hubble Relay, whose default address is cluster-internal DNS and doesn't resolve from your machine. Use `make dev-hubble` instead: it opens a `kubectl port-forward` to `hubble-relay` (or reuses one already listening on the port) and runs the dev server with `HUBBLE_RELAY_ADDR` pointing at it. Port defaults to 4245 (`make dev-hubble HUBBLE_LOCAL_PORT=4246` to change).
+
 ---
 
 ### Integration tests (kind)
