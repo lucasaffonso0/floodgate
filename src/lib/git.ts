@@ -1,6 +1,6 @@
 import 'server-only'
 import simpleGit, { type SimpleGit } from 'simple-git'
-import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync } from 'fs'
+import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, chmodSync } from 'fs'
 import { dirname, join, relative } from 'path'
 import { UserFacingError } from './api-helpers'
 import { getGitOpsConnection, hasGitOpsCredentials as hasGitOpsCredentialsFromConfig } from './gitopsConfig'
@@ -258,6 +258,12 @@ function buildRealConfig(): GitOpsRepoConfig {
   mkdirSync(dirname(SSH_KEY_PATH), { recursive: true })
   const key = conn.ssh_private_key.endsWith('\n') ? conn.ssh_private_key : conn.ssh_private_key + '\n'
   writeFileSync(SSH_KEY_PATH, key, { mode: 0o600 })
+  // writeFileSync's mode only applies when the file is created. The pod's
+  // fsGroup makes the kubelet re-add group rw bits to everything on /data
+  // at every start, so an existing key comes back as 0660 and ssh refuses
+  // it ("UNPROTECTED PRIVATE KEY FILE"). Re-tighten on every write.
+  chmodSync(dirname(SSH_KEY_PATH), 0o700)
+  chmodSync(SSH_KEY_PATH, 0o600)
   if (conn.ssh_known_hosts) writeFileSync(SSH_KNOWN_HOSTS_PATH, conn.ssh_known_hosts, 'utf8')
   return {
     localPath: LOCAL_REPO_PATH,
