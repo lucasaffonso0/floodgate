@@ -2,14 +2,14 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { FloodgateLogoIcon } from '@/components/FloodgateLogo'
-import { ServiceInfo, NetworkPolicyInfo, Draft, AppConfig, User, ServiceLayout, AutosyncStatus, ApprovalRequest, CiliumFlowSummary } from '@/types'
+import { ServiceInfo, NetworkPolicyInfo, Draft, AppConfig, User, ServiceLayout, AutosyncStatus, ApprovalRequest, CiliumFlowSummary, CiliumFlowsSummaryResponse } from '@/types'
 import {
   getServices, getNetworkPolicies, getAllNetworkPolicies,
   getConfig, updateConfig, createNetworkPolicy, createEgressNetworkPolicy, createCidrPolicy,
   createApprovalRequest, getSecurityCoverage, getAutosyncStatus,
   getMe, logout, getServiceLayout, setNamespaceLayoutLock,
   saveAllLayout, setGlobalLayoutLock, getApprovalRequests,
-  getCiliumFlows, clearCiliumFlows,
+  getCiliumFlowsSummary, getCiliumFlowsIfChanged, clearCiliumFlows,
   isolateNamespace, restrictService, deleteNetworkPolicy,
   getDraftMode, activateDraftMode, deactivateDraftMode,
 } from '@/api/client'
@@ -188,7 +188,39 @@ export default function App() {
   const [ciliumStreaming, setCiliumStreaming] = useState(false)
   const currentUserRef = useRef<User | null>(null)
 
-  const refresh = useCallback(async () => {
+  // The full flow list (up to MAX_FLOW_ROWS rows, tens of MB) is only
+  // downloaded while something on screen uses it (the graph's "Tráfego ao
+  // vivo" edges, or the Descoberta/Rascunhos tabs) and only when its version
+  // changed. Every poll otherwise fetches just the small summary, which also
+  // carries the Descoberta badge count.
+  const [flowsSummary, setFlowsSummary] = useState<CiliumFlowsSummaryResponse | null>(null)
+  const [graphNeedsFlows, setGraphNeedsFlows] = useState(false)
+  const [panelNeedsFlows, setPanelNeedsFlows] = useState(false)
+  const needFlows = graphNeedsFlows || panelNeedsFlows
+  const needFlowsRef = useRef(false)
+  const flowsEtagRef = useRef<string | null>(null)
+  const flowsLoadingRef = useRef(false)
+  const loadFlows = useCallback(async () => {
+    if (flowsLoadingRef.current) return
+    flowsLoadingRef.current = true
+    try {
+      const r = await getCiliumFlowsIfChanged(flowsEtagRef.current)
+      if (r) {
+        flowsEtagRef.current = r.etag
+        setCiliumFlows(r.data.flows)
+      }
+    } catch { /* keep the copy already on screen */ }
+    finally { flowsLoadingRef.current = false }
+  }, [])
+  const handlePanelTabChange = useCallback((tab: string | null) => {
+    setPanelNeedsFlows(tab === 'descoberta' || tab === 'drafts')
+  }, [])
+  useEffect(() => {
+    needFlowsRef.current = needFlows
+    if (needFlows) void loadFlows()
+  }, [needFlows, loadFlows])
+
+  const refreshOnce = useCallback(async () => {
     try {
       // Each of these four used to have no per-call fallback: one
       // transient failure (a GitOps read racing a concurrent write's file
@@ -200,14 +232,14 @@ export default function App() {
       // known-good snapshot keeps whatever was already on screen instead;
       // only the very first load (nothing to fall back to yet) still
       // surfaces the failure, via the outer catch below.
-      const [svcs, pols, allPols, layoutData, sync, approvals, ciliumData] = await Promise.all([
+      const [svcs, pols, allPols, layoutData, sync, approvals, flowsSum] = await Promise.all([
         getServices().catch(e => { if (!hasLoadedOnce.current) throw e; return servicesRef.current }),
         getNetworkPolicies().catch(e => { if (!hasLoadedOnce.current) throw e; return policiesRef.current }),
         getAllNetworkPolicies().catch(e => { if (!hasLoadedOnce.current) throw e; return allPoliciesRef.current }),
         getServiceLayout().catch(e => { if (!hasLoadedOnce.current || !serviceLayoutRef.current) throw e; return serviceLayoutRef.current }),
         getAutosyncStatus().catch(() => null),
         getApprovalRequests('pending').catch(() => [] as ApprovalRequest[]),
-        getCiliumFlows().catch(() => ({ available: false, streaming: false, flows: [] as CiliumFlowSummary[] })),
+        getCiliumFlowsSummary().catch(() => null),
       ])
       setAutosyncStatus(sync)
       setServices(svcs); servicesRef.current = svcs
@@ -215,8 +247,9 @@ export default function App() {
       setAllPolicies(allPols); allPoliciesRef.current = allPols
       serviceLayoutRef.current = layoutData
       setPendingApprovals(approvals)
-      setCiliumFlows(ciliumData.flows)
-      setCiliumStreaming(ciliumData.streaming)
+      setFlowsSummary(flowsSum)
+      setCiliumStreaming(flowsSum?.streaming ?? false)
+      if (needFlowsRef.current && flowsSum && `"${flowsSum.version}"` !== flowsEtagRef.current) void loadFlows()
 
       // Protect in-flight dragged positions from being overwritten by poll
       const dbLayouts = layoutData.layouts.map(l => {
@@ -271,7 +304,48 @@ export default function App() {
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Erro ao conectar ao backend')
     }
-  }, [])
+  }, [loadFlows])
+
+  // Never two refreshes at once: a call arriving mid-refresh joins the
+  // running one, which then runs once more so that caller still sees data
+  // fetched after its own request (e.g. right after applying a change).
+  // Overlapping polls, SSE bursts and post-action refreshes otherwise
+  // piled up concurrent copies of the same 7 requests.
+  const refreshPromise = useRef<Promise<void> | null>(null)
+  const refreshQueued = useRef(false)
+  const refresh = useCallback((): Promise<void> => {
+    if (refreshPromise.current) {
+      refreshQueued.current = true
+      return refreshPromise.current
+    }
+    const run = (async () => {
+      try {
+        do {
+          refreshQueued.current = false
+          await refreshOnce()
+        } while (refreshQueued.current)
+      } finally {
+        refreshPromise.current = null
+      }
+    })()
+    refreshPromise.current = run
+    return run
+  }, [refreshOnce])
+
+  // Polls and SSE-triggered refreshes are skipped while the browser tab is
+  // hidden (nobody is looking); one catch-up refresh runs when it's shown
+  // again. Explicit refreshes after a user action are never skipped.
+  const staleWhileHiddenRef = useRef(false)
+  useEffect(() => {
+    const onVisibility = () => {
+      if (!document.hidden && staleWhileHiddenRef.current) {
+        staleWhileHiddenRef.current = false
+        void refresh()
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [refresh])
 
   const flushAutosave = useCallback(async () => {
     const svcChanges = [...pendingServiceChanges.current.values()]
@@ -367,7 +441,10 @@ export default function App() {
       .catch(() => {})
       .finally(() => setConfigLoaded(true))
     getDraftMode().then(r => { setDraftMode(r.active); setDraftModeFlows(r.flows) }).catch(() => {})
-    const timer = setInterval(refresh, POLL_INTERVAL)
+    const timer = setInterval(() => {
+      if (document.hidden) { staleWhileHiddenRef.current = true; return }
+      void refresh()
+    }, POLL_INTERVAL)
     return () => clearInterval(timer)
   }, [refresh])
 
@@ -393,7 +470,10 @@ export default function App() {
           // land in the DB in real time; they just show up on the next
           // regular poll instead of instantly, same cadence as
           // services/policies already have.
-          if (event.type !== 'hubble_flow_new') refresh()
+          if (event.type !== 'hubble_flow_new') {
+            if (document.hidden) staleWhileHiddenRef.current = true
+            else void refresh()
+          }
           if (event.type === 'approval_created') {
             const user = currentUserRef.current
             if (!user || event.created_by === user.id) return
@@ -1038,7 +1118,9 @@ export default function App() {
           onPasswordModalClosed={() => setOpenPasswordModal(false)}
           ciliumFlows={ciliumFlows}
           ciliumStreaming={ciliumStreaming}
-          onClearCiliumFlows={() => clearCiliumFlows().then(() => setCiliumFlows([])).catch(() => {})}
+          onClearCiliumFlows={() => clearCiliumFlows().then(() => { flowsEtagRef.current = null; setCiliumFlows([]) }).catch(() => {})}
+          onActiveTabChange={handlePanelTabChange}
+          descobertaBadgeCount={flowsSummary?.unprotected_dropped}
           onViewNamespace={setSelectedNamespace}
           draftMode={draftMode}
           draftModeFlows={draftModeFlows}
@@ -1098,6 +1180,7 @@ export default function App() {
             onPolicyChanged={refresh}
             ciliumFlows={ciliumFlows}
             ciliumStreaming={ciliumStreaming}
+            onShowFlowEdgesChange={setGraphNeedsFlows}
             ignoredNamespaces={config.ignored_namespaces}
             visibleNamespaces={visibleNamespaces}
             selectedNamespace={selectedNamespace}

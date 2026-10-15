@@ -220,6 +220,16 @@ export interface CiliumFlowsResponse {
   flows: CiliumFlowSummary[]
 }
 
+// GET /api/cilium/flows/summary: polled every cycle in place of the full
+// list. `version` changes whenever the list does (see hubble.ts
+// getDiscoveredFlowsSummary) and doubles as the full list's ETag.
+export interface CiliumFlowsSummaryResponse {
+  version: string
+  total: number
+  unprotected_dropped: number
+  streaming: boolean
+}
+
 export interface AutosyncStatus {
   enabled: boolean
   interval_s: number

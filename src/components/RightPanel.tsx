@@ -3613,6 +3613,12 @@ interface Props {
   ciliumStreaming?: boolean
   onClearCiliumFlows?: () => void
   onViewNamespace?: (ns: string) => void
+  // Lets the parent download the full flow list only while a tab that
+  // reads it (Descoberta, Rascunhos) is open.
+  onActiveTabChange?: (tab: Tab | null) => void
+  // Unprotected DROPPED flow count for the Descoberta badge, from the
+  // server summary (the full list may not be loaded at all).
+  descobertaBadgeCount?: number
   // Modo Rascunho: draftModeFlows é a foto congelada da Descoberta (só
   // preenchida quando ativo) usada pra calcular o aviso de impacto.
   draftMode?: boolean
@@ -3627,6 +3633,8 @@ export default function RightPanel({
   ciliumFlows = [], ciliumStreaming = false,
   onClearCiliumFlows,
   onViewNamespace,
+  onActiveTabChange,
+  descobertaBadgeCount = 0,
   draftMode = false, draftModeFlows = [],
 }: Props) {
   // Defaults here must match what the server renders (no localStorage access
@@ -3635,6 +3643,7 @@ export default function RightPanel({
   // disagree and React throws a hydration mismatch (#418) whenever a user
   // has a non-default value saved.
   const [activeTab, setActiveTab] = useState<Tab | null>('namespaces')
+  useEffect(() => { onActiveTabChange?.(activeTab) }, [activeTab, onActiveTabChange])
   const [approvalTabKey, setApprovalTabKey] = useState(0)
   const [showLabels, setShowLabels] = useState<boolean>(false)
   const [showPwModal, setShowPwModal] = useState(false)
@@ -3676,7 +3685,7 @@ export default function RightPanel({
     return pendingApprovals.some(r => r.allowed_approvers.some(a => a.id === currentUser.id))
   })()
 
-  const unprotectedFlowCount = ciliumFlows.filter(f => !f.has_policy && f.verdict === 'DROPPED').length
+  const unprotectedFlowCount = descobertaBadgeCount
 
   const navItems: Array<{ id: Tab; icon: React.ReactNode; badge?: number }> = [
     { id: 'namespaces', icon: <Icon.Namespace /> },

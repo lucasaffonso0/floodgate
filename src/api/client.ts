@@ -3,7 +3,7 @@ import type {
   ServiceInfo, NetworkPolicyInfo, CreatePolicyRequest, NamespaceIngressRequest,
   PortSpec, AppConfig, User, AuditLog, ApprovalRequest, SecurityCoverage, NamespacePermission,
   ServiceLayout, AutosyncStatus, CiliumFlowsResponse, CiliumFlowSummary, CidrPolicyRequest,
-  BackupStatus, BackupResult, GitOpsConfig,
+  BackupStatus, BackupResult, GitOpsConfig, CiliumFlowsSummaryResponse,
 } from '@/types'
 
 const api = axios.create({ baseURL: '/api' })
@@ -220,8 +220,17 @@ export const syncGitOpsRepo = (): Promise<GitOpsConnectionTest> =>
   api.post('/gitops-config/sync').then(r => r.data)
 
 // ── Cilium Auto-Discover ───────────────────────────────────────────────────
-export const getCiliumFlows = (): Promise<CiliumFlowsResponse> =>
-  api.get('/cilium/flows').then(r => r.data)
+export const getCiliumFlowsSummary = (): Promise<CiliumFlowsSummaryResponse> =>
+  api.get('/cilium/flows/summary').then(r => r.data)
+
+// Conditional fetch of the full list: pass the ETag of the copy already in
+// hand and a 304 comes back as `null` (keep that copy, nothing changed)
+// instead of re-downloading and re-parsing every row.
+export const getCiliumFlowsIfChanged = (etag: string | null): Promise<{ etag: string | null; data: CiliumFlowsResponse } | null> =>
+  api.get('/cilium/flows', {
+    headers: etag ? { 'If-None-Match': etag } : {},
+    validateStatus: s => (s >= 200 && s < 300) || s === 304,
+  }).then(r => r.status === 304 ? null : { etag: (r.headers['etag'] as string | undefined) ?? null, data: r.data })
 
 export const clearCiliumFlows = (): Promise<void> =>
   api.delete('/cilium/flows').then(() => undefined)

@@ -1716,6 +1716,9 @@ interface Props {
   // Modo Rascunho: "Aplicar default-deny" no painel do serviço vira
   // rascunho em vez de chamar restrictService() direto.
   draftMode?: boolean
+  // Tells the parent whether flow edges ("Tráfego ao vivo") are on, so the
+  // full flow list is only downloaded while the graph actually draws it.
+  onShowFlowEdgesChange?: (on: boolean) => void
 }
 
 // ─── Layout toolbar ────────────────────────────────────────────────────────
@@ -1982,7 +1985,7 @@ export default function NetworkGraph({
   onAddDraft, onRemoveDraft, onPolicyChanged,
   layoutSaveStatus = 'idle',
   ciliumFlows, ciliumStreaming, ignoredNamespaces = [], visibleNamespaces,
-  selectedNamespace, onSelectNamespace, onExplainFlow, draftMode,
+  selectedNamespace, onSelectNamespace, onExplainFlow, draftMode, onShowFlowEdgesChange,
 }: Props) {
   const [nodes, setNodes] = useNodesState<Node>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<BuiltInEdge>([])
@@ -1998,6 +2001,7 @@ export default function NetworkGraph({
       return v === null ? true : v === '1'
     } catch { return true }
   })
+  React.useEffect(() => { onShowFlowEdgesChange?.(showFlowEdges) }, [showFlowEdges, onShowFlowEdgesChange])
   const toggleFlowEdges = React.useCallback(() => {
     setShowFlowEdges(v => {
       const next = !v
