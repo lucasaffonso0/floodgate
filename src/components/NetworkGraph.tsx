@@ -499,10 +499,14 @@ function buildGraph(
   // out the moment visibleNamespaces is non-empty, regardless of showInternetTraffic.
   const nsVisible = (ns: string) =>
     ns === 'internet' || !visibleNamespaces || visibleNamespaces.size === 0 || visibleNamespaces.has(ns)
+  // "Só internet" only applies while internet traffic is shown AND some
+  // exists: otherwise a persisted toggle would hide every in-cluster edge
+  // with nothing internet-bound left to show in their place.
+  const internetOnly = onlyInternetTraffic && showInternetTraffic && ciliumFlows.some(f => f.dst_namespace === 'internet')
   const visibleFlows = ciliumFlows.filter(
     f => nsVisible(f.src_namespace) && nsVisible(f.dst_namespace)
       && (showInternetTraffic || f.dst_namespace !== 'internet')
-      && (!onlyInternetTraffic || f.dst_namespace === 'internet')
+      && (!internetOnly || f.dst_namespace === 'internet')
   )
 
   // Modo Rascunho: preview the graph as if the current drafts had been
@@ -2427,7 +2431,7 @@ export default function NetworkGraph({
                 🌐 Tráfego pra internet
               </button>
             )}
-            {showFlowEdges && showInternetTraffic && ciliumFlows?.some(f => f.dst_namespace === 'internet') && (
+            {showFlowEdges && showInternetTraffic && (onlyInternetTraffic || ciliumFlows?.some(f => f.dst_namespace === 'internet')) && (
               <button
                 onClick={toggleOnlyInternetTraffic}
                 title="Oculta o tráfego normal e mostra só o que vai pra internet"
