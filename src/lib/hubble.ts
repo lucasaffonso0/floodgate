@@ -360,7 +360,9 @@ function reclassifyFlowPolicies(table: 'discovered_flows' | 'ignored_flows', all
 // relevant change" (only the fields flowHasPolicy()/explainAccess() ever
 // look at), so an unrelated field changing (e.g. created_at) never causes
 // a false "changed".
-let _lastPolicyFingerprint = ''
+// null, not '': an empty policy list fingerprints to '', so starting at ''
+// would skip the first reclassification after a restart with no policies.
+let _lastPolicyFingerprint: string | null = null
 function policyFingerprint(policies: NetworkPolicyInfo[]): string {
   return policies
     // sync_status included on purpose: a GitOps policy going from
@@ -397,8 +399,15 @@ export async function updateFlowPolicies(): Promise<void> {
     // Fetch fresh rather than trust the cache here: this is the periodic
     // authoritative reconciliation pass, the cache is only for insert-time
     // best-effort classification.
-    const allPolicies = await listNetworkPolicies(true).catch(() => [])
-    if (allPolicies.length === 0) return
+    // A failed read is skipped (keep the current classification), but an
+    // empty list is a real answer: the last policy was deleted or
+    // everything was paused, and flows must stop showing as covered.
+    let allPolicies: NetworkPolicyInfo[]
+    try {
+      allPolicies = await listNetworkPolicies(true)
+    } catch {
+      return
+    }
 
     // Fingerprint on the UNFILTERED list: sync_status is one of the
     // fingerprinted fields (see policyFingerprint's comment), so a policy

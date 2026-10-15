@@ -3,13 +3,28 @@ import { vi } from 'vitest'
 import type { NetworkPolicyInfo } from '@/types'
 
 vi.mock('server-only', () => ({}))
-vi.mock('./db', () => ({ getDb: () => ({ prepare: () => ({ get: () => ({ n: 0 }), all: () => [], run: () => {} }) }) }))
+// Real in-memory SQLite (not a stub) so updateFlowPolicies' reclassification
+// can be observed on actual rows.
+vi.mock('./db', async () => {
+  const { default: Database } = await import('better-sqlite3')
+  const db = new Database(':memory:')
+  for (const table of ['discovered_flows', 'ignored_flows']) {
+    db.exec(`CREATE TABLE ${table} (
+      id TEXT PRIMARY KEY, src_workload TEXT NOT NULL, src_namespace TEXT NOT NULL,
+      dst_workload TEXT NOT NULL, dst_namespace TEXT NOT NULL, dst_port INTEGER NOT NULL,
+      protocol TEXT NOT NULL, verdict TEXT NOT NULL, flow_count INTEGER NOT NULL DEFAULT 1,
+      has_policy INTEGER NOT NULL DEFAULT 0, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL)`)
+  }
+  return { getDb: () => db }
+})
 vi.mock('./k8s', () => ({ listNetworkPolicies: vi.fn(), checkHubbleRelayReady: vi.fn(), listServices: vi.fn() }))
 vi.mock('./config', () => ({ getConfig: () => ({ ignored_namespaces: [], hubble_flow_retention_days: 7, hubble_internet_flow_retention_days: 1 }) }))
 vi.mock('./sse', () => ({ emit: vi.fn() }))
 
-const { __testing } = await import('./hubble')
+const { __testing, updateFlowPolicies } = await import('./hubble')
 const { policyFingerprint, excludeUnappliedGitOps } = __testing
+const { getDb } = await import('./db')
+const { listNetworkPolicies } = await import('./k8s')
 
 function policy(overrides: Partial<NetworkPolicyInfo> = {}): NetworkPolicyInfo {
   return {
@@ -68,5 +83,27 @@ describe('policyFingerprint', () => {
     const one = policyFingerprint([policy({ name: 'x' })])
     const two = policyFingerprint([policy({ name: 'x' }), policy({ name: 'y' })])
     expect(one).not.toBe(two)
+  })
+})
+
+describe('updateFlowPolicies', () => {
+  const hasPolicy = () =>
+    (getDb().prepare("SELECT has_policy FROM discovered_flows WHERE id = 'f1'").get() as { has_policy: number }).has_policy
+
+  it('reclassifies even when no policy is left, clearing a stale has_policy', async () => {
+    getDb().prepare(`INSERT INTO discovered_flows VALUES ('f1','app','frontend','worker','backend',8080,'TCP','FORWARDED',1,1,'2026-01-01','2026-01-01')`).run()
+
+    // A failing K8s read must not be mistaken for "zero policies": the
+    // classification stays as it was until a real answer comes back.
+    vi.mocked(listNetworkPolicies).mockRejectedValueOnce(new Error('apiserver unavailable'))
+    await updateFlowPolicies()
+    expect(hasPolicy()).toBe(1)
+
+    // The last policy was deleted (or everything got paused): the flow is
+    // no longer covered and must say so. This used to return early on an
+    // empty list and leave has_policy=1 forever.
+    vi.mocked(listNetworkPolicies).mockResolvedValueOnce([])
+    await updateFlowPolicies()
+    expect(hasPolicy()).toBe(0)
   })
 })
