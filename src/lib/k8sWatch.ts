@@ -21,7 +21,7 @@ import { perfCount } from './perfMetrics'
 // State lives on `global`: Next bundles routes separately and each bundle
 // would otherwise open its own set of watches.
 
-export type WatchedKind = 'services' | 'networkpolicies' | 'namespaces'
+export type WatchedKind = 'services' | 'networkpolicies' | 'namespaces' | 'pods'
 
 type Entry = {
   informer: k8s.Informer<k8s.KubernetesObject> & k8s.ObjectCache<k8s.KubernetesObject>
@@ -39,6 +39,7 @@ function state(): State {
 }
 
 const RESTART_DELAY_MS = 5_000
+const MAX_RESTART_DELAY_MS = 120_000
 const INVALIDATE_COALESCE_MS = 250
 
 function watchEnabled(): boolean {
@@ -62,25 +63,48 @@ const PATHS: Record<WatchedKind, string> = {
   services: '/api/v1/services',
   networkpolicies: '/apis/networking.k8s.io/v1/networkpolicies',
   namespaces: '/api/v1/namespaces',
+  pods: '/api/v1/pods',
 }
+
+// Pods change all the time (status, restarts) and no cached list is built
+// from them: their events must not invalidate the read cache.
+const INVALIDATES_READS: Record<WatchedKind, boolean> = { services: true, networkpolicies: true, namespaces: true, pods: false }
 
 function start(kind: WatchedKind, kc: k8s.KubeConfig, list: () => Promise<k8s.KubernetesListObject<k8s.KubernetesObject>>): void {
   const informer = k8s.makeInformer(kc, PATHS[kind], list)
   const entry: Entry = { informer, synced: false }
   state().entries[kind] = entry
 
-  const onChange = () => { perfCount(`k8s.watch_event_${kind}`); scheduleInvalidate() }
+  const onChange = () => { perfCount(`k8s.watch_event_${kind}`); if (INVALIDATES_READS[kind]) scheduleInvalidate() }
   informer.on('add', onChange)
   informer.on('update', onChange)
   informer.on('delete', onChange)
-  informer.on('error', (err: unknown) => {
+  // The API server closes every watch after a while (about every 10 minutes
+  // on a typical cluster), so an error here is usually routine: reconnect
+  // quietly. Only a reconnect that itself fails is logged, and it keeps
+  // retrying with a growing delay (a failed restart used to be swallowed,
+  // leaving the watch off until the pod restarted).
+  const restart = (attempt: number) => {
+    setTimeout(() => {
+      informer.start()
+        .then(() => {
+          entry.synced = true
+          scheduleInvalidate()
+          if (attempt > 0) console.log(`[k8s-watch] ${kind}: watch restabelecido`)
+        })
+        .catch(err => {
+          const next = Math.min(RESTART_DELAY_MS * 2 ** (attempt + 1), MAX_RESTART_DELAY_MS)
+          console.warn(`[k8s-watch] ${kind}: falha ao reconectar, nova tentativa em ${next / 1000}s (leituras usam list direto enquanto isso):`, (err as Error)?.message ?? err)
+          restart(attempt + 1)
+        })
+    }, Math.min(RESTART_DELAY_MS * 2 ** attempt, MAX_RESTART_DELAY_MS)).unref?.()
+  }
+  informer.on('error', () => {
     // The cache may now miss changes: stop serving from it until the
     // restarted watch has re-listed.
     entry.synced = false
-    console.warn(`[k8s-watch] ${kind}: watch interrompido, reconectando em ${RESTART_DELAY_MS / 1000}s:`, (err as Error)?.message ?? err)
-    setTimeout(() => {
-      informer.start().then(() => { entry.synced = true; scheduleInvalidate() }).catch(() => {})
-    }, RESTART_DELAY_MS).unref?.()
+    perfCount(`k8s.watch_reconnect_${kind}`)
+    restart(0)
   })
 
   informer.start()

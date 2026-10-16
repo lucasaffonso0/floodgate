@@ -283,6 +283,38 @@ function detectPolicyMeta(spec: k8s.V1NetworkPolicySpec): {
   return { policyType: 'allow', srcNamespace: '', targetPort: 0 }
 }
 
+// Every pod's owning workload, keyed "namespace/podName": what a flow
+// endpoint should be called when Cilium sends only the pod name. Uses the
+// owner references instead of guessing from the name, so a StatefulSet's
+// "kafka-0" becomes "kafka" while a Deployment really named "app-v2" keeps
+// its name. Served from the pods watch when it's up.
+export async function listPodOwners(): Promise<Map<string, string>> {
+  const pods = watchedItems<k8s.V1Pod>('pods', kc, () => core.listPodForAllNamespaces())
+    ?? (perfCount('k8s.list_pods'), (await core.listPodForAllNamespaces()).items)
+  const owners = new Map<string, string>()
+  for (const pod of pods) {
+    const ns = pod.metadata?.namespace, name = pod.metadata?.name
+    if (!ns || !name) continue
+    owners.set(`${ns}/${name}`, podOwnerWorkload(pod))
+  }
+  return owners
+}
+
+export function podOwnerWorkload(pod: k8s.V1Pod): string {
+  const name = pod.metadata?.name ?? ''
+  const refs = pod.metadata?.ownerReferences ?? []
+  const owner = refs.find(r => r.controller) ?? refs[0]
+  if (!owner) return name
+  if (owner.kind === 'ReplicaSet') {
+    // "<deployment>-<pod-template-hash>": the hash is on the pod's own labels.
+    const hash = pod.metadata?.labels?.['pod-template-hash']
+    return hash && owner.name.endsWith(`-${hash}`) ? owner.name.slice(0, -(hash.length + 1)) : owner.name
+  }
+  // A CronJob's Jobs are "<cronjob>-<scheduled minute>".
+  if (owner.kind === 'Job') return owner.name.replace(/-\d{8,}$/, '')
+  return owner.name
+}
+
 export async function listNamespaceNames(): Promise<Set<string>> {
   const names = await cachedRead('k8s:namespaces', READ_CACHE_TTL_MS, async () => {
     const items = watchedItems<k8s.V1Namespace>('namespaces', kc, () => core.listNamespace())

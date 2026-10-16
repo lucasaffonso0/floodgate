@@ -555,3 +555,18 @@ describe('isolateNamespaces: bulk isolation', () => {
     expect(results[1].error).toBeUndefined()
   })
 })
+
+describe('podOwnerWorkload', () => {
+  const pod = (name: string, owner?: { kind: string; name: string }, labels: Record<string, string> = {}) => ({
+    metadata: { name, namespace: 'ns', labels, ownerReferences: owner ? [{ ...owner, apiVersion: 'v1', uid: 'u', controller: true }] : undefined },
+  })
+  it('uses the owner reference, not the pod name', async () => {
+    const { podOwnerWorkload } = await import('./k8s')
+    expect(podOwnerWorkload(pod('kafka-0', { kind: 'StatefulSet', name: 'kafka' }))).toBe('kafka')
+    expect(podOwnerWorkload(pod('gl-kafka-kafka-2', { kind: 'StrimziPodSet', name: 'gl-kafka-kafka' }))).toBe('gl-kafka-kafka')
+    expect(podOwnerWorkload(pod('api-v2-7d9f8b6c4d-x2k9p', { kind: 'ReplicaSet', name: 'api-v2-7d9f8b6c4d' }, { 'pod-template-hash': '7d9f8b6c4d' }))).toBe('api-v2')
+    expect(podOwnerWorkload(pod('backup-29345678-abcde', { kind: 'Job', name: 'backup-29345678' }))).toBe('backup')
+    expect(podOwnerWorkload(pod('cilium-xyz12', { kind: 'DaemonSet', name: 'cilium' }))).toBe('cilium')
+    expect(podOwnerWorkload(pod('standalone'))).toBe('standalone')
+  })
+})
