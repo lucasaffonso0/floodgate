@@ -19,6 +19,16 @@ message Flow {
   Endpoint source = 8;
   Endpoint destination = 9;
   Layer4 l4 = 6;
+  // google.protobuf.BoolValue upstream (unset = unknown direction). Field 26
+  // confirmed live against a real Hubble Relay (kind-pop-os, 2026-10-16):
+  // with a whitelist of reply [true] every decoded value was true, with
+  // reply [false] every one was false.
+  BoolValue is_reply = 26;
+}
+
+// Same wire format as google.protobuf.BoolValue.
+message BoolValue {
+  bool value = 1;
 }
 
 // Field number 5 confirmed live against a real cluster (kind-pop-os,

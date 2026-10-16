@@ -19,7 +19,8 @@ vi.mock('./db', async () => {
   db.exec('CREATE TABLE discovered_flows_deleted (id TEXT NOT NULL, rev INTEGER NOT NULL, deleted_at TEXT NOT NULL)')
   return { getDb: () => db }
 })
-vi.mock('./k8s', () => ({ listNetworkPolicies: vi.fn(), checkHubbleRelayReady: vi.fn(), listServices: vi.fn() }))
+const podOwners = vi.hoisted(() => ({ map: new Map<string, string>() }))
+vi.mock('./k8s', () => ({ listNetworkPolicies: vi.fn(), checkHubbleRelayReady: vi.fn(), listServices: vi.fn(), listPodOwners: vi.fn(async () => podOwners.map) }))
 const testConfig = vi.hoisted(() => ({ ignored_namespaces: [] as string[], hubble_flow_retention_days: 7, hubble_internet_flow_retention_days: 1 }))
 vi.mock('./config', () => ({ getConfig: () => testConfig }))
 vi.mock('./sse', () => ({ emit: vi.fn() }))
@@ -343,5 +344,71 @@ describe('retention, caps and unignore migration', () => {
     expect(ids('discovered_flows').slice(0, 2)).toEqual(['r000003', 'r000004'])
     const after = getDiscoveredFlowsSince(null)
     expect(getDiscoveredFlowsSince(after.version).full).toBe(false)
+  })
+})
+
+describe('reply direction (is_reply)', () => {
+  const svc = (ns: string, name: string) => ({ namespace: ns, labels: [`k8s:app=${name}`], workloads: [{ name, kind: 'Deployment' }] })
+  const msg = (dstPort: number, isReply: boolean | null, srcPort = 40000 + dstPort) => ({ flow: {
+    verdict: 'FORWARDED',
+    source: svc('netbird', 'router'), destination: svc('screening', 'peer'),
+    ip: { source: '10.0.0.1', destination: '10.0.0.2' },
+    l4: { UDP: { source_port: srcPort, destination_port: dstPort } },
+    is_reply: isReply === null ? null : { value: isReply },
+  } })
+  const ingest = async (...msgs: unknown[]) => {
+    const mod = await import('./hubble')
+    for (const m of msgs) mod.__testing.processFlow(m)
+    mod.flushFlowWrites()
+  }
+  const ports = () => (getDb().prepare('SELECT dst_port FROM discovered_flows ORDER BY dst_port').all() as Array<{ dst_port: number }>).map(r => r.dst_port)
+
+  it('keeps a high port when the flow is known to be a request, drops replies, and keeps the ephemeral-port guard when unknown', async () => {
+    const { clearDiscoveredFlows, invalidateIgnoredNamespacesCache } = await import('./hubble')
+    testConfig.ignored_namespaces = []
+    invalidateIgnoredNamespacesCache()
+    clearDiscoveredFlows()
+    await ingest(
+      msg(51820, false),  // WireGuard: real port, request direction
+      msg(51821, null),   // unknown direction, no Service declares it: treated as ephemeral
+      msg(8080, true),    // a reply: never a row
+    )
+    expect(ports()).toEqual([51820])
+  })
+
+  it('clearDiscoveredFlows reports how many rows it removed', async () => {
+    const { clearDiscoveredFlows } = await import('./hubble')
+    clearDiscoveredFlows()
+    await ingest(msg(51820, false), msg(51830, false))
+    expect(clearDiscoveredFlows()).toEqual({ discovered: 2, ignored: 0 })
+  })
+})
+
+describe('pod owner lookup', () => {
+  it('names an endpoint Cilium sent only as a pod name after its owning workload', async () => {
+    const mod = await import('./hubble')
+    const { clearDiscoveredFlows, invalidateIgnoredNamespacesCache } = mod
+    testConfig.ignored_namespaces = []
+    invalidateIgnoredNamespacesCache()
+    clearDiscoveredFlows()
+    podOwners.map = new Map([['kafka/gl-kafka-kafka-0', 'gl-kafka-kafka'], ['kafka/gl-kafka-kafka-1', 'gl-kafka-kafka']])
+    await mod.__testing.refreshPodOwners()
+    const msg = (pod: string, srcPort: number) => ({ flow: {
+      verdict: 'FORWARDED',
+      source: { namespace: 'api', labels: ['k8s:app=api'], workloads: [{ name: 'api', kind: 'Deployment' }] },
+      destination: { namespace: 'kafka', pod_name: pod, labels: [], workloads: [] },
+      ip: { source: '10.0.0.1', destination: '10.0.0.2' },
+      l4: { TCP: { source_port: srcPort, destination_port: 9092 } },
+      is_reply: { value: false },
+    } })
+    mod.__testing.processFlow(msg('gl-kafka-kafka-0', 41000))
+    mod.__testing.processFlow(msg('gl-kafka-kafka-1', 41001))
+    mod.__testing.processFlow(msg('unknown-pod-0', 41002))
+    mod.flushFlowWrites()
+    const rows = getDb().prepare("SELECT dst_workload, flow_count FROM discovered_flows WHERE dst_namespace = 'kafka' ORDER BY dst_workload").all()
+    expect(rows).toEqual([
+      { dst_workload: 'gl-kafka-kafka', flow_count: 2 }, // both replicas: one row
+      { dst_workload: 'unknown-pod-0', flow_count: 1 },  // not in the map: raw (normalized) name, as before
+    ])
   })
 })

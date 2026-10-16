@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth'
 import { acceptsGzip, gzipBody, jsonBody } from '@/lib/api-helpers'
+import { logAudit } from '@/lib/audit'
 import { getDiscoveredFlowsSince, getDiscoveredFlowsSummary, clearDiscoveredFlows, isHubbleStreaming } from '@/lib/hubble'
 
 // The full list can be tens of MB, so the client normally asks only for
@@ -56,6 +57,15 @@ export async function DELETE() {
   const user = await getCurrentUser()
   if (!user || user.role !== 'admin') return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
-  clearDiscoveredFlows()
+  // Irreversível e apaga todo o histórico da Descoberta: fica registrado
+  // quem limpou e quanto foi apagado.
+  const deleted = clearDiscoveredFlows()
+  logAudit({
+    user_id: user.sub,
+    username: user.username,
+    action: 'clear_discovered_flows',
+    resource_type: 'Flows',
+    details: JSON.stringify(deleted),
+  })
   return new NextResponse(null, { status: 204 })
 }

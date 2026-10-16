@@ -19,6 +19,7 @@ const ACTION_COLORS: Record<string, { bg: string; color: string }> = {
   auto_default_deny_egress:   { bg: '#fff7ed', color: '#c2410c' },
   apply_default_deny_ingress: { bg: '#fff7ed', color: '#c2410c' },
   apply_default_deny_egress:  { bg: '#fff7ed', color: '#c2410c' },
+  clear_discovered_flows:     { bg: '#fef2f2', color: '#dc2626' },
 }
 
 function ActionBadge({ action }: { action: string }) {

@@ -4,7 +4,7 @@ import * as grpc from '@grpc/grpc-js'
 import * as protoLoader from '@grpc/proto-loader'
 import { createHash } from 'crypto'
 import { getDb } from './db'
-import { listNetworkPolicies, checkHubbleRelayReady, listServices } from './k8s'
+import { listNetworkPolicies, checkHubbleRelayReady, listServices, listPodOwners } from './k8s'
 import { getConfig } from './config'
 import { emit } from './sse'
 import { perfCount } from './perfMetrics'
@@ -100,10 +100,15 @@ function extractEndpoint(ep: any): { workload: string; namespace: string } {
   const labels: string[] = ep?.labels ?? []
 
   // Cilium hasn't always resolved the owner workload (e.g. right after a pod
-  // starts) and falls back to the raw pod name: normalize either way so the
-  // same logical service always gets the same identity across flow records
-  // (this also fixes duplicate rows for what's really one src→dst pair).
-  let workload = workloads[0]?.name ?? ep?.pod_name ?? ''
+  // starts, or for owners it doesn't know, like Strimzi's StrimziPodSet) and
+  // falls back to the raw pod name. That name is looked up in the pod owner
+  // map first (real owner references, so a StatefulSet's "kafka-0" becomes
+  // "kafka"), then normalized either way so the same logical service always
+  // gets the same identity across flow records (this also fixes duplicate
+  // rows for what's really one src→dst pair).
+  const podName: string | undefined = ep?.pod_name || undefined
+  let workload = workloads[0]?.name
+    ?? (podName ? _podOwners.get(`${namespace}/${podName}`) ?? podName : '')
   if (!workload) {
     const appLabel = labels.find((l: string) => /^(k8s:)?app=/.test(l))
     workload = appLabel?.replace(/^(k8s:)?app=/, '') ?? ''
@@ -161,6 +166,23 @@ function isKnownServicePort(namespace: string, workload: string, port: number): 
   return false
 }
 
+// ─── Dono de cada pod (namespace/pod → workload), para quando o Cilium só
+// manda o nome do pod. Atualizado em background, mesmo padrão do cache de
+// ports acima; vem do watch de pods, então refrescar é barato. ──────────────
+let _podOwners = new Map<string, string>()
+let _podOwnersAt = 0
+let _podOwnersRefreshing = false
+
+async function refreshPodOwners(): Promise<void> {
+  if (_podOwnersRefreshing) return
+  _podOwnersRefreshing = true
+  try {
+    _podOwners = await listPodOwners()
+    _podOwnersAt = Date.now()
+  } catch { /* non-critical: mantém o mapa antigo */ }
+  finally { _podOwnersRefreshing = false }
+}
+
 // ─── Cache de policies (classifica has_policy já na inserção do flow, sem
 // esperar o próximo ciclo do scheduler) ────────────────────────────────────
 let _policyCache: NetworkPolicyInfo[] = []
@@ -198,7 +220,11 @@ export function invalidateIgnoredNamespacesCache(): void {
 
 // ─── Deduplicação por conexão TCP (source port identifica cada conexão única) ──
 // key: "flowId:srcPort" → timestamp de primeiro avistamento (para limpeza TTL)
-const _connDedup = new Map<string, number>()
+// No global, como o buffer de escrita: clearDiscoveredFlows() roda no bundle
+// da rota e precisa esvaziar o mesmo mapa que o stream (bundle do scheduler)
+// consulta.
+const _dedupHolder = global as typeof global & { _hubbleConnDedup?: Map<string, number> }
+const _connDedup = (_dedupHolder._hubbleConnDedup ??= new Map<string, number>())
 const CONN_TTL_MS = 120_000  // remove entradas após 2 min (porta efêmera não será reutilizada tão cedo)
 
 function isNewConnection(id: string, srcPort: number): boolean {
@@ -379,7 +405,14 @@ function processFlow(msg: unknown): void {
   const flow = (msg as any)?.flow
   if (!flow) return
   perfCount('hubble.received')
-  if (flow.is_reply === true) return
+  // is_reply: true = the server-to-client half of a connection (the relay
+  // already filters these out, see startHubbleStream; skipped here too in
+  // case a relay ignores the filter). false = the request direction, so
+  // the destination port is the real service port. null = Hubble doesn't
+  // know (policy-verdict events, many drops): falls back to the port
+  // heuristic below.
+  const isReply: boolean | null = flow.is_reply == null ? null : !!flow.is_reply.value
+  if (isReply === true) return
 
   const src = extractEndpoint(flow.source)
   const portInfo = extractPort(flow.l4)
@@ -409,9 +442,12 @@ function processFlow(msg: unknown): void {
   if (!src.workload || !portInfo || portInfo.port === 0) return
   if (!dst.workload && !dst.namespace) return
   if (portInfo.port === 53) return
-  if (portInfo.port >= 32768 && !dstIsWorld) {
-    // Porta alta: só aceita se for port declarado em algum K8s Service real do destino.
-    // Caso contrário, é porta efêmera de resposta TCP (Hubble captura os dois sentidos).
+  if (portInfo.port >= 32768 && !dstIsWorld && isReply === null) {
+    // Porta alta sem saber o sentido: só aceita se for port declarado em algum
+    // K8s Service real do destino. Caso contrário, é provavelmente porta efêmera
+    // de resposta TCP (Hubble captura os dois sentidos). Com is_reply=false o
+    // sentido é conhecido e a porta é real (ex: WireGuard 51820/UDP, que nenhum
+    // Service declara), então não passa por aqui.
     // Não faz sentido pra internet: não existe "Service" pra validar contra
     // um IP externo, e uma porta alta ali pode perfeitamente ser real (ex:
     // uma API de terceiro respondendo numa porta não-privilegiada).
@@ -428,6 +464,7 @@ function processFlow(msg: unknown): void {
   const table = (ignored.includes(src.namespace) || ignored.includes(dst.namespace)) ? 'ignored_flows' : 'discovered_flows'
 
   if (Date.now() - _policyCacheAt > 15_000) refreshPolicyCache()  // refresh async em background
+  if (Date.now() - _podOwnersAt > 30_000) refreshPodOwners()       // refresh async em background
 
   const verdict = rawVerdict === 'FORWARDED' ? 'FORWARDED'
     : rawVerdict === 'DROPPED' ? 'DROPPED'
@@ -462,6 +499,7 @@ export function startHubbleStream(): void {
   g._hubbleStreaming = true
   refreshSvcPortCache()  // popula cache de ports antes dos primeiros flows
   refreshPolicyCache()   // popula cache de policies antes dos primeiros flows
+  refreshPodOwners()     // popula o dono dos pods antes dos primeiros flows
   startFlowWriter()
 
   try {
@@ -470,10 +508,14 @@ export function startHubbleStream(): void {
     // Filtered at the relay: only the verdicts processFlow() keeps, and no
     // reply packets (the server-to-client half of every connection, which
     // processFlow() never wanted either). Roughly halves what the relay
-    // sends and this process decodes.
+    // sends and this process decodes. Replies are EXCLUDED via the
+    // blacklist, not "reply: false" in the whitelist: that one also drops
+    // every flow whose is_reply is unknown, which includes policy-verdict
+    // events and many DROPPED flows.
     const stream = client.GetFlows({
       number: '0', follow: true,
-      whitelist: [{ verdict: ['FORWARDED', 'DROPPED', 'AUDIT'], reply: [false] }],
+      whitelist: [{ verdict: ['FORWARDED', 'DROPPED', 'AUDIT'] }],
+      blacklist: [{ reply: [true] }],
     }, new grpc.Metadata())
     g._hubbleStream = stream
 
@@ -891,15 +933,23 @@ export function getDiscoveredFlows(): CiliumFlowSummary[] {
   return rows.map(toFlowSummary)
 }
 
-export function clearDiscoveredFlows(): void {
+// Retorna quantas linhas apagou, para a auditoria registrar o tamanho do
+// que foi limpo.
+export function clearDiscoveredFlows(): { discovered: number; ignored: number } {
   // Descarta o que ainda não foi gravado: senão o próximo flush recriaria
   // as linhas que o usuário acabou de limpar.
   _pendingFlows.clear()
+  // E esquece as conexões já vistas: senão uma conexão que continua ativa
+  // (mesma porta de origem) seria tratada como repetição, que só atualiza
+  // uma linha que acabou de ser apagada, e sumiria da Descoberta até essa
+  // memória expirar.
+  _connDedup.clear()
   const db = getDb()
-  db.prepare('DELETE FROM discovered_flows').run()
-  db.prepare('DELETE FROM ignored_flows').run()
+  const discovered = db.prepare('DELETE FROM discovered_flows').run().changes
+  const ignored = db.prepare('DELETE FROM ignored_flows').run().changes
   db.prepare('DELETE FROM discovered_flows_deleted').run()
   bumpFlowGeneration()
+  return { discovered, ignored }
 }
 
 // ── Modo Rascunho ────────────────────────────────────────────────────────
@@ -948,4 +998,4 @@ export function setDraftModeActive(active: boolean): void {
 // reclassification fix (excludeUnappliedGitOps, the sync_status-aware
 // fingerprint), tested in isolation from the gRPC stream / DB side effects
 // the rest of this file has. Not used by any application code path.
-export const __testing = { policyFingerprint, excludeUnappliedGitOps, processFlow }
+export const __testing = { policyFingerprint, excludeUnappliedGitOps, processFlow, refreshPodOwners }
