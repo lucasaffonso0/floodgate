@@ -3,6 +3,7 @@
 import React from 'react'
 import { ServiceInfo, NetworkPolicyInfo, Draft } from '@/types'
 import { deleteNetworkPolicy, isolateNamespace } from '@/api/client'
+import { confirmTrafficImpact } from '@/api/confirmImpact'
 import { getNamespaceIsolation, getOtherPoliciesInNamespace } from '@/lib/nsIsolation'
 import { computeEffectivePolicies } from '@/lib/simulate'
 
@@ -110,15 +111,18 @@ export function NamespaceIsolationPanel({
   const effectiveHasInternetPolicy = draftMode ? effectivePolicies.some(p => p.namespace === namespace && p.policy_type === 'allow-egress' && p.dst_service === 'internet') : hasInternetPolicy
 
   async function apply(direction: 'ingress' | 'egress' | 'both') {
+    const draft: Omit<Draft, 'id'> = {
+      kind: 'isolate', isolate_namespace: namespace, isolate_direction: direction,
+      isolate_allow_intra: allowIntra, isolate_allow_internet: allowInternet,
+      src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: direction === 'both' ? 'both' : direction,
+    }
     if (draftMode) {
-      onAddDraft?.({
-        kind: 'isolate', isolate_namespace: namespace, isolate_direction: direction,
-        isolate_allow_intra: allowIntra, isolate_allow_internet: allowInternet,
-        src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: direction === 'both' ? 'both' : direction,
-      })
+      onAddDraft?.(draft)
       setResult('Adicionado aos rascunhos')
       return
     }
+    const what = direction === 'both' ? 'entrada e saída' : direction === 'ingress' ? 'entrada' : 'saída'
+    if (!await confirmTrafficImpact(`isolar "${namespace}" (${what})`, [draft])) return
     setApplying(true); setResult(null)
     try {
       const r = await isolateNamespace({ namespace, direction, allow_intra_namespace: allowIntra, allow_egress_internet: allowInternet })
@@ -204,6 +208,10 @@ export function NamespaceIsolationPanel({
       setResult('Adicionado aos rascunhos')
       return
     }
+    if (hasIntraPolicy && !await confirmTrafficImpact(`desligar o tráfego interno de "${namespace}"`, [{
+      kind: 'toggle', toggle_namespace: namespace, toggle_option: 'intra', toggle_action: 'disable',
+      src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: 'both',
+    }])) return
     setApplying(true); setResult(null)
     try {
       if (hasIntraPolicy) {
@@ -228,6 +236,10 @@ export function NamespaceIsolationPanel({
       setResult('Adicionado aos rascunhos')
       return
     }
+    if (hasInternetPolicy && !await confirmTrafficImpact(`desligar o acesso à internet de "${namespace}"`, [{
+      kind: 'toggle', toggle_namespace: namespace, toggle_option: 'internet', toggle_action: 'disable',
+      src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: 'egress',
+    }])) return
     setApplying(true); setResult(null)
     try {
       if (hasInternetPolicy) {

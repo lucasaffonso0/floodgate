@@ -12,10 +12,13 @@ import {
   adoptPolicy, unadoptPolicy, checkHubble, previewDiscoveryPolicyYAML, createCidrPolicy,
   getBackupStatus, triggerBackup,
   getGitOpsConfig, saveGitOpsConfig, syncGitOpsRepo, type GitOpsConfigUpdate, type GitOpsConnectionTest,
+  getWorkloads,
 } from '@/api/client'
 import { normalizeWorkload, classifyFlowGap } from '@/lib/flowMatch'
 import { simulateImpact, computeEffectivePolicies, createFlowBlockedChecker } from '@/lib/simulate'
 import { getNamespaceIsolation } from '@/lib/nsIsolation'
+import { createOrphanCheck } from '@/lib/orphans'
+import { confirmTrafficImpact, removeDraft } from '@/api/confirmImpact'
 import { CronExpressionParser } from 'cron-parser'
 import { useVirtualizer } from '@tanstack/react-virtual'
 
@@ -1139,23 +1142,18 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   function toggleNs(ns: string) { setCollapsedNs(prev => { const n = new Set(prev); n.has(ns) ? n.delete(ns) : n.add(ns); return n }) }
 
   // Orphan detection: managed policies whose src/dst service no longer exists
-  const serviceSet = new Set(services.map(s => `${s.namespace}/${s.name}`))
-  function isOrphaned(p: NetworkPolicyInfo): boolean {
-    if (p.policy_type === 'external' || p.policy_type === 'allow-intranamespace') return false
-    if (p.policy_type === 'allow') {
-      const srcOk = !p.src_workload || serviceSet.has(`${p.src_namespace}/${p.src_workload}`)
-      const dstOk = !p.dst_service || serviceSet.has(`${p.namespace}/${p.dst_service}`)
-      return !srcOk || !dstOk
-    }
-    if (p.policy_type === 'allow-egress') {
-      // policy lives in src_namespace; dst_service is in an unknown namespace
-      const srcOk = !p.src_workload || serviceSet.has(`${p.namespace}/${p.src_workload}`)
-      const dstOk = !p.dst_service || p.dst_service === 'internet' || services.some(s => s.name === p.dst_service)
-      return !srcOk || !dstOk
-    }
-    // restrict-ingress, restrict-egress, allow-namespace: dst_service lives in p.namespace
-    return !!p.dst_service && !serviceSet.has(`${p.namespace}/${p.dst_service}`)
-  }
+  // Workloads with pods, so a source that is a Service-less workload (e.g.
+  // netbird's router) isn't flagged as obsolete. null until loaded: the
+  // check then gives such sources the benefit of the doubt (see orphans.ts).
+  const [workloads, setWorkloads] = useState<Set<string> | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    const load = () => getWorkloads().then(w => { if (!cancelled) setWorkloads(new Set(w)) }).catch(() => {})
+    load()
+    const id = setInterval(load, 30_000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [])
+  const isOrphaned = useMemo(() => createOrphanCheck(services, workloads), [services, workloads])
   const orphaned = policies.filter(isOrphaned)
   // pending_write vem do servidor (gitops_pending_ops): sobrevive a um
   // reload, ao contrário do estado local deletingAll/deletingPolicy. Usado
@@ -1296,7 +1294,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   }
 
   async function handleDelete(ns: string, name: string) {
-    if (!confirm('Remover esta NetworkPolicy?')) return
+    if (!await confirmTrafficImpact(`remover "${name}"`, [removeDraft(ns, [name])], 'Remover esta NetworkPolicy?')) return
     const key = `${ns}/${name}`
     setDeletingPolicy(key); setDeleteError(null)
     try {
@@ -1360,7 +1358,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
   }
 
   async function handlePauseOne(ns: string, name: string) {
-    if (!confirm(`Pausar "${name}"? A policy será removida do cluster mas salva para restauração.`)) return
+    if (!await confirmTrafficImpact(`pausar "${name}"`, [removeDraft(ns, [name])], `Pausar "${name}"? A policy será removida do cluster mas salva para restauração.`)) return
     await pausePolicy(ns, name).catch(() => {})
     onRefresh(); await loadPaused()
   }
@@ -1420,7 +1418,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
                   {policyDescription(p)}
                 </span>
                 {orphan && (
-                  <span style={{ fontSize: 8, fontWeight: 700, color: '#dc2626', background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>OBSOLETA</span>
+                  <span title="A origem (nenhum Service nem workload com pods com esse nome) ou o Service de destino não existe mais no cluster" style={{ fontSize: 8, fontWeight: 700, color: '#dc2626', background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 3, padding: '1px 4px', flexShrink: 0 }}>OBSOLETA</span>
                 )}
                 {/* Quando faz parte de uma operação em massa (>1 ao mesmo tempo), o
                     banner agregado acima já cobre isso: o badge individual aqui
@@ -1632,7 +1630,7 @@ function PoliciesTab({ policies, allPolicies, services, isAdmin, isViewer, canMa
         {orphaned.length > 0 && (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fff1f2', border: '1px solid #fecdd3', borderRadius: 6, padding: '5px 8px', marginBottom: 6 }}>
             <span style={{ fontSize: 10, color: '#dc2626', fontWeight: 600 }}>
-              {orphaned.length} obsoleta(s): serviço removido do cluster
+              {orphaned.length} obsoleta(s): origem ou destino não existe mais no cluster
             </span>
             {isAdmin && (
               <button style={{ ...btn.base, ...btn.red, padding: '2px 7px', fontSize: 9 }} onClick={handleCleanupOrphaned}>
@@ -1942,7 +1940,7 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
       targets.forEach(ns => onAddDraft?.(draftFor(ns, expDirection, expAllowIntra, expAllowInternet)))
       return
     }
-    if (!confirm(`Isolar ${targets.length} namespace(s) expostos?`)) return
+    if (!await confirmTrafficImpact(`isolar ${targets.length} namespace(s)`, targets.map(ns => draftFor(ns, expDirection, expAllowIntra, expAllowInternet)), `Isolar ${targets.length} namespace(s) expostos?`)) return
     setBulkBusy('exposed')
     await runBulkIsolate(targets.map(ns => ({ namespace: ns, direction: expDirection, allow_intra_namespace: expAllowIntra, allow_egress_internet: expAllowInternet })))
   }
@@ -1954,7 +1952,7 @@ function SegurancaTab({ services, policies, config, isAdmin, canManageNamespace,
       targets.forEach(({ ns, iso }) => onAddDraft?.(draftFor(ns, iso.isolatedIn ? 'egress' : 'ingress', partAllowIntra, partAllowInternet)))
       return
     }
-    if (!confirm(`Completar isolamento em ${targets.length} namespace(s)?`)) return
+    if (!await confirmTrafficImpact(`completar o isolamento de ${targets.length} namespace(s)`, targets.map(({ ns, iso }) => draftFor(ns, iso.isolatedIn ? 'egress' : 'ingress', partAllowIntra, partAllowInternet)), `Completar isolamento em ${targets.length} namespace(s)?`)) return
     setBulkBusy('partial')
     await runBulkIsolate(targets.map(({ ns, iso }) => ({
       namespace: ns, direction: iso.isolatedIn ? 'egress' as const : 'ingress' as const,
@@ -3466,7 +3464,12 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
             <span style={{ width: 8, height: 8, borderRadius: '50%', display: 'inline-block', background: hubbleAvailable === false ? '#cbd5e1' : isOn ? 'white' : '#94a3b8' }} />
             {hubbleAvailable === null ? 'Verificando…' : isOn ? 'Auto-discover ON' : 'Auto-discover OFF'}
           </button>
-          <button onClick={() => onClear?.()} style={{ ...btn.base, ...btn.red, marginLeft: 'auto' }}>
+          <button
+            onClick={() => {
+              if (!confirm('Apagar todo o histórico de tráfego da Descoberta?\n\nÉ esse histórico que permite avisar, antes de isolar um namespace, aplicar um default-deny ou apagar uma policy, quais conexões seriam bloqueadas. Depois de limpar, esses avisos só cobrem o tráfego capturado a partir de agora.')) return
+              onClear?.()
+            }}
+            style={{ ...btn.base, ...btn.red, marginLeft: 'auto' }}>
             <Icon.XCircle /> Limpar
           </button>
         </div>

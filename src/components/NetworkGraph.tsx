@@ -28,6 +28,7 @@ import dagre from '@dagrejs/dagre'
 import { ServiceInfo, NetworkPolicyInfo, Draft, PortSpec, ServiceLayout, ApprovalRequest, CiliumFlowSummary } from '@/types'
 import { deleteNetworkPolicy, restrictService, patchNetworkPolicyPort } from '@/api/client'
 import { explainAccess, sourceIsExempt, isDestinationExempt, type ExplainResult } from '@/lib/explainAccess'
+import { confirmTrafficImpact, removeDraft } from '@/api/confirmImpact'
 import { createFlowBlockedChecker, computeEffectivePolicies } from '@/lib/simulate'
 import { normalizeWorkload, classifyFlowGap } from '@/lib/flowMatch'
 import { getNamespaceIsolation } from '@/lib/nsIsolation'
@@ -1434,13 +1435,15 @@ function ServiceDetailPanel({
     p.src_workload === name && p.src_namespace === ns)
 
   async function applyRestrict(direction: 'ingress' | 'egress') {
+    const draft: Omit<Draft, 'id'> = {
+      kind: 'restrict', restrict_service: name, restrict_namespace: ns, restrict_direction: direction,
+      src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: direction,
+    }
     if (draftMode) {
-      onAddDraft?.({
-        kind: 'restrict', restrict_service: name, restrict_namespace: ns, restrict_direction: direction,
-        src_workload: '', src_namespace: '', dst_service: '', dst_namespace: '', dst_ports: [], policy_direction: direction,
-      })
+      onAddDraft?.(draft)
       return
     }
+    if (!await confirmTrafficImpact(`aplicar default-deny de ${direction === 'ingress' ? 'entrada' : 'saída'} em "${name}"`, [draft])) return
     await restrictService({ service_name: name, namespace: ns, direction })
     onPolicyChanged()
   }
@@ -1742,7 +1745,7 @@ function EditPolicyModal({
   }
 
   async function handleDelete() {
-    if (!confirm(`Remover "${policy.name}"?`)) return
+    if (!await confirmTrafficImpact(`remover "${policy.name}"`, [removeDraft(policy.namespace, [policy.name])], `Remover "${policy.name}"?`)) return
     setDeleting(true)
     try {
       await deleteNetworkPolicy(policy.namespace, policy.name)

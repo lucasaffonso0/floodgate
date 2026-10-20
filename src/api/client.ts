@@ -1,10 +1,11 @@
 import type { FlowEdge } from '@/lib/flowEdges'
+import type { TrafficImpact } from '@/lib/impactSummary'
 import axios from 'axios'
 import type {
   ServiceInfo, NetworkPolicyInfo, CreatePolicyRequest, NamespaceIngressRequest,
   PortSpec, AppConfig, User, AuditLog, ApprovalRequest, SecurityCoverage, NamespacePermission,
   ServiceLayout, AutosyncStatus, CiliumFlowsResponse, CiliumFlowSummary, CidrPolicyRequest,
-  BackupStatus, BackupResult, GitOpsConfig, CiliumFlowsSummaryResponse,
+  BackupStatus, BackupResult, GitOpsConfig, CiliumFlowsSummaryResponse, Draft,
 } from '@/types'
 
 const api = axios.create({ baseURL: '/api' })
@@ -22,6 +23,15 @@ api.interceptors.response.use(
 // ── Services & Policies ────────────────────────────────────────────────────
 export const getServices = (): Promise<ServiceInfo[]> =>
   api.get('/services').then(r => r.data)
+
+// What applying these changes would block among the connections Descoberta
+// has seen (read-only, see /api/networkpolicies/impact).
+export const checkTrafficImpact = (drafts: Array<Omit<Draft, 'id'>>): Promise<TrafficImpact> =>
+  api.post('/networkpolicies/impact', { drafts }).then(r => r.data)
+
+// "namespace/name" of every workload that has pods (see /api/workloads).
+export const getWorkloads = (): Promise<string[]> =>
+  api.get('/workloads').then(r => r.data)
 
 export const getNetworkPolicies = (): Promise<NetworkPolicyInfo[]> =>
   api.get('/networkpolicies').then(r => r.data)

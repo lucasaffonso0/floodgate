@@ -300,6 +300,18 @@ export async function listPodOwners(): Promise<Map<string, string>> {
   return owners
 }
 
+// Every workload that has at least one pod, as "namespace/name" (same
+// naming as podOwnerWorkload). Cached like the other cluster-wide reads; the
+// pods watch doesn't invalidate the cache, so it's at most a few seconds old.
+export async function listWorkloadKeys(): Promise<string[]> {
+  return cachedRead('k8s:workloads', READ_CACHE_TTL_MS, async () => {
+    const owners = await listPodOwners()
+    const keys = new Set<string>()
+    for (const [podKey, workload] of owners) keys.add(`${podKey.slice(0, podKey.indexOf('/'))}/${workload}`)
+    return [...keys].sort()
+  })
+}
+
 export function podOwnerWorkload(pod: k8s.V1Pod): string {
   const name = pod.metadata?.name ?? ''
   const refs = pod.metadata?.ownerReferences ?? []
