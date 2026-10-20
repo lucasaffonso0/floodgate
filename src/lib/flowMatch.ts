@@ -82,9 +82,14 @@ export function flowHasPolicy(
   // protected by a narrower CIDR range, instead of the broad internet
   // sentinel, will show as uncovered here even when the traffic is
   // actually allowed).
+  // A source with no egress restriction at all is NOT covered: its traffic
+  // gets through because nothing blocks it, not because a policy allows it
+  // (the Descoberta tab labels that case "sem restrição" instead, see
+  // isUnrestrictedFlow). Treating it as covered showed "com política" on
+  // internet traffic from namespaces with no policy whatsoever.
   if (f.dst_namespace === 'internet') {
     const srcExplain = explainAccess(srcWorkload, f.src_namespace, 'egress', policies)
-    if (!srcExplain.blocked) return true
+    if (!srcExplain.blocked) return false
     return isDestinationExempt(srcExplain.exceptions, 'internet', f.src_namespace, f.dst_namespace)
   }
 
@@ -104,4 +109,17 @@ export function flowHasPolicy(
   const srcExplain = explainAccess(srcWorkload, f.src_namespace, 'egress', policies)
   if (!srcExplain.blocked) return true
   return isDestinationExempt(srcExplain.exceptions, f.dst_workload, f.src_namespace, f.dst_namespace)
+}
+
+// Traffic that gets through only because nothing restricts it: no policy
+// limits the source's egress or (for in-cluster traffic) the destination's
+// ingress. Not the same as being covered by a policy (flowHasPolicy): the
+// Descoberta tab shows it as "sem restrição" rather than "com política".
+export function isUnrestrictedFlow(
+  f: { src_workload: string; src_namespace: string; dst_workload: string; dst_namespace: string },
+  policies: NetworkPolicyInfo[],
+): boolean {
+  if (explainAccess(normalizeWorkload(f.src_workload), f.src_namespace, 'egress', policies).blocked) return false
+  if (f.dst_namespace === 'internet') return true
+  return !explainAccess(normalizeWorkload(f.dst_workload), f.dst_namespace, 'ingress', policies).blocked
 }

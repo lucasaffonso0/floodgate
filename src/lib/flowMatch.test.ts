@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { normalizeWorkload, flowHasPolicy, classifyFlowGap, isWorldEndpoint } from './flowMatch'
+import { normalizeWorkload, flowHasPolicy, isUnrestrictedFlow, classifyFlowGap, isWorldEndpoint } from './flowMatch'
 import { NetworkPolicyInfo } from '@/types'
 
 function policy(overrides: Partial<NetworkPolicyInfo>): NetworkPolicyInfo {
@@ -163,8 +163,13 @@ describe('flowHasPolicy', () => {
   describe('internet-bound flows (dst_namespace: "internet")', () => {
     const internetFlow = { src_workload: 'app', src_namespace: 'frontend', dst_workload: '1.1.1.1', dst_namespace: 'internet', dst_port: 443 }
 
-    it('is true when the source namespace has no egress restriction at all', () => {
-      expect(flowHasPolicy(internetFlow, [])).toBe(true)
+    it('is false when the source has no egress restriction at all: it passes because nothing blocks it, not because a policy allows it', () => {
+      expect(flowHasPolicy(internetFlow, [])).toBe(false)
+    })
+
+    it('is false when the source only has unrelated egress allows (implicit deny, no internet exception)', () => {
+      const policies = [policy({ policy_type: 'allow-egress', namespace: 'frontend', src_workload: 'app', src_namespace: 'frontend', dst_service: 'api' })]
+      expect(flowHasPolicy(internetFlow, policies)).toBe(false)
     })
 
     it('is false when the source namespace has an unexempted egress-deny', () => {
@@ -198,7 +203,7 @@ describe('flowHasPolicy', () => {
       const policies = [
         policy({ policy_type: 'allow-namespace', namespace: 'internet', dst_service: 'x', src_namespace: 'frontend', dst_ports: [{ port: 443, protocol: 'TCP' }] }),
       ]
-      expect(flowHasPolicy(internetFlow, policies)).toBe(true) // true only because src has no egress restriction, not because of this policy
+      expect(flowHasPolicy(internetFlow, policies)).toBe(false) // this policy is never matched, and an unrestricted source isn't "covered"
     })
   })
 })
@@ -231,5 +236,27 @@ describe('classifyFlowGap', () => {
       policy({ policy_type: 'restrict-egress', namespace: 'frontend', dst_service: '' }),
     ]
     expect(classifyFlowGap(flow, policies)).toEqual({ missingIngress: true, missingEgress: true })
+  })
+})
+
+describe('isUnrestrictedFlow', () => {
+  const internal = { src_workload: 'app', src_namespace: 'frontend', dst_workload: 'api', dst_namespace: 'backend' }
+  const internet = { ...internal, dst_workload: '142.251.41.174', dst_namespace: 'internet' }
+
+  it('is true when nothing restricts the source egress (internet) or either side (in-cluster)', () => {
+    expect(isUnrestrictedFlow(internet, [])).toBe(true)
+    expect(isUnrestrictedFlow(internal, [])).toBe(true)
+  })
+
+  it('is false once the source egress is restricted, even with an internet exception', () => {
+    const policies = [
+      policy({ policy_type: 'restrict-egress', namespace: 'frontend', dst_service: '' }),
+      policy({ policy_type: 'allow-egress', namespace: 'frontend', src_workload: '', src_namespace: 'frontend', dst_service: 'internet' }),
+    ]
+    expect(isUnrestrictedFlow(internet, policies)).toBe(false)
+  })
+
+  it('is false for in-cluster traffic when the destination ingress is restricted', () => {
+    expect(isUnrestrictedFlow(internal, [policy({ policy_type: 'restrict-ingress', namespace: 'backend', dst_service: '' })])).toBe(false)
   })
 })

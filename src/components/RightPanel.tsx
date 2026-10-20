@@ -14,7 +14,7 @@ import {
   getGitOpsConfig, saveGitOpsConfig, syncGitOpsRepo, type GitOpsConfigUpdate, type GitOpsConnectionTest,
   getWorkloads,
 } from '@/api/client'
-import { normalizeWorkload, classifyFlowGap } from '@/lib/flowMatch'
+import { normalizeWorkload, classifyFlowGap, isUnrestrictedFlow } from '@/lib/flowMatch'
 import { simulateImpact, computeEffectivePolicies, createFlowBlockedChecker } from '@/lib/simulate'
 import { getNamespaceIsolation } from '@/lib/nsIsolation'
 import { createOrphanCheck } from '@/lib/orphans'
@@ -3329,6 +3329,13 @@ function DescobertaTab({ flows, config, streaming, allPolicies, onClear, onAddDr
           </span>
           {f.has_policy && (
             <span style={{ fontSize: 10, color: '#2563eb', fontWeight: 600 }}>✓ com política</span>
+          )}
+          {!f.has_policy && f.verdict === 'FORWARDED' && isUnrestrictedFlow(f, allPolicies) && (
+            <span
+              title="Nenhuma NetworkPolicy limita este tráfego: ele passa porque nada o bloqueia, não porque uma regra o libera."
+              style={{ fontSize: 10, color: '#64748b', fontWeight: 600 }}>
+              sem restrição
+            </span>
           )}
           {previewBlocked && (
             <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 10, background: '#fef3c7', color: '#b45309' }}>
